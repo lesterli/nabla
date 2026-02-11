@@ -1,0 +1,11 @@
+[workspace]
+members = ["agent-core", "agent-llm", "agent-cli"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

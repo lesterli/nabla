@@ -11,9 +11,9 @@ A coding agent is a **constrained state machine**, not a chatbot.
 
 ```
 agent-rs/
-  core/         # protocol, runtime, policy, tools, memory
-  llm/          # multi-provider gateway
-  cli/          # terminal adapter
+  agent-core/   # protocol, runtime, policy, tools, memory
+  agent-llm/    # crate implementing the llm-gateway layer
+  agent-cli/    # terminal adapter
   Cargo.toml    # workspace root
 ```
 
@@ -50,6 +50,6 @@ Every step emits an event. Failures too. Any interruption resumes from the last 
 | **runtime** | Turn loop, state transitions, checkpoint/resume |
 | **policy** | `Allow` / `Deny` / `AskHuman` before side-effects |
 | **tools** | Registration, schema validation, isolated execution |
-| **llm-gateway** | Provider adapters, retry/backoff, fallback, cost tracking |
+| **llm-gateway** | Provider adapters, retry/backoff, fallback, cost tracking (`agent-llm` crate) |
 | **memory** | Event persistence, context compression, replay |
 | **adapters** | CLI / ACP / RPC — protocol translation, no business logic |
