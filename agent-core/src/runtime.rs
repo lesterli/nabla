@@ -35,6 +35,8 @@ impl AgentRuntime {
         tools: &ToolRegistry,
         store: &mut dyn EventStore,
     ) -> TurnResult {
+        self.sync_next_event_index(store);
+
         let submission_id = op.submission_id().to_string();
         let mut emitted = Vec::new();
 
@@ -225,6 +227,17 @@ impl AgentRuntime {
         }
     }
 
+    fn sync_next_event_index(&mut self, store: &dyn EventStore) {
+        let Some(last_index) = store.last_event_index() else {
+            return;
+        };
+
+        let next_after_store = last_index.saturating_add(1);
+        if self.next_event_index < next_after_store {
+            self.next_event_index = next_after_store;
+        }
+    }
+
     fn push_event(
         &mut self,
         submission_id: &str,
@@ -246,7 +259,7 @@ mod tests {
     use super::{AgentRuntime, LlmGateway, LlmOutput};
     use crate::{
         memory::{EventStore, InMemoryEventStore},
-        policy::DenyAllPolicy,
+        policy::{AllowAllPolicy, DenyAllPolicy},
         protocol::{Event, EventKind, Op, StopReason, ToolCall},
         tools::{EchoTool, ToolRegistry},
     };
@@ -372,5 +385,89 @@ mod tests {
                 } if request_id == "approval-1" && reason == "approved in test"
             )
         }));
+    }
+
+    #[test]
+    fn event_index_keeps_increasing_after_runtime_restart() {
+        let mut store = InMemoryEventStore::default();
+        let mut tools = ToolRegistry::default();
+        tools.register(EchoTool);
+
+        let llm = StaticGateway {
+            text: "ok".to_string(),
+            tool_calls: vec![ToolCall {
+                name: "echo".to_string(),
+                args: json!({ "text": "hello" }),
+            }],
+        };
+
+        let mut runtime_first = AgentRuntime::default();
+        let first_result = runtime_first.run_turn(
+            Op::UserInput {
+                submission_id: "sub-1".to_string(),
+                input: "first".to_string(),
+            },
+            &llm,
+            &AllowAllPolicy,
+            &tools,
+            &mut store,
+        );
+        let first_last_index = first_result
+            .events
+            .last()
+            .expect("first run should emit events")
+            .index;
+
+        let mut runtime_second = AgentRuntime::default();
+        let second_result = runtime_second.run_turn(
+            Op::UserInput {
+                submission_id: "sub-2".to_string(),
+                input: "second".to_string(),
+            },
+            &llm,
+            &AllowAllPolicy,
+            &tools,
+            &mut store,
+        );
+
+        let second_first_index = second_result
+            .events
+            .first()
+            .expect("second run should emit events")
+            .index;
+        assert_eq!(second_first_index, first_last_index + 1);
+
+        assert!(store.events().windows(2).all(|pair| pair[0].index < pair[1].index));
+    }
+
+    #[test]
+    fn empty_store_starts_event_index_at_zero() {
+        let mut store = InMemoryEventStore::default();
+        let mut tools = ToolRegistry::default();
+        tools.register(EchoTool);
+
+        let llm = StaticGateway {
+            text: "ok".to_string(),
+            tool_calls: Vec::new(),
+        };
+
+        let mut runtime = AgentRuntime::default();
+        let result = runtime.run_turn(
+            Op::UserInput {
+                submission_id: "sub-empty".to_string(),
+                input: "first".to_string(),
+            },
+            &llm,
+            &AllowAllPolicy,
+            &tools,
+            &mut store,
+        );
+
+        let first_index = result
+            .events
+            .first()
+            .expect("run should emit events")
+            .index;
+        assert_eq!(first_index, 0);
     }
 }

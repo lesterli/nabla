@@ -4,6 +4,9 @@ pub trait EventStore {
     fn append(&mut self, event: Event);
     fn events(&self) -> &[Event];
     fn events_for_submission(&self, submission_id: &str) -> Vec<Event>;
+    fn last_event_index(&self) -> Option<u64> {
+        self.events().last().map(|event| event.index)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
