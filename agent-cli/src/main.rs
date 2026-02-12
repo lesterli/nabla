@@ -83,8 +83,10 @@ fn build_gateway_from_env() -> Result<MultiProviderGateway, String> {
     let provider = std::env::var("AGENT_LLM_PROVIDER").unwrap_or_else(|_| "mock".to_string());
 
     match provider.as_str() {
-        "mock" => Ok(MultiProviderGateway::new()
-            .with_provider(StaticProvider::new("mock", "assistant> "))),
+        "mock" => {
+            Ok(MultiProviderGateway::new()
+                .with_provider(StaticProvider::new("mock", "assistant> ")))
+        }
         "openai" | "openai_compatible" => {
             let base_url = std::env::var("AGENT_LLM_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
