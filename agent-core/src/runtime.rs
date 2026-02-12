@@ -169,6 +169,59 @@ impl AgentRuntime {
                     events: emitted,
                 }
             }
+            Op::Resume { checkpoint_id, .. } => {
+                self.push_event(
+                    &submission_id,
+                    EventKind::TurnResumed { checkpoint_id },
+                    &mut emitted,
+                    store,
+                );
+
+                self.push_event(
+                    &submission_id,
+                    EventKind::TurnStopped {
+                        reason: StopReason::Interrupted,
+                    },
+                    &mut emitted,
+                    store,
+                );
+
+                TurnResult {
+                    stop_reason: StopReason::Interrupted,
+                    events: emitted,
+                }
+            }
+            Op::HumanApprovalResponse {
+                request_id,
+                approved,
+                reason,
+                ..
+            } => {
+                self.push_event(
+                    &submission_id,
+                    EventKind::HumanApprovalResolved {
+                        request_id,
+                        approved,
+                        reason,
+                    },
+                    &mut emitted,
+                    store,
+                );
+
+                self.push_event(
+                    &submission_id,
+                    EventKind::TurnStopped {
+                        reason: StopReason::Interrupted,
+                    },
+                    &mut emitted,
+                    store,
+                );
+
+                TurnResult {
+                    stop_reason: StopReason::Interrupted,
+                    events: emitted,
+                }
+            }
         }
     }
 
@@ -251,5 +304,73 @@ mod tests {
             .iter()
             .any(|event| matches!(event.kind, EventKind::ToolExecuted { .. }));
         assert!(!executed);
+    }
+
+    #[test]
+    fn resume_op_emits_turn_resumed_and_stops_interrupted() {
+        let mut runtime = AgentRuntime::default();
+        let mut store = InMemoryEventStore::default();
+        let tools = ToolRegistry::default();
+        let llm = StaticGateway {
+            text: "unused".to_string(),
+            tool_calls: Vec::new(),
+        };
+
+        let result = runtime.run_turn(
+            Op::Resume {
+                submission_id: "sub-resume".to_string(),
+                checkpoint_id: Some("ckpt-1".to_string()),
+            },
+            &llm,
+            &DenyAllPolicy::new("unused"),
+            &tools,
+            &mut store,
+        );
+
+        assert_eq!(result.stop_reason, StopReason::Interrupted);
+        assert!(store.events().iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::TurnResumed {
+                    checkpoint_id: Some(ref checkpoint_id),
+                } if checkpoint_id == "ckpt-1"
+            )
+        }));
+    }
+
+    #[test]
+    fn human_approval_response_op_emits_resolution_and_stops_interrupted() {
+        let mut runtime = AgentRuntime::default();
+        let mut store = InMemoryEventStore::default();
+        let tools = ToolRegistry::default();
+        let llm = StaticGateway {
+            text: "unused".to_string(),
+            tool_calls: Vec::new(),
+        };
+
+        let result = runtime.run_turn(
+            Op::HumanApprovalResponse {
+                submission_id: "sub-approval".to_string(),
+                request_id: "approval-1".to_string(),
+                approved: true,
+                reason: Some("approved in test".to_string()),
+            },
+            &llm,
+            &DenyAllPolicy::new("unused"),
+            &tools,
+            &mut store,
+        );
+
+        assert_eq!(result.stop_reason, StopReason::Interrupted);
+        assert!(store.events().iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::HumanApprovalResolved {
+                    ref request_id,
+                    approved: true,
+                    reason: Some(ref reason),
+                } if request_id == "approval-1" && reason == "approved in test"
+            )
+        }));
     }
 }
