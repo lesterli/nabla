@@ -5,14 +5,78 @@ use agent_core::{
     runtime::AgentRuntime,
     tools::{EchoTool, ToolRegistry},
 };
-use agent_llm::{MultiProviderGateway, OpenAiCompatibleProvider, StaticProvider};
+use agent_llm::{
+    MultiProviderGateway, OpenAiCompatibleProvider, OpenAiFunctionTool, OpenAiToolChoice,
+    StaticProvider,
+};
+use serde_json::json;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_usage(program: &str) {
     println!(
-        "Usage: {program} [OPTIONS] <prompt>\n\nOptions:\n  -h, --help     Show this help message\n  -V, --version  Show version\n\nLLM env:\n  AGENT_LLM_PROVIDER=mock|openai|openai_compatible (default: mock)\n  AGENT_LLM_BASE_URL (default: https://api.openai.com/v1)\n  AGENT_LLM_API_KEY (required for openai/openai_compatible)\n  AGENT_LLM_MODEL (default: gpt-4o-mini)\n  AGENT_LLM_NAME (optional provider display name)"
+        "Usage: {program} [OPTIONS] <prompt>\n\nOptions:\n  -h, --help     Show this help message\n  -V, --version  Show version\n\nLLM env:\n  AGENT_LLM_PROVIDER=mock|openai|openai_compatible (default: mock)\n  AGENT_LLM_BASE_URL (default: https://api.openai.com/v1)\n  AGENT_LLM_API_KEY (required for openai/openai_compatible)\n  AGENT_LLM_MODEL (default: gpt-4o-mini)\n  AGENT_LLM_NAME (optional provider display name)\n  AGENT_LLM_TOOLS (optional comma list; supported: echo)\n  AGENT_LLM_TOOL_CHOICE (optional: auto|required|none|echo|function:<name>)"
     );
+}
+
+fn parse_tools_env(raw: &str) -> Result<Vec<&str>, String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|tool| match tool {
+            "echo" => Ok("echo"),
+            other => Err(format!(
+                "unsupported tool `{other}` in AGENT_LLM_TOOLS (supported: echo)"
+            )),
+        })
+        .collect()
+}
+
+fn parse_tool_choice_env(raw: &str) -> Result<OpenAiToolChoice, String> {
+    let normalized = raw.trim();
+    if normalized.is_empty() {
+        return Err("AGENT_LLM_TOOL_CHOICE cannot be empty".to_string());
+    }
+
+    match normalized {
+        "auto" => Ok(OpenAiToolChoice::Auto),
+        "required" => Ok(OpenAiToolChoice::Required),
+        "none" => Ok(OpenAiToolChoice::None),
+        "echo" => Ok(OpenAiToolChoice::Function {
+            name: "echo".to_string(),
+        }),
+        _ => {
+            if let Some(name) = normalized.strip_prefix("function:") {
+                if name.trim().is_empty() {
+                    return Err(
+                        "AGENT_LLM_TOOL_CHOICE function:<name> requires non-empty <name>"
+                            .to_string(),
+                    );
+                }
+                return Ok(OpenAiToolChoice::Function {
+                    name: name.trim().to_string(),
+                });
+            }
+            Err(format!(
+                "unsupported AGENT_LLM_TOOL_CHOICE value `{normalized}` (expected: auto, required, none, echo, function:<name>)"
+            ))
+        }
+    }
+}
+
+fn echo_tool_definition() -> OpenAiFunctionTool {
+    OpenAiFunctionTool::new(
+        "echo",
+        "Echo input text for connectivity checks.",
+        json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string" }
+            },
+            "required": ["text"],
+            "additionalProperties": false
+        }),
+    )
 }
 
 fn build_gateway_from_env() -> Result<MultiProviderGateway, String> {
@@ -31,7 +95,19 @@ fn build_gateway_from_env() -> Result<MultiProviderGateway, String> {
             let name =
                 std::env::var("AGENT_LLM_NAME").unwrap_or_else(|_| "openai-compatible".to_string());
 
-            let provider = OpenAiCompatibleProvider::new(name, base_url, api_key, model)?;
+            let mut provider = OpenAiCompatibleProvider::new(name, base_url, api_key, model)?;
+            let tools_env = std::env::var("AGENT_LLM_TOOLS").unwrap_or_default();
+            for tool_name in parse_tools_env(&tools_env)? {
+                if tool_name == "echo" {
+                    provider = provider.with_tool(echo_tool_definition());
+                }
+            }
+
+            if let Ok(raw_choice) = std::env::var("AGENT_LLM_TOOL_CHOICE") {
+                let parsed_choice = parse_tool_choice_env(&raw_choice)?;
+                provider = provider.with_tool_choice(parsed_choice);
+            }
+
             Ok(MultiProviderGateway::new().with_provider(provider))
         }
         other => Err(format!(
@@ -114,5 +190,32 @@ fn main() {
 
     if turn.stop_reason != StopReason::Done {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_tool_choice_env, parse_tools_env};
+    use agent_llm::OpenAiToolChoice;
+
+    #[test]
+    fn parses_supported_tools_list() {
+        let tools = parse_tools_env(" echo ").expect("parse tools");
+        assert_eq!(tools, vec!["echo"]);
+    }
+
+    #[test]
+    fn rejects_unsupported_tool() {
+        let err = parse_tools_env("shell").expect_err("should reject");
+        assert!(err.contains("unsupported tool"));
+    }
+
+    #[test]
+    fn parses_function_tool_choice() {
+        let choice = parse_tool_choice_env("function:echo").expect("parse tool choice");
+        match choice {
+            OpenAiToolChoice::Function { name } => assert_eq!(name, "echo"),
+            _ => panic!("expected function tool choice"),
+        }
     }
 }

@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use agent_core::{
-    protocol::Event,
+    protocol::{Event, ToolCall},
     runtime::{LlmGateway, LlmOutput},
 };
 use reqwest::blocking::Client;
@@ -16,6 +16,7 @@ pub trait ProviderAdapter: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ProviderResponse {
     pub text: String,
+    pub tool_calls: Vec<ToolCall>,
     pub estimated_input_tokens: u32,
     pub estimated_output_tokens: u32,
 }
@@ -73,7 +74,7 @@ impl LlmGateway for MultiProviderGateway {
 
                     return Ok(LlmOutput {
                         text: response.text,
-                        tool_calls: Vec::new(),
+                        tool_calls: response.tool_calls,
                     });
                 }
                 Err(err) => {
@@ -112,6 +113,7 @@ impl ProviderAdapter for StaticProvider {
     fn complete(&self, prompt: &str) -> Result<ProviderResponse, String> {
         Ok(ProviderResponse {
             text: format!("{}{}", self.response_prefix, prompt),
+            tool_calls: Vec::new(),
             estimated_input_tokens: prompt.split_whitespace().count() as u32,
             estimated_output_tokens: 8,
         })
@@ -124,7 +126,34 @@ pub struct OpenAiCompatibleProvider {
     base_url: String,
     api_key: String,
     model: String,
+    tools: Vec<OpenAiFunctionTool>,
+    tool_choice: Option<OpenAiToolChoice>,
     client: Client,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenAiFunctionTool {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+impl OpenAiFunctionTool {
+    pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum OpenAiToolChoice {
+    Auto,
+    Required,
+    None,
+    Function { name: String },
 }
 
 impl OpenAiCompatibleProvider {
@@ -143,12 +172,68 @@ impl OpenAiCompatibleProvider {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
             model: model.into(),
+            tools: Vec::new(),
+            tool_choice: None,
             client,
         })
     }
 
     fn completions_url(&self) -> String {
         format!("{}/chat/completions", self.base_url)
+    }
+
+    pub fn with_tool(mut self, tool: OpenAiFunctionTool) -> Self {
+        self.tools.push(tool);
+        self
+    }
+
+    pub fn with_tool_choice(mut self, tool_choice: OpenAiToolChoice) -> Self {
+        self.tool_choice = Some(tool_choice);
+        self
+    }
+
+    fn build_chat_completions_request(&self, prompt: &str) -> OpenAiChatCompletionsRequest {
+        let tools = if self.tools.is_empty() {
+            None
+        } else {
+            Some(
+                self.tools
+                    .iter()
+                    .map(|tool| OpenAiRequestTool {
+                        kind: "function".to_string(),
+                        function: OpenAiRequestToolFunction {
+                            name: tool.name.clone(),
+                            description: tool.description.clone(),
+                            parameters: tool.parameters.clone(),
+                        },
+                    })
+                    .collect(),
+            )
+        };
+
+        let tool_choice = if tools.is_some() {
+            Some(match self.tool_choice.as_ref() {
+                Some(OpenAiToolChoice::Required) => Value::String("required".to_string()),
+                Some(OpenAiToolChoice::None) => Value::String("none".to_string()),
+                Some(OpenAiToolChoice::Function { name }) => serde_json::json!({
+                    "type": "function",
+                    "function": { "name": name }
+                }),
+                _ => Value::String("auto".to_string()),
+            })
+        } else {
+            None
+        };
+
+        OpenAiChatCompletionsRequest {
+            model: self.model.clone(),
+            messages: vec![OpenAiMessage {
+                role: "user".to_string(),
+                content: prompt.to_string(),
+            }],
+            tools,
+            tool_choice,
+        }
     }
 }
 
@@ -158,13 +243,7 @@ impl ProviderAdapter for OpenAiCompatibleProvider {
     }
 
     fn complete(&self, prompt: &str) -> Result<ProviderResponse, String> {
-        let request = OpenAiChatCompletionsRequest {
-            model: self.model.clone(),
-            messages: vec![OpenAiMessage {
-                role: "user".to_string(),
-                content: prompt.to_string(),
-            }],
-        };
+        let request = self.build_chat_completions_request(prompt);
 
         let response = self
             .client
@@ -183,28 +262,7 @@ impl ProviderAdapter for OpenAiCompatibleProvider {
             return Err(format!("HTTP {status}: {body}"));
         }
 
-        let parsed: OpenAiChatCompletionsResponse = serde_json::from_str(&body)
-            .map_err(|err| format!("invalid provider response: {err}"))?;
-
-        let Some(choice) = parsed.choices.first() else {
-            return Err("provider returned no choices".to_string());
-        };
-
-        let text = extract_openai_message_text(&choice.message.content)?;
-        let estimated_input_tokens = parsed
-            .usage
-            .as_ref()
-            .map_or_else(|| estimate_tokens(prompt), |usage| usage.prompt_tokens);
-        let estimated_output_tokens = parsed
-            .usage
-            .as_ref()
-            .map_or_else(|| estimate_tokens(&text), |usage| usage.completion_tokens);
-
-        Ok(ProviderResponse {
-            text,
-            estimated_input_tokens,
-            estimated_output_tokens,
-        })
+        parse_openai_chat_completions_response(&body, prompt)
     }
 }
 
@@ -212,7 +270,41 @@ fn estimate_tokens(text: &str) -> u32 {
     text.split_whitespace().count() as u32
 }
 
+fn parse_openai_chat_completions_response(
+    body: &str,
+    prompt: &str,
+) -> Result<ProviderResponse, String> {
+    let parsed: OpenAiChatCompletionsResponse =
+        serde_json::from_str(body).map_err(|err| format!("invalid provider response: {err}"))?;
+
+    let Some(choice) = parsed.choices.first() else {
+        return Err("provider returned no choices".to_string());
+    };
+
+    let tool_calls = extract_openai_tool_calls(&choice.message)?;
+    let text = extract_openai_message_text(&choice.message.content)?;
+    let estimated_input_tokens = parsed
+        .usage
+        .as_ref()
+        .map_or_else(|| estimate_tokens(prompt), |usage| usage.prompt_tokens);
+    let estimated_output_tokens = parsed
+        .usage
+        .as_ref()
+        .map_or_else(|| estimate_tokens(&text), |usage| usage.completion_tokens);
+
+    Ok(ProviderResponse {
+        text,
+        tool_calls,
+        estimated_input_tokens,
+        estimated_output_tokens,
+    })
+}
+
 fn extract_openai_message_text(content: &Value) -> Result<String, String> {
+    if content.is_null() {
+        return Ok(String::new());
+    }
+
     if let Some(text) = content.as_str() {
         return Ok(text.to_string());
     }
@@ -233,16 +325,85 @@ fn extract_openai_message_text(content: &Value) -> Result<String, String> {
     Err("provider returned unsupported message content shape".to_string())
 }
 
+fn extract_openai_tool_calls(message: &OpenAiChoiceMessage) -> Result<Vec<ToolCall>, String> {
+    let Some(tool_calls) = message.tool_calls.as_ref() else {
+        return Ok(Vec::new());
+    };
+
+    let mut parsed = Vec::with_capacity(tool_calls.len());
+    for (idx, tool_call) in tool_calls.iter().enumerate() {
+        if tool_call.kind != "function" {
+            return Err(format!(
+                "provider returned unsupported tool_call type `{}` at index {idx}",
+                tool_call.kind
+            ));
+        }
+
+        let Some(function) = tool_call.function.as_ref() else {
+            return Err(format!(
+                "provider returned function tool_call without function payload at index {idx}"
+            ));
+        };
+
+        if function.name.trim().is_empty() {
+            return Err(format!(
+                "provider returned function tool_call with empty name at index {idx}"
+            ));
+        }
+
+        let args = parse_openai_tool_arguments(&function.arguments).map_err(|err| {
+            format!(
+                "provider returned invalid arguments for tool `{}`: {err}",
+                function.name
+            )
+        })?;
+
+        parsed.push(ToolCall {
+            name: function.name.clone(),
+            args,
+        });
+    }
+
+    Ok(parsed)
+}
+
+fn parse_openai_tool_arguments(arguments: &Value) -> Result<Value, String> {
+    if let Some(arguments_json) = arguments.as_str() {
+        return serde_json::from_str(arguments_json)
+            .map_err(|err| format!("arguments is not valid JSON: {err}"));
+    }
+
+    Ok(arguments.clone())
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct OpenAiChatCompletionsRequest {
     model: String,
     messages: Vec<OpenAiMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<OpenAiRequestTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OpenAiMessage {
     role: String,
     content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpenAiRequestTool {
+    #[serde(rename = "type")]
+    kind: String,
+    function: OpenAiRequestToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpenAiRequestToolFunction {
+    name: String,
+    description: String,
+    parameters: Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -259,6 +420,20 @@ struct OpenAiChoice {
 #[derive(Debug, Clone, Deserialize)]
 struct OpenAiChoiceMessage {
     content: Value,
+    tool_calls: Option<Vec<OpenAiMessageToolCall>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiMessageToolCall {
+    #[serde(rename = "type")]
+    kind: String,
+    function: Option<OpenAiFunctionCall>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiFunctionCall {
+    name: String,
+    arguments: Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -269,8 +444,18 @@ struct OpenAiUsage {
 
 #[cfg(test)]
 mod tests {
-    use super::{MultiProviderGateway, StaticProvider, extract_openai_message_text};
-    use agent_core::{protocol::Event, runtime::LlmGateway};
+    use super::{
+        MultiProviderGateway, OpenAiCompatibleProvider, OpenAiFunctionTool, OpenAiToolChoice,
+        ProviderAdapter, ProviderResponse, StaticProvider, extract_openai_message_text,
+        parse_openai_chat_completions_response,
+    };
+    use agent_core::{
+        memory::{EventStore, InMemoryEventStore},
+        policy::AllowAllPolicy,
+        protocol::{Event, EventKind, Op, StopReason},
+        runtime::{AgentRuntime, LlmGateway},
+        tools::{EchoTool, ToolRegistry},
+    };
     use serde_json::json;
 
     #[test]
@@ -304,5 +489,187 @@ mod tests {
         ]))
         .expect("extract text");
         assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn parses_tool_calls_from_openai_response_body() {
+        let body = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": null,
+                        "tool_calls": [
+                            {
+                                "id": "call_123",
+                                "type": "function",
+                                "function": {
+                                    "name": "echo",
+                                    "arguments": "{\"text\":\"hello\"}"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 3,
+                "completion_tokens": 5
+            }
+        })
+        .to_string();
+
+        let response =
+            parse_openai_chat_completions_response(&body, "say hello").expect("parse provider");
+
+        assert_eq!(response.text, "");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "echo");
+        assert_eq!(response.tool_calls[0].args, json!({ "text": "hello" }));
+    }
+
+    #[test]
+    fn returns_parse_error_for_malformed_tool_call_arguments() {
+        let body = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "echo",
+                                    "arguments": "{not-json}"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        })
+        .to_string();
+
+        let err =
+            parse_openai_chat_completions_response(&body, "hi").expect_err("expected parse error");
+        assert!(err.contains("invalid arguments for tool `echo`"));
+    }
+
+    #[test]
+    fn request_payload_includes_tools_and_tool_choice() {
+        let provider = OpenAiCompatibleProvider::new(
+            "openai-compatible",
+            "https://api.openai.com/v1",
+            "test-key",
+            "gpt-4o-mini",
+        )
+        .expect("provider should build")
+        .with_tool(OpenAiFunctionTool::new(
+            "echo",
+            "Echo input text",
+            json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" }
+                },
+                "required": ["text"]
+            }),
+        ))
+        .with_tool_choice(OpenAiToolChoice::Required);
+
+        let request = provider.build_chat_completions_request("say hi");
+        let payload = serde_json::to_value(&request).expect("serialize request");
+
+        assert_eq!(payload["tools"][0]["type"], "function");
+        assert_eq!(payload["tools"][0]["function"]["name"], "echo");
+        assert_eq!(payload["tool_choice"], "required");
+    }
+
+    #[test]
+    fn request_payload_omits_tools_and_tool_choice_when_no_tools_configured() {
+        let provider = OpenAiCompatibleProvider::new(
+            "openai-compatible",
+            "https://api.openai.com/v1",
+            "test-key",
+            "gpt-4o-mini",
+        )
+        .expect("provider should build")
+        .with_tool_choice(OpenAiToolChoice::Required);
+
+        let request = provider.build_chat_completions_request("say hi");
+        let payload = serde_json::to_value(&request).expect("serialize request");
+
+        assert!(payload.get("tools").is_none());
+        assert!(payload.get("tool_choice").is_none());
+    }
+
+    #[derive(Debug, Clone)]
+    struct FixtureParsedProvider {
+        body: String,
+    }
+
+    impl ProviderAdapter for FixtureParsedProvider {
+        fn name(&self) -> &str {
+            "fixture-parsed"
+        }
+
+        fn complete(&self, prompt: &str) -> Result<ProviderResponse, String> {
+            parse_openai_chat_completions_response(&self.body, prompt)
+        }
+    }
+
+    #[test]
+    fn runtime_executes_tool_call_parsed_from_provider_output() {
+        let provider_body = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "calling echo",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "echo",
+                                    "arguments": "{\"text\":\"from-provider\"}"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 2,
+                "completion_tokens": 4
+            }
+        })
+        .to_string();
+
+        let llm = MultiProviderGateway::new().with_provider(FixtureParsedProvider {
+            body: provider_body,
+        });
+        let mut runtime = AgentRuntime::default();
+        let mut tools = ToolRegistry::default();
+        tools.register(EchoTool);
+        let mut store = InMemoryEventStore::default();
+
+        let result = runtime.run_turn(
+            Op::UserInput {
+                submission_id: "sub-tool-integration".to_string(),
+                input: "please call echo".to_string(),
+            },
+            &llm,
+            &AllowAllPolicy,
+            &tools,
+            &mut store,
+        );
+
+        assert_eq!(result.stop_reason, StopReason::Done);
+        let executed = store.events().iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::ToolExecuted { ref result }
+                    if result.call_name == "echo" && !result.is_error
+            )
+        });
+        assert!(executed, "expected runtime to execute parsed tool call");
     }
 }
