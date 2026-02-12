@@ -82,205 +82,17 @@ impl AgentRuntime {
                     return result;
                 }
 
-                let mut total_tool_calls = 0_u64;
-                let mut total_tokens = 0_u64;
-
-                for _ in 0..self.config.max_control_loop_iterations {
-                    if let Some(result) = self.try_push_event(
-                        &submission_id,
-                        EventKind::ContextBuilt {
-                            recent_events: store.events().len(),
-                        },
-                        &mut emitted,
-                        store,
-                    ) {
-                        return result;
-                    }
-
-                    let llm_output = match llm.complete(&input, store.events()) {
-                        Ok(output) => output,
-                        Err(err) => {
-                            if let Some(result) = self.try_push_event(
-                                &submission_id,
-                                EventKind::LlmError { message: err },
-                                &mut emitted,
-                                store,
-                            ) {
-                                return result;
-                            }
-
-                            self.push_event(
-                                &submission_id,
-                                EventKind::TurnStopped {
-                                    reason: StopReason::Error,
-                                },
-                                &mut emitted,
-                                store,
-                            );
-
-                            return TurnResult {
-                                stop_reason: StopReason::Error,
-                                events: emitted,
-                            };
-                        }
-                    };
-
-                    if let Some(result) = self.try_push_event(
-                        &submission_id,
-                        EventKind::LlmText {
-                            text: llm_output.text.clone(),
-                        },
-                        &mut emitted,
-                        store,
-                    ) {
-                        return result;
-                    }
-
-                    total_tokens =
-                        total_tokens.saturating_add(estimate_text_tokens(&llm_output.text));
-                    if let Some(max_tokens) = self.config.max_tokens {
-                        if total_tokens > max_tokens {
-                            return self.stop_for_budget(
-                                &submission_id,
-                                BudgetKind::Tokens,
-                                max_tokens,
-                                total_tokens,
-                                &mut emitted,
-                                store,
-                            );
-                        }
-                    }
-
-                    if llm_output.tool_calls.is_empty() {
-                        self.push_event(
-                            &submission_id,
-                            EventKind::TurnStopped {
-                                reason: StopReason::Done,
-                            },
-                            &mut emitted,
-                            store,
-                        );
-
-                        return TurnResult {
-                            stop_reason: StopReason::Done,
-                            events: emitted,
-                        };
-                    }
-
-                    for call in llm_output.tool_calls {
-                        let next_tool_calls = total_tool_calls.saturating_add(1);
-                        if let Some(max_tool_calls) = self.config.max_tool_calls {
-                            if next_tool_calls > max_tool_calls {
-                                return self.stop_for_budget(
-                                    &submission_id,
-                                    BudgetKind::ToolCalls,
-                                    max_tool_calls,
-                                    next_tool_calls,
-                                    &mut emitted,
-                                    store,
-                                );
-                            }
-                        }
-                        total_tool_calls = next_tool_calls;
-
-                        if let Some(result) = self.try_push_event(
-                            &submission_id,
-                            EventKind::ToolCallProposed { call: call.clone() },
-                            &mut emitted,
-                            store,
-                        ) {
-                            return result;
-                        }
-
-                        let decision = policy.decide(&call);
-                        if let Some(result) = self.try_push_event(
-                            &submission_id,
-                            EventKind::PolicyEvaluated {
-                                call: call.clone(),
-                                decision: decision.clone(),
-                            },
-                            &mut emitted,
-                            store,
-                        ) {
-                            return result;
-                        }
-
-                        match decision {
-                            PolicyDecision::Allow => {
-                                let result = tools.execute(&call);
-                                let is_error = result.is_error;
-                                if let Some(stop) = self.try_push_event(
-                                    &submission_id,
-                                    EventKind::ToolExecuted { result },
-                                    &mut emitted,
-                                    store,
-                                ) {
-                                    return stop;
-                                }
-
-                                if is_error {
-                                    self.push_event(
-                                        &submission_id,
-                                        EventKind::TurnStopped {
-                                            reason: StopReason::Error,
-                                        },
-                                        &mut emitted,
-                                        store,
-                                    );
-
-                                    return TurnResult {
-                                        stop_reason: StopReason::Error,
-                                        events: emitted,
-                                    };
-                                }
-                            }
-                            PolicyDecision::Deny { .. } => {
-                                self.push_event(
-                                    &submission_id,
-                                    EventKind::TurnStopped {
-                                        reason: StopReason::PolicyDenied,
-                                    },
-                                    &mut emitted,
-                                    store,
-                                );
-
-                                return TurnResult {
-                                    stop_reason: StopReason::PolicyDenied,
-                                    events: emitted,
-                                };
-                            }
-                            PolicyDecision::AskHuman { .. } => {
-                                self.push_event(
-                                    &submission_id,
-                                    EventKind::TurnStopped {
-                                        reason: StopReason::HumanApprovalRequired,
-                                    },
-                                    &mut emitted,
-                                    store,
-                                );
-
-                                return TurnResult {
-                                    stop_reason: StopReason::HumanApprovalRequired,
-                                    events: emitted,
-                                };
-                            }
-                        }
-                    }
-                }
-
-                self.push_event(
+                self.run_control_loop(
                     &submission_id,
-                    EventKind::TurnStopped {
-                        reason: StopReason::Interrupted,
-                    },
+                    &input,
+                    llm,
+                    policy,
+                    tools,
                     &mut emitted,
                     store,
-                );
-
-                TurnResult {
-                    stop_reason: StopReason::Interrupted,
-                    events: emitted,
-                }
+                    0,
+                    0,
+                )
             }
             Op::Resume { checkpoint_id, .. } => {
                 if let Some(result) = self.try_push_event(
@@ -312,6 +124,10 @@ impl AgentRuntime {
                 reason,
                 ..
             } => {
+                let request_id_for_lookup = request_id.clone();
+                let pending_call =
+                    find_pending_human_approval_call(store, &submission_id, &request_id_for_lookup);
+
                 if let Some(result) = self.try_push_event(
                     &submission_id,
                     EventKind::HumanApprovalResolved {
@@ -325,21 +141,368 @@ impl AgentRuntime {
                     return result;
                 }
 
-                self.push_event(
+                if !approved {
+                    self.push_event(
+                        &submission_id,
+                        EventKind::TurnStopped {
+                            reason: StopReason::PolicyDenied,
+                        },
+                        &mut emitted,
+                        store,
+                    );
+
+                    return TurnResult {
+                        stop_reason: StopReason::PolicyDenied,
+                        events: emitted,
+                    };
+                }
+
+                let Some(pending_call) = pending_call else {
+                    self.push_event(
+                        &submission_id,
+                        EventKind::LlmError {
+                            message: format!(
+                                "no pending human approval request: {request_id_for_lookup}"
+                            ),
+                        },
+                        &mut emitted,
+                        store,
+                    );
+                    self.push_event(
+                        &submission_id,
+                        EventKind::TurnStopped {
+                            reason: StopReason::Error,
+                        },
+                        &mut emitted,
+                        store,
+                    );
+
+                    return TurnResult {
+                        stop_reason: StopReason::Error,
+                        events: emitted,
+                    };
+                };
+
+                if let Some(result) = self.try_push_event(
                     &submission_id,
-                    EventKind::TurnStopped {
-                        reason: StopReason::Interrupted,
+                    EventKind::TurnResumed {
+                        checkpoint_id: None,
                     },
                     &mut emitted,
                     store,
+                ) {
+                    return result;
+                }
+
+                let total_tool_calls =
+                    match self.consume_tool_call_budget(&submission_id, 0, &mut emitted, store) {
+                        Ok(next) => next,
+                        Err(result) => return result,
+                    };
+
+                let execution = tools.execute(&pending_call);
+                let is_error = execution.is_error;
+                if let Some(result) = self.try_push_event(
+                    &submission_id,
+                    EventKind::ToolExecuted { result: execution },
+                    &mut emitted,
+                    store,
+                ) {
+                    return result;
+                }
+                if is_error {
+                    self.push_event(
+                        &submission_id,
+                        EventKind::TurnStopped {
+                            reason: StopReason::Error,
+                        },
+                        &mut emitted,
+                        store,
+                    );
+                    return TurnResult {
+                        stop_reason: StopReason::Error,
+                        events: emitted,
+                    };
+                }
+
+                let Some(prompt) = latest_user_input_for_submission(store, &submission_id) else {
+                    self.push_event(
+                        &submission_id,
+                        EventKind::LlmError {
+                            message: "cannot resume: missing prior user input".to_string(),
+                        },
+                        &mut emitted,
+                        store,
+                    );
+                    self.push_event(
+                        &submission_id,
+                        EventKind::TurnStopped {
+                            reason: StopReason::Error,
+                        },
+                        &mut emitted,
+                        store,
+                    );
+                    return TurnResult {
+                        stop_reason: StopReason::Error,
+                        events: emitted,
+                    };
+                };
+
+                self.run_control_loop(
+                    &submission_id,
+                    &prompt,
+                    llm,
+                    policy,
+                    tools,
+                    &mut emitted,
+                    store,
+                    total_tool_calls,
+                    0,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_control_loop(
+        &mut self,
+        submission_id: &str,
+        prompt: &str,
+        llm: &dyn LlmGateway,
+        policy: &dyn PolicyEngine,
+        tools: &ToolRegistry,
+        emitted: &mut Vec<Event>,
+        store: &mut dyn EventStore,
+        mut total_tool_calls: u64,
+        mut total_tokens: u64,
+    ) -> TurnResult {
+        for _ in 0..self.config.max_control_loop_iterations {
+            if let Some(result) = self.try_push_event(
+                submission_id,
+                EventKind::ContextBuilt {
+                    recent_events: store.events().len(),
+                },
+                emitted,
+                store,
+            ) {
+                return result;
+            }
+
+            let llm_output = match llm.complete(prompt, store.events()) {
+                Ok(output) => output,
+                Err(err) => {
+                    if let Some(result) = self.try_push_event(
+                        submission_id,
+                        EventKind::LlmError { message: err },
+                        emitted,
+                        store,
+                    ) {
+                        return result;
+                    }
+
+                    self.push_event(
+                        submission_id,
+                        EventKind::TurnStopped {
+                            reason: StopReason::Error,
+                        },
+                        emitted,
+                        store,
+                    );
+
+                    return TurnResult {
+                        stop_reason: StopReason::Error,
+                        events: emitted.clone(),
+                    };
+                }
+            };
+
+            if let Some(result) = self.try_push_event(
+                submission_id,
+                EventKind::LlmText {
+                    text: llm_output.text.clone(),
+                },
+                emitted,
+                store,
+            ) {
+                return result;
+            }
+
+            total_tokens = total_tokens.saturating_add(estimate_text_tokens(&llm_output.text));
+            if let Some(max_tokens) = self.config.max_tokens {
+                if total_tokens > max_tokens {
+                    return self.stop_for_budget(
+                        submission_id,
+                        BudgetKind::Tokens,
+                        max_tokens,
+                        total_tokens,
+                        emitted,
+                        store,
+                    );
+                }
+            }
+
+            if llm_output.tool_calls.is_empty() {
+                self.push_event(
+                    submission_id,
+                    EventKind::TurnStopped {
+                        reason: StopReason::Done,
+                    },
+                    emitted,
+                    store,
                 );
 
-                TurnResult {
-                    stop_reason: StopReason::Interrupted,
-                    events: emitted,
+                return TurnResult {
+                    stop_reason: StopReason::Done,
+                    events: emitted.clone(),
+                };
+            }
+
+            for call in llm_output.tool_calls {
+                total_tool_calls = match self.consume_tool_call_budget(
+                    submission_id,
+                    total_tool_calls,
+                    emitted,
+                    store,
+                ) {
+                    Ok(next) => next,
+                    Err(result) => return result,
+                };
+
+                if let Some(result) = self.try_push_event(
+                    submission_id,
+                    EventKind::ToolCallProposed { call: call.clone() },
+                    emitted,
+                    store,
+                ) {
+                    return result;
+                }
+
+                let decision = policy.decide(&call);
+                if let Some(result) = self.try_push_event(
+                    submission_id,
+                    EventKind::PolicyEvaluated {
+                        call: call.clone(),
+                        decision: decision.clone(),
+                    },
+                    emitted,
+                    store,
+                ) {
+                    return result;
+                }
+
+                match decision {
+                    PolicyDecision::Allow => {
+                        let result = tools.execute(&call);
+                        let is_error = result.is_error;
+                        if let Some(stop) = self.try_push_event(
+                            submission_id,
+                            EventKind::ToolExecuted { result },
+                            emitted,
+                            store,
+                        ) {
+                            return stop;
+                        }
+
+                        if is_error {
+                            self.push_event(
+                                submission_id,
+                                EventKind::TurnStopped {
+                                    reason: StopReason::Error,
+                                },
+                                emitted,
+                                store,
+                            );
+
+                            return TurnResult {
+                                stop_reason: StopReason::Error,
+                                events: emitted.clone(),
+                            };
+                        }
+                    }
+                    PolicyDecision::Deny { .. } => {
+                        self.push_event(
+                            submission_id,
+                            EventKind::TurnStopped {
+                                reason: StopReason::PolicyDenied,
+                            },
+                            emitted,
+                            store,
+                        );
+
+                        return TurnResult {
+                            stop_reason: StopReason::PolicyDenied,
+                            events: emitted.clone(),
+                        };
+                    }
+                    PolicyDecision::AskHuman { reason } => {
+                        let request_id = format!("approval-{}", self.next_event_index);
+                        if let Some(result) = self.try_push_event(
+                            submission_id,
+                            EventKind::HumanApprovalRequested {
+                                request_id,
+                                call: call.clone(),
+                                reason,
+                            },
+                            emitted,
+                            store,
+                        ) {
+                            return result;
+                        }
+
+                        self.push_event(
+                            submission_id,
+                            EventKind::TurnStopped {
+                                reason: StopReason::HumanApprovalRequired,
+                            },
+                            emitted,
+                            store,
+                        );
+
+                        return TurnResult {
+                            stop_reason: StopReason::HumanApprovalRequired,
+                            events: emitted.clone(),
+                        };
+                    }
                 }
             }
         }
+
+        self.push_event(
+            submission_id,
+            EventKind::TurnStopped {
+                reason: StopReason::Interrupted,
+            },
+            emitted,
+            store,
+        );
+
+        TurnResult {
+            stop_reason: StopReason::Interrupted,
+            events: emitted.clone(),
+        }
+    }
+
+    fn consume_tool_call_budget(
+        &mut self,
+        submission_id: &str,
+        current_tool_calls: u64,
+        emitted: &mut Vec<Event>,
+        store: &mut dyn EventStore,
+    ) -> Result<u64, TurnResult> {
+        let next_tool_calls = current_tool_calls.saturating_add(1);
+        if let Some(max_tool_calls) = self.config.max_tool_calls {
+            if next_tool_calls > max_tool_calls {
+                return Err(self.stop_for_budget(
+                    submission_id,
+                    BudgetKind::ToolCalls,
+                    max_tool_calls,
+                    next_tool_calls,
+                    emitted,
+                    store,
+                ));
+            }
+        }
+        Ok(next_tool_calls)
     }
 
     fn try_push_event(
@@ -426,6 +589,47 @@ impl AgentRuntime {
     }
 }
 
+fn find_pending_human_approval_call(
+    store: &dyn EventStore,
+    submission_id: &str,
+    request_id: &str,
+) -> Option<ToolCall> {
+    let mut requested_call = None;
+    let mut resolved = false;
+    for event in store.events_for_submission(submission_id) {
+        match event.kind {
+            EventKind::HumanApprovalRequested {
+                request_id: event_request_id,
+                call,
+                ..
+            } if event_request_id == request_id => {
+                requested_call = Some(call);
+                resolved = false;
+            }
+            EventKind::HumanApprovalResolved {
+                request_id: event_request_id,
+                ..
+            } if event_request_id == request_id => {
+                resolved = true;
+            }
+            _ => {}
+        }
+    }
+
+    if resolved { None } else { requested_call }
+}
+
+fn latest_user_input_for_submission(store: &dyn EventStore, submission_id: &str) -> Option<String> {
+    store
+        .events_for_submission(submission_id)
+        .into_iter()
+        .rev()
+        .find_map(|event| match event.kind {
+            EventKind::UserInput { input } => Some(input),
+            _ => None,
+        })
+}
+
 fn estimate_text_tokens(text: &str) -> u64 {
     text.split_whitespace().count() as u64
 }
@@ -439,8 +643,8 @@ mod tests {
     use super::{AgentRuntime, LlmGateway, LlmOutput, RuntimeConfig};
     use crate::{
         memory::{EventStore, InMemoryEventStore},
-        policy::{AllowAllPolicy, DenyAllPolicy},
-        protocol::{BudgetKind, Event, EventKind, Op, StopReason, ToolCall},
+        policy::{AllowAllPolicy, DenyAllPolicy, PolicyEngine},
+        protocol::{BudgetKind, Event, EventKind, Op, PolicyDecision, StopReason, ToolCall},
         tools::{EchoTool, ToolRegistry},
     };
 
@@ -481,6 +685,26 @@ mod tests {
             });
             *idx += 1;
             Ok(output)
+        }
+    }
+
+    struct AskHumanPolicy {
+        reason: String,
+    }
+
+    impl AskHumanPolicy {
+        fn new(reason: impl Into<String>) -> Self {
+            Self {
+                reason: reason.into(),
+            }
+        }
+    }
+
+    impl PolicyEngine for AskHumanPolicy {
+        fn decide(&self, _call: &ToolCall) -> PolicyDecision {
+            PolicyDecision::AskHuman {
+                reason: self.reason.clone(),
+            }
         }
     }
 
@@ -558,29 +782,61 @@ mod tests {
     }
 
     #[test]
-    fn human_approval_response_op_emits_resolution_and_stops_interrupted() {
+    fn human_approval_approved_resumes_and_executes_pending_call() {
         let mut runtime = AgentRuntime::default();
         let mut store = InMemoryEventStore::default();
-        let tools = ToolRegistry::default();
-        let llm = StaticGateway {
-            text: "unused".to_string(),
-            tool_calls: Vec::new(),
-        };
+        let mut tools = ToolRegistry::default();
+        tools.register(EchoTool);
+        let llm = SequenceGateway::new(vec![
+            LlmOutput {
+                text: "need approval".to_string(),
+                tool_calls: vec![ToolCall {
+                    name: "echo".to_string(),
+                    args: json!({ "text": "approved" }),
+                }],
+            },
+            LlmOutput {
+                text: "done".to_string(),
+                tool_calls: Vec::new(),
+            },
+        ]);
 
-        let result = runtime.run_turn(
+        let first = runtime.run_turn(
+            Op::UserInput {
+                submission_id: "sub-approval".to_string(),
+                input: "needs approval".to_string(),
+            },
+            &llm,
+            &AskHumanPolicy::new("needs human"),
+            &tools,
+            &mut store,
+        );
+        assert_eq!(first.stop_reason, StopReason::HumanApprovalRequired);
+
+        let expected_request_id = first
+            .events
+            .iter()
+            .find_map(|event| match &event.kind {
+                EventKind::HumanApprovalRequested { request_id, .. } => Some(request_id.clone()),
+                _ => None,
+            })
+            .expect("expected approval request event");
+
+        let mut resumed_runtime = AgentRuntime::default();
+        let second = resumed_runtime.run_turn(
             Op::HumanApprovalResponse {
                 submission_id: "sub-approval".to_string(),
-                request_id: "approval-1".to_string(),
+                request_id: expected_request_id.clone(),
                 approved: true,
                 reason: Some("approved in test".to_string()),
             },
             &llm,
-            &DenyAllPolicy::new("unused"),
+            &AllowAllPolicy,
             &tools,
             &mut store,
         );
 
-        assert_eq!(result.stop_reason, StopReason::Interrupted);
+        assert_eq!(second.stop_reason, StopReason::Done);
         assert!(store.events().iter().any(|event| {
             matches!(
                 event.kind,
@@ -588,9 +844,72 @@ mod tests {
                     ref request_id,
                     approved: true,
                     reason: Some(ref reason),
-                } if request_id == "approval-1" && reason == "approved in test"
+                } if request_id == &expected_request_id && reason == "approved in test"
             )
         }));
+        assert!(store.events().iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::ToolExecuted { ref result }
+                    if result.call_name == "echo" && !result.is_error
+            )
+        }));
+    }
+
+    #[test]
+    fn human_approval_denied_stops_without_executing_pending_call() {
+        let mut runtime = AgentRuntime::default();
+        let mut store = InMemoryEventStore::default();
+        let mut tools = ToolRegistry::default();
+        tools.register(EchoTool);
+        let llm = SequenceGateway::new(vec![LlmOutput {
+            text: "need approval".to_string(),
+            tool_calls: vec![ToolCall {
+                name: "echo".to_string(),
+                args: json!({ "text": "should-not-run" }),
+            }],
+        }]);
+
+        let first = runtime.run_turn(
+            Op::UserInput {
+                submission_id: "sub-approval-deny".to_string(),
+                input: "needs approval".to_string(),
+            },
+            &llm,
+            &AskHumanPolicy::new("needs human"),
+            &tools,
+            &mut store,
+        );
+        assert_eq!(first.stop_reason, StopReason::HumanApprovalRequired);
+
+        let request_id = first
+            .events
+            .iter()
+            .find_map(|event| match &event.kind {
+                EventKind::HumanApprovalRequested { request_id, .. } => Some(request_id.clone()),
+                _ => None,
+            })
+            .expect("expected approval request event");
+
+        let second = runtime.run_turn(
+            Op::HumanApprovalResponse {
+                submission_id: "sub-approval-deny".to_string(),
+                request_id,
+                approved: false,
+                reason: Some("denied in test".to_string()),
+            },
+            &llm,
+            &AllowAllPolicy,
+            &tools,
+            &mut store,
+        );
+
+        assert_eq!(second.stop_reason, StopReason::PolicyDenied);
+        let executed = store
+            .events()
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ToolExecuted { .. }));
+        assert!(!executed);
     }
 
     #[test]
