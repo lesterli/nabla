@@ -69,6 +69,14 @@ pub enum StopReason {
     HumanApprovalRequired,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetKind {
+    ToolCalls,
+    Events,
+    Tokens,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventKind {
@@ -110,6 +118,11 @@ pub enum EventKind {
         approved: bool,
         reason: Option<String>,
     },
+    BudgetExceeded {
+        budget: BudgetKind,
+        limit: u64,
+        observed: u64,
+    },
     TurnStopped {
         reason: StopReason,
     },
@@ -138,7 +151,7 @@ impl Event {
 mod tests {
     use serde_json::json;
 
-    use super::{Event, EventKind, Op, StopReason, ToolCall};
+    use super::{BudgetKind, Event, EventKind, Op, StopReason, ToolCall};
 
     fn assert_stable_json<T: serde::Serialize>(actual: T, expected: &str) {
         let actual =
@@ -302,6 +315,32 @@ mod tests {
     "request_id": "approval-7",
     "approved": false,
     "reason": "rejected in test"
+  }
+}"#;
+
+        assert_stable_json(event, expected);
+    }
+
+    #[test]
+    fn protocol_schema_budget_exceeded_event_json_shape_is_stable() {
+        let event = Event::new(
+            "submission-42".to_string(),
+            12,
+            EventKind::BudgetExceeded {
+                budget: BudgetKind::ToolCalls,
+                limit: 3,
+                observed: 4,
+            },
+        );
+        let expected = r#"{
+  "schema_version": 1,
+  "submission_id": "submission-42",
+  "index": 12,
+  "kind": {
+    "kind": "budget_exceeded",
+    "budget": "tool_calls",
+    "limit": 3,
+    "observed": 4
   }
 }"#;
 

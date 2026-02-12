@@ -1,7 +1,7 @@
 use crate::{
     memory::EventStore,
     policy::PolicyEngine,
-    protocol::{Event, EventKind, Op, PolicyDecision, StopReason, ToolCall},
+    protocol::{BudgetKind, Event, EventKind, Op, PolicyDecision, StopReason, ToolCall},
     tools::ToolRegistry,
 };
 
@@ -10,6 +10,25 @@ pub trait LlmGateway {
 }
 
 const DEFAULT_MAX_CONTROL_LOOP_ITERATIONS: usize = 16;
+
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    pub max_tool_calls: Option<u64>,
+    pub max_events: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub max_control_loop_iterations: usize,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_tool_calls: None,
+            max_events: None,
+            max_tokens: None,
+            max_control_loop_iterations: DEFAULT_MAX_CONTROL_LOOP_ITERATIONS,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LlmOutput {
@@ -26,9 +45,17 @@ pub struct TurnResult {
 #[derive(Debug, Default)]
 pub struct AgentRuntime {
     next_event_index: u64,
+    config: RuntimeConfig,
 }
 
 impl AgentRuntime {
+    pub fn with_config(config: RuntimeConfig) -> Self {
+        Self {
+            next_event_index: 0,
+            config,
+        }
+    }
+
     pub fn run_turn(
         &mut self,
         op: Op,
@@ -44,34 +71,43 @@ impl AgentRuntime {
 
         match op {
             Op::UserInput { input, .. } => {
-                self.push_event(
+                if let Some(result) = self.try_push_event(
                     &submission_id,
                     EventKind::UserInput {
                         input: input.clone(),
                     },
                     &mut emitted,
                     store,
-                );
+                ) {
+                    return result;
+                }
 
-                for _ in 0..DEFAULT_MAX_CONTROL_LOOP_ITERATIONS {
-                    self.push_event(
+                let mut total_tool_calls = 0_u64;
+                let mut total_tokens = 0_u64;
+
+                for _ in 0..self.config.max_control_loop_iterations {
+                    if let Some(result) = self.try_push_event(
                         &submission_id,
                         EventKind::ContextBuilt {
                             recent_events: store.events().len(),
                         },
                         &mut emitted,
                         store,
-                    );
+                    ) {
+                        return result;
+                    }
 
                     let llm_output = match llm.complete(&input, store.events()) {
                         Ok(output) => output,
                         Err(err) => {
-                            self.push_event(
+                            if let Some(result) = self.try_push_event(
                                 &submission_id,
                                 EventKind::LlmError { message: err },
                                 &mut emitted,
                                 store,
-                            );
+                            ) {
+                                return result;
+                            }
 
                             self.push_event(
                                 &submission_id,
@@ -89,14 +125,31 @@ impl AgentRuntime {
                         }
                     };
 
-                    self.push_event(
+                    if let Some(result) = self.try_push_event(
                         &submission_id,
                         EventKind::LlmText {
-                            text: llm_output.text,
+                            text: llm_output.text.clone(),
                         },
                         &mut emitted,
                         store,
-                    );
+                    ) {
+                        return result;
+                    }
+
+                    total_tokens =
+                        total_tokens.saturating_add(estimate_text_tokens(&llm_output.text));
+                    if let Some(max_tokens) = self.config.max_tokens {
+                        if total_tokens > max_tokens {
+                            return self.stop_for_budget(
+                                &submission_id,
+                                BudgetKind::Tokens,
+                                max_tokens,
+                                total_tokens,
+                                &mut emitted,
+                                store,
+                            );
+                        }
+                    }
 
                     if llm_output.tool_calls.is_empty() {
                         self.push_event(
@@ -115,15 +168,32 @@ impl AgentRuntime {
                     }
 
                     for call in llm_output.tool_calls {
-                        self.push_event(
+                        let next_tool_calls = total_tool_calls.saturating_add(1);
+                        if let Some(max_tool_calls) = self.config.max_tool_calls {
+                            if next_tool_calls > max_tool_calls {
+                                return self.stop_for_budget(
+                                    &submission_id,
+                                    BudgetKind::ToolCalls,
+                                    max_tool_calls,
+                                    next_tool_calls,
+                                    &mut emitted,
+                                    store,
+                                );
+                            }
+                        }
+                        total_tool_calls = next_tool_calls;
+
+                        if let Some(result) = self.try_push_event(
                             &submission_id,
                             EventKind::ToolCallProposed { call: call.clone() },
                             &mut emitted,
                             store,
-                        );
+                        ) {
+                            return result;
+                        }
 
                         let decision = policy.decide(&call);
-                        self.push_event(
+                        if let Some(result) = self.try_push_event(
                             &submission_id,
                             EventKind::PolicyEvaluated {
                                 call: call.clone(),
@@ -131,18 +201,22 @@ impl AgentRuntime {
                             },
                             &mut emitted,
                             store,
-                        );
+                        ) {
+                            return result;
+                        }
 
                         match decision {
                             PolicyDecision::Allow => {
                                 let result = tools.execute(&call);
                                 let is_error = result.is_error;
-                                self.push_event(
+                                if let Some(stop) = self.try_push_event(
                                     &submission_id,
                                     EventKind::ToolExecuted { result },
                                     &mut emitted,
                                     store,
-                                );
+                                ) {
+                                    return stop;
+                                }
 
                                 if is_error {
                                     self.push_event(
@@ -209,12 +283,14 @@ impl AgentRuntime {
                 }
             }
             Op::Resume { checkpoint_id, .. } => {
-                self.push_event(
+                if let Some(result) = self.try_push_event(
                     &submission_id,
                     EventKind::TurnResumed { checkpoint_id },
                     &mut emitted,
                     store,
-                );
+                ) {
+                    return result;
+                }
 
                 self.push_event(
                     &submission_id,
@@ -236,7 +312,7 @@ impl AgentRuntime {
                 reason,
                 ..
             } => {
-                self.push_event(
+                if let Some(result) = self.try_push_event(
                     &submission_id,
                     EventKind::HumanApprovalResolved {
                         request_id,
@@ -245,7 +321,9 @@ impl AgentRuntime {
                     },
                     &mut emitted,
                     store,
-                );
+                ) {
+                    return result;
+                }
 
                 self.push_event(
                     &submission_id,
@@ -261,6 +339,65 @@ impl AgentRuntime {
                     events: emitted,
                 }
             }
+        }
+    }
+
+    fn try_push_event(
+        &mut self,
+        submission_id: &str,
+        kind: EventKind,
+        emitted: &mut Vec<Event>,
+        store: &mut dyn EventStore,
+    ) -> Option<TurnResult> {
+        if let Some(max_events) = self.config.max_events {
+            let next_events = emitted.len() as u64 + 1;
+            if next_events > max_events {
+                return Some(self.stop_for_budget(
+                    submission_id,
+                    BudgetKind::Events,
+                    max_events,
+                    next_events,
+                    emitted,
+                    store,
+                ));
+            }
+        }
+
+        self.push_event(submission_id, kind, emitted, store);
+        None
+    }
+
+    fn stop_for_budget(
+        &mut self,
+        submission_id: &str,
+        budget: BudgetKind,
+        limit: u64,
+        observed: u64,
+        emitted: &mut Vec<Event>,
+        store: &mut dyn EventStore,
+    ) -> TurnResult {
+        self.push_event(
+            submission_id,
+            EventKind::BudgetExceeded {
+                budget,
+                limit,
+                observed,
+            },
+            emitted,
+            store,
+        );
+        self.push_event(
+            submission_id,
+            EventKind::TurnStopped {
+                reason: StopReason::BudgetExceeded,
+            },
+            emitted,
+            store,
+        );
+
+        TurnResult {
+            stop_reason: StopReason::BudgetExceeded,
+            events: emitted.clone(),
         }
     }
 
@@ -289,17 +426,21 @@ impl AgentRuntime {
     }
 }
 
+fn estimate_text_tokens(text: &str) -> u64 {
+    text.split_whitespace().count() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
     use serde_json::json;
 
-    use super::{AgentRuntime, LlmGateway, LlmOutput};
+    use super::{AgentRuntime, LlmGateway, LlmOutput, RuntimeConfig};
     use crate::{
         memory::{EventStore, InMemoryEventStore},
         policy::{AllowAllPolicy, DenyAllPolicy},
-        protocol::{Event, EventKind, Op, StopReason, ToolCall},
+        protocol::{BudgetKind, Event, EventKind, Op, StopReason, ToolCall},
         tools::{EchoTool, ToolRegistry},
     };
 
@@ -502,7 +643,12 @@ mod tests {
             .index;
         assert_eq!(second_first_index, first_last_index + 1);
 
-        assert!(store.events().windows(2).all(|pair| pair[0].index < pair[1].index));
+        assert!(
+            store
+                .events()
+                .windows(2)
+                .all(|pair| pair[0].index < pair[1].index)
+        );
     }
 
     #[test]
@@ -528,11 +674,7 @@ mod tests {
             &mut store,
         );
 
-        let first_index = result
-            .events
-            .first()
-            .expect("run should emit events")
-            .index;
+        let first_index = result.events.first().expect("run should emit events").index;
         assert_eq!(first_index, 0);
     }
 
@@ -643,5 +785,137 @@ mod tests {
                 reason: StopReason::Error
             }
         ));
+    }
+
+    #[test]
+    fn max_tool_calls_budget_stops_with_budget_exceeded() {
+        let mut store = InMemoryEventStore::default();
+        let mut tools = ToolRegistry::default();
+        tools.register(EchoTool);
+
+        let llm = SequenceGateway::new(vec![
+            LlmOutput {
+                text: "step 1".to_string(),
+                tool_calls: vec![ToolCall {
+                    name: "echo".to_string(),
+                    args: json!({ "text": "one" }),
+                }],
+            },
+            LlmOutput {
+                text: "step 2".to_string(),
+                tool_calls: vec![ToolCall {
+                    name: "echo".to_string(),
+                    args: json!({ "text": "two" }),
+                }],
+            },
+        ]);
+
+        let config = RuntimeConfig {
+            max_tool_calls: Some(1),
+            ..RuntimeConfig::default()
+        };
+        let mut runtime = AgentRuntime::with_config(config);
+        let result = runtime.run_turn(
+            Op::UserInput {
+                submission_id: "sub-tool-budget".to_string(),
+                input: "budget".to_string(),
+            },
+            &llm,
+            &AllowAllPolicy,
+            &tools,
+            &mut store,
+        );
+
+        assert_eq!(result.stop_reason, StopReason::BudgetExceeded);
+        assert!(store.events().iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::BudgetExceeded {
+                    budget: BudgetKind::ToolCalls,
+                    limit: 1,
+                    observed: 2
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn max_events_budget_stops_with_budget_exceeded() {
+        let mut store = InMemoryEventStore::default();
+        let mut tools = ToolRegistry::default();
+        tools.register(EchoTool);
+
+        let llm = StaticGateway {
+            text: "hello world".to_string(),
+            tool_calls: Vec::new(),
+        };
+
+        let config = RuntimeConfig {
+            max_events: Some(2),
+            ..RuntimeConfig::default()
+        };
+        let mut runtime = AgentRuntime::with_config(config);
+        let result = runtime.run_turn(
+            Op::UserInput {
+                submission_id: "sub-event-budget".to_string(),
+                input: "budget".to_string(),
+            },
+            &llm,
+            &AllowAllPolicy,
+            &tools,
+            &mut store,
+        );
+
+        assert_eq!(result.stop_reason, StopReason::BudgetExceeded);
+        assert!(store.events().iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::BudgetExceeded {
+                    budget: BudgetKind::Events,
+                    limit: 2,
+                    observed: 3
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn max_tokens_budget_stops_with_budget_exceeded() {
+        let mut store = InMemoryEventStore::default();
+        let mut tools = ToolRegistry::default();
+        tools.register(EchoTool);
+
+        let llm = StaticGateway {
+            text: "one two three".to_string(),
+            tool_calls: Vec::new(),
+        };
+
+        let config = RuntimeConfig {
+            max_tokens: Some(2),
+            ..RuntimeConfig::default()
+        };
+        let mut runtime = AgentRuntime::with_config(config);
+        let result = runtime.run_turn(
+            Op::UserInput {
+                submission_id: "sub-token-budget".to_string(),
+                input: "budget".to_string(),
+            },
+            &llm,
+            &AllowAllPolicy,
+            &tools,
+            &mut store,
+        );
+
+        assert_eq!(result.stop_reason, StopReason::BudgetExceeded);
+        assert!(store.events().iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::BudgetExceeded {
+                    budget: BudgetKind::Tokens,
+                    limit: 2,
+                    observed: 3
+                }
+            )
+        }));
     }
 }
