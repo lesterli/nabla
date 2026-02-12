@@ -444,6 +444,8 @@ struct OpenAiUsage {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::{
         MultiProviderGateway, OpenAiCompatibleProvider, OpenAiFunctionTool, OpenAiToolChoice,
         ProviderAdapter, ProviderResponse, StaticProvider, extract_openai_message_text,
@@ -602,9 +604,11 @@ mod tests {
         assert!(payload.get("tool_choice").is_none());
     }
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug)]
     struct FixtureParsedProvider {
-        body: String,
+        first_body: String,
+        next_body: String,
+        call_count: Mutex<usize>,
     }
 
     impl ProviderAdapter for FixtureParsedProvider {
@@ -613,7 +617,17 @@ mod tests {
         }
 
         fn complete(&self, prompt: &str) -> Result<ProviderResponse, String> {
-            parse_openai_chat_completions_response(&self.body, prompt)
+            let mut call_count = self
+                .call_count
+                .lock()
+                .expect("fixture parsed provider mutex poisoned");
+            let body = if *call_count == 0 {
+                &self.first_body
+            } else {
+                &self.next_body
+            };
+            *call_count += 1;
+            parse_openai_chat_completions_response(body, prompt)
         }
     }
 
@@ -643,8 +657,26 @@ mod tests {
         })
         .to_string();
 
+        let done_body = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "done",
+                        "tool_calls": []
+                    }
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1
+            }
+        })
+        .to_string();
+
         let llm = MultiProviderGateway::new().with_provider(FixtureParsedProvider {
-            body: provider_body,
+            first_body: provider_body,
+            next_body: done_body,
+            call_count: Mutex::new(0),
         });
         let mut runtime = AgentRuntime::default();
         let mut tools = ToolRegistry::default();
