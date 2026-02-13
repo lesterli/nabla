@@ -1,3 +1,5 @@
+mod extensions;
+
 use std::path::PathBuf;
 
 use agent_core::{
@@ -11,6 +13,10 @@ use agent_core::{
 use agent_llm::{
     MultiProviderGateway, OpenAiCompatibleProvider, OpenAiFunctionTool, OpenAiToolChoice,
     StaticProvider,
+};
+use extensions::{
+    host::ExtensionHost,
+    types::{NextAction, TurnContext},
 };
 use serde_json::json;
 
@@ -48,6 +54,7 @@ enum CliCommand {
 struct CommandExecution {
     events: Vec<Event>,
     exit_code: i32,
+    diagnostics: Vec<String>,
 }
 
 fn print_usage(program: &str) {
@@ -444,6 +451,20 @@ fn execute_parsed_command(
     command: CliCommand,
     llm: Option<&dyn LlmGateway>,
 ) -> Result<CommandExecution, String> {
+    execute_parsed_command_with_extensions(command, llm, None)
+}
+
+fn execute_parsed_command_with_extensions(
+    command: CliCommand,
+    llm: Option<&dyn LlmGateway>,
+    extension_host: Option<&mut ExtensionHost>,
+) -> Result<CommandExecution, String> {
+    let mut default_host = ExtensionHost::default();
+    let host = match extension_host {
+        Some(host) => host,
+        None => &mut default_host,
+    };
+
     match command {
         CliCommand::Run {
             submission_id,
@@ -451,7 +472,7 @@ fn execute_parsed_command(
             store_file,
         } => {
             let llm = llm.ok_or_else(|| "run requires an LLM gateway".to_string())?;
-            execute_run(submission_id, prompt, store_file, llm)
+            execute_run(submission_id, prompt, store_file, llm, host)
         }
         CliCommand::Resume {
             submission_id,
@@ -459,7 +480,7 @@ fn execute_parsed_command(
             store_file,
         } => {
             let llm = llm.ok_or_else(|| "resume requires an LLM gateway".to_string())?;
-            execute_resume(submission_id, checkpoint_id, store_file, llm)
+            execute_resume(submission_id, checkpoint_id, store_file, llm, host)
         }
         CliCommand::Approve {
             submission_id,
@@ -469,7 +490,15 @@ fn execute_parsed_command(
             store_file,
         } => {
             let llm = llm.ok_or_else(|| "approve requires an LLM gateway".to_string())?;
-            execute_approve(submission_id, request_id, approved, reason, store_file, llm)
+            execute_approve(
+                submission_id,
+                request_id,
+                approved,
+                reason,
+                store_file,
+                llm,
+                host,
+            )
         }
         CliCommand::Replay {
             submission_id,
@@ -484,49 +513,123 @@ fn execute_run(
     prompt: String,
     store_file: Option<PathBuf>,
     llm: &dyn LlmGateway,
+    extension_host: &mut ExtensionHost,
+) -> Result<CommandExecution, String> {
+    match store_file {
+        Some(path) => {
+            let mut store = FileEventStore::open(&path)
+                .map_err(|err| format!("failed to open store file `{}`: {err}", path.display()))?;
+            execute_turn_with_extensions(
+                Op::UserInput {
+                    submission_id,
+                    input: prompt,
+                },
+                llm,
+                &mut store,
+                extension_host,
+                true,
+            )
+        }
+        None => {
+            let mut store = InMemoryEventStore::default();
+            execute_turn_with_extensions(
+                Op::UserInput {
+                    submission_id,
+                    input: prompt,
+                },
+                llm,
+                &mut store,
+                extension_host,
+                true,
+            )
+        }
+    }
+}
+
+fn execute_turn_with_extensions(
+    initial_op: Op,
+    llm: &dyn LlmGateway,
+    store: &mut dyn EventStore,
+    extension_host: &mut ExtensionHost,
+    strict_done_exit: bool,
 ) -> Result<CommandExecution, String> {
     let mut runtime = AgentRuntime::default();
     let policy = AllowAllPolicy;
     let tools = build_tools();
 
-    let turn = match store_file {
-        Some(path) => {
-            let mut store = FileEventStore::open(&path)
-                .map_err(|err| format!("failed to open store file `{}`: {err}", path.display()))?;
-            runtime.run_turn(
-                Op::UserInput {
-                    submission_id,
-                    input: prompt,
-                },
-                llm,
-                &policy,
-                &tools,
-                &mut store,
-            )
+    let mut current_op = initial_op;
+    let mut all_events = Vec::new();
+    let mut follow_up_turns_used = 0usize;
+
+    let final_stop_reason = loop {
+        let current_submission_id = current_op.submission_id().to_string();
+        let turn = runtime.run_turn(current_op, llm, &policy, &tools, store);
+        let turn_stop_reason = turn.stop_reason.clone();
+
+        let turn_events = turn.events.clone();
+        all_events.extend(turn_events.clone());
+
+        let context = TurnContext {
+            submission_id: current_submission_id.clone(),
+            stop_reason: turn.stop_reason,
+            stop_facts: turn.stop_facts,
+            events: turn_events,
+        };
+
+        let next_action = extension_host.process_turn(&context);
+        let Some(next_action) = next_action else {
+            break turn_stop_reason;
+        };
+
+        match next_action {
+            NextAction::Stop => break turn_stop_reason,
+            NextAction::Continue { input } => {
+                if follow_up_turns_used >= extension_host.max_follow_up_turns() {
+                    extension_host.record_diagnostic(format!(
+                        "extension follow-up budget exceeded: max_follow_up_turns={}",
+                        extension_host.max_follow_up_turns()
+                    ));
+                    break turn_stop_reason;
+                }
+                follow_up_turns_used = follow_up_turns_used.saturating_add(1);
+                current_op = Op::UserInput {
+                    submission_id: current_submission_id,
+                    input,
+                };
+            }
+            NextAction::AskHumanMessage { message } => {
+                if follow_up_turns_used >= extension_host.max_follow_up_turns() {
+                    extension_host.record_diagnostic(format!(
+                        "extension follow-up budget exceeded: max_follow_up_turns={}",
+                        extension_host.max_follow_up_turns()
+                    ));
+                    break turn_stop_reason;
+                }
+                follow_up_turns_used = follow_up_turns_used.saturating_add(1);
+                current_op = Op::UserInput {
+                    submission_id: current_submission_id,
+                    input: message,
+                };
+            }
         }
-        None => {
-            let mut store = InMemoryEventStore::default();
-            runtime.run_turn(
-                Op::UserInput {
-                    submission_id,
-                    input: prompt,
-                },
-                llm,
-                &policy,
-                &tools,
-                &mut store,
-            )
+    };
+    let exit_code = if strict_done_exit {
+        if final_stop_reason == StopReason::Done {
+            0
+        } else {
+            1
+        }
+    } else {
+        match final_stop_reason {
+            StopReason::Error | StopReason::PolicyDenied | StopReason::BudgetExceeded => 1,
+            _ => 0,
         }
     };
 
-    let exit_code = if turn.stop_reason == StopReason::Done {
-        0
-    } else {
-        1
-    };
     Ok(CommandExecution {
-        events: turn.events,
+        events: all_events,
         exit_code,
+        diagnostics: extension_host.diagnostics().to_vec(),
     })
 }
 
@@ -535,10 +638,8 @@ fn execute_resume(
     checkpoint_id: Option<String>,
     store_file: PathBuf,
     llm: &dyn LlmGateway,
+    extension_host: &mut ExtensionHost,
 ) -> Result<CommandExecution, String> {
-    let mut runtime = AgentRuntime::default();
-    let policy = AllowAllPolicy;
-    let tools = build_tools();
     let mut store = FileEventStore::open(&store_file).map_err(|err| {
         format!(
             "failed to open store file `{}`: {err}",
@@ -546,25 +647,16 @@ fn execute_resume(
         )
     })?;
 
-    let turn = runtime.run_turn(
+    execute_turn_with_extensions(
         Op::Resume {
             submission_id,
             checkpoint_id,
         },
         llm,
-        &policy,
-        &tools,
         &mut store,
-    );
-
-    let exit_code = match turn.stop_reason {
-        StopReason::Error | StopReason::PolicyDenied | StopReason::BudgetExceeded => 1,
-        _ => 0,
-    };
-    Ok(CommandExecution {
-        events: turn.events,
-        exit_code,
-    })
+        extension_host,
+        false,
+    )
 }
 
 fn execute_replay(submission_id: String, store_file: PathBuf) -> Result<CommandExecution, String> {
@@ -578,6 +670,7 @@ fn execute_replay(submission_id: String, store_file: PathBuf) -> Result<CommandE
     Ok(CommandExecution {
         events: store.events_for_submission(&submission_id),
         exit_code: 0,
+        diagnostics: Vec::new(),
     })
 }
 
@@ -588,10 +681,8 @@ fn execute_approve(
     reason: Option<String>,
     store_file: PathBuf,
     llm: &dyn LlmGateway,
+    extension_host: &mut ExtensionHost,
 ) -> Result<CommandExecution, String> {
-    let mut runtime = AgentRuntime::default();
-    let policy = AllowAllPolicy;
-    let tools = build_tools();
     let mut store = FileEventStore::open(&store_file).map_err(|err| {
         format!(
             "failed to open store file `{}`: {err}",
@@ -599,7 +690,7 @@ fn execute_approve(
         )
     })?;
 
-    let turn = runtime.run_turn(
+    execute_turn_with_extensions(
         Op::HumanApprovalResponse {
             submission_id,
             request_id,
@@ -607,19 +698,10 @@ fn execute_approve(
             reason,
         },
         llm,
-        &policy,
-        &tools,
         &mut store,
-    );
-
-    let exit_code = match turn.stop_reason {
-        StopReason::Error | StopReason::PolicyDenied | StopReason::BudgetExceeded => 1,
-        _ => 0,
-    };
-    Ok(CommandExecution {
-        events: turn.events,
-        exit_code,
-    })
+        extension_host,
+        false,
+    )
 }
 
 fn main() {
@@ -666,6 +748,9 @@ fn main() {
                 let line = serde_json::to_string(&event).expect("serialize event");
                 println!("{line}");
             }
+            for diagnostic in execution.diagnostics {
+                eprintln!("Extension diagnostic: {diagnostic}");
+            }
 
             if execution.exit_code != 0 {
                 std::process::exit(execution.exit_code);
@@ -684,6 +769,9 @@ fn main() {
                 let line = serde_json::to_string(&event).expect("serialize event");
                 println!("{line}");
             }
+            for diagnostic in execution.diagnostics {
+                eprintln!("Extension diagnostic: {diagnostic}");
+            }
         }
     }
 }
@@ -697,13 +785,17 @@ mod tests {
     };
 
     use super::{
-        CliCommand, execute_parsed_command, parse_cli_command, parse_tool_choice_env,
-        parse_tools_env,
+        CliCommand, execute_parsed_command, execute_parsed_command_with_extensions,
+        parse_cli_command, parse_tool_choice_env, parse_tools_env,
+    };
+    use crate::extensions::{
+        host::ExtensionHost,
+        types::{CliExtension, NextAction, TurnContext},
     };
     use agent_core::{
         memory::EventStore,
         memory_file::FileEventStore,
-        protocol::{Event, EventKind, StopReason, ToolCall},
+        protocol::{Event, EventKind, StopFacts, StopReason, ToolCall},
     };
     use agent_llm::{MultiProviderGateway, OpenAiToolChoice, StaticProvider};
     use serde_json::json;
@@ -1046,6 +1138,296 @@ mod tests {
         match choice {
             OpenAiToolChoice::Function { name } => assert_eq!(name, "echo"),
             _ => panic!("expected function tool choice"),
+        }
+    }
+
+    struct FollowUpOnceExtension {
+        used: bool,
+        input: String,
+    }
+
+    impl CliExtension for FollowUpOnceExtension {
+        fn name(&self) -> &'static str {
+            "follow-up-once"
+        }
+
+        fn priority(&self) -> i32 {
+            10
+        }
+
+        fn propose_next_action(
+            &mut self,
+            context: &TurnContext,
+        ) -> Result<Option<NextAction>, String> {
+            let _ = (
+                &context.submission_id,
+                &context.stop_reason,
+                &context.events,
+            );
+            if self.used {
+                return Ok(None);
+            }
+            self.used = true;
+            Ok(Some(NextAction::Continue {
+                input: self.input.clone(),
+            }))
+        }
+    }
+
+    struct AskHumanMessageOnceExtension {
+        used: bool,
+        message: String,
+    }
+
+    impl CliExtension for AskHumanMessageOnceExtension {
+        fn name(&self) -> &'static str {
+            "ask-human-message-once"
+        }
+
+        fn priority(&self) -> i32 {
+            5
+        }
+
+        fn propose_next_action(
+            &mut self,
+            _context: &TurnContext,
+        ) -> Result<Option<NextAction>, String> {
+            if self.used {
+                return Ok(None);
+            }
+            self.used = true;
+            Ok(Some(NextAction::AskHumanMessage {
+                message: self.message.clone(),
+            }))
+        }
+    }
+
+    struct FailingExtension;
+
+    impl CliExtension for FailingExtension {
+        fn name(&self) -> &'static str {
+            "failing-extension"
+        }
+
+        fn priority(&self) -> i32 {
+            100
+        }
+
+        fn on_turn_end(&mut self, _context: &TurnContext) -> Result<(), String> {
+            Err("intentional failure for test".to_string())
+        }
+    }
+
+    struct StopExtension;
+
+    impl CliExtension for StopExtension {
+        fn name(&self) -> &'static str {
+            "stop-extension"
+        }
+
+        fn priority(&self) -> i32 {
+            1
+        }
+
+        fn propose_next_action(
+            &mut self,
+            _context: &TurnContext,
+        ) -> Result<Option<NextAction>, String> {
+            Ok(Some(NextAction::Stop))
+        }
+    }
+
+    fn dummy_turn_context() -> TurnContext {
+        TurnContext {
+            submission_id: "sub-ext".to_string(),
+            stop_reason: StopReason::Done,
+            stop_facts: StopFacts {
+                stop_reason: StopReason::Done,
+                budget_exceeded: None,
+                tool_error_count: 0,
+                last_tool_calls: Vec::new(),
+                has_pending_approval: false,
+            },
+            events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn extension_host_follow_up_injects_second_turn() {
+        let store_path = temp_store_path("extension-follow-up");
+        if let Some(parent) = store_path.parent() {
+            fs::create_dir_all(parent).expect("create temp dir");
+        }
+
+        let llm =
+            MultiProviderGateway::new().with_provider(StaticProvider::new("mock", "assistant> "));
+        let store_path_str = store_path.to_string_lossy().to_string();
+        let run_command = parse_cli_command(&args(&[
+            "run",
+            "--submission-id",
+            "sub-ext-follow-up",
+            "--store-file",
+            &store_path_str,
+            "first input",
+        ]))
+        .expect("parse run");
+
+        let mut host = ExtensionHost::default();
+        host.set_max_follow_up_turns(2);
+        host.add_extension(Box::new(FollowUpOnceExtension {
+            used: false,
+            input: "second input from extension".to_string(),
+        }));
+
+        let execution =
+            execute_parsed_command_with_extensions(run_command, Some(&llm), Some(&mut host))
+                .expect("execute command with extensions");
+        assert_eq!(execution.exit_code, 0);
+        assert!(execution.diagnostics.is_empty());
+
+        let user_inputs = execution
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::UserInput { input } => Some(input.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(user_inputs.len(), 2);
+        assert_eq!(user_inputs[0], "first input");
+        assert_eq!(user_inputs[1], "second input from extension");
+
+        fs::remove_file(&store_path).expect("cleanup store file");
+        if let Some(parent) = store_path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+
+    #[test]
+    fn extension_host_conflict_resolution_prefers_higher_priority() {
+        let mut host = ExtensionHost::default();
+        host.add_extension(Box::new(FollowUpOnceExtension {
+            used: false,
+            input: "high-priority".to_string(),
+        }));
+        host.add_extension(Box::new(StopExtension));
+
+        let next = host.process_turn(&dummy_turn_context());
+        assert_eq!(
+            next,
+            Some(NextAction::Continue {
+                input: "high-priority".to_string()
+            })
+        );
+        assert!(
+            host.diagnostics()
+                .iter()
+                .any(|message| message.contains("extension action conflict")),
+            "expected deterministic conflict diagnostic"
+        );
+    }
+
+    #[test]
+    fn extension_failure_is_isolated_and_reported() {
+        let store_path = temp_store_path("extension-failure");
+        if let Some(parent) = store_path.parent() {
+            fs::create_dir_all(parent).expect("create temp dir");
+        }
+
+        let llm =
+            MultiProviderGateway::new().with_provider(StaticProvider::new("mock", "assistant> "));
+        let store_path_str = store_path.to_string_lossy().to_string();
+        let run_command = parse_cli_command(&args(&[
+            "run",
+            "--submission-id",
+            "sub-ext-failure",
+            "--store-file",
+            &store_path_str,
+            "first input",
+        ]))
+        .expect("parse run");
+
+        let mut host = ExtensionHost::default();
+        host.add_extension(Box::new(FailingExtension));
+        host.add_extension(Box::new(FollowUpOnceExtension {
+            used: false,
+            input: "still-runs".to_string(),
+        }));
+
+        let execution =
+            execute_parsed_command_with_extensions(run_command, Some(&llm), Some(&mut host))
+                .expect("execute command with failing extension");
+        assert_eq!(execution.exit_code, 0);
+        assert!(
+            execution
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("failing-extension")),
+            "failing extension should be visible in diagnostics"
+        );
+
+        let user_inputs = execution
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::UserInput { .. }))
+            .count();
+        assert_eq!(
+            user_inputs, 2,
+            "follow-up extension should still run despite failure in another extension"
+        );
+
+        fs::remove_file(&store_path).expect("cleanup store file");
+        if let Some(parent) = store_path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+
+    #[test]
+    fn extension_host_supports_ask_human_message_action() {
+        let store_path = temp_store_path("extension-ask-human-message");
+        if let Some(parent) = store_path.parent() {
+            fs::create_dir_all(parent).expect("create temp dir");
+        }
+
+        let llm =
+            MultiProviderGateway::new().with_provider(StaticProvider::new("mock", "assistant> "));
+        let store_path_str = store_path.to_string_lossy().to_string();
+        let run_command = parse_cli_command(&args(&[
+            "run",
+            "--submission-id",
+            "sub-ext-ask-human",
+            "--store-file",
+            &store_path_str,
+            "first input",
+        ]))
+        .expect("parse run");
+
+        let mut host = ExtensionHost::default();
+        host.add_extension(Box::new(AskHumanMessageOnceExtension {
+            used: false,
+            message: "human follow-up".to_string(),
+        }));
+
+        let execution =
+            execute_parsed_command_with_extensions(run_command, Some(&llm), Some(&mut host))
+                .expect("execute command with ask-human action");
+        assert_eq!(execution.exit_code, 0);
+
+        let user_inputs = execution
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::UserInput { input } => Some(input.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(user_inputs.len(), 2);
+        assert_eq!(user_inputs[0], "first input");
+        assert_eq!(user_inputs[1], "human follow-up");
+
+        fs::remove_file(&store_path).expect("cleanup store file");
+        if let Some(parent) = store_path.parent() {
+            let _ = fs::remove_dir(parent);
         }
     }
 }
