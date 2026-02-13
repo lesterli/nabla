@@ -7,4 +7,5 @@ license.workspace = true
 [dependencies]
 agent-core = { path = "../agent-core" }
 agent-llm = { path = "../agent-llm" }
+serde.workspace = true
 serde_json.workspace = true

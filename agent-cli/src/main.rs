@@ -1,12 +1,12 @@
 mod extensions;
 
-use std::path::PathBuf;
+use std::{fs, path::PathBuf, time::Instant};
 
 use agent_core::{
     memory::{EventStore, InMemoryEventStore},
     memory_file::FileEventStore,
     policy::AllowAllPolicy,
-    protocol::{Event, Op, StopReason},
+    protocol::{Event, EventKind, Op, PROTOCOL_SCHEMA_VERSION, StopFacts, StopReason, ToolCall},
     runtime::{AgentRuntime, LlmGateway},
     tools::{EchoTool, ToolRegistry},
 };
@@ -16,12 +16,14 @@ use agent_llm::{
 };
 use extensions::{
     host::ExtensionHost,
-    types::{NextAction, TurnContext},
+    types::{CliExtension, NextAction, TurnContext},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_SUBMISSION_ID: &str = "cli-session-1";
+const EVAL_RESULT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
@@ -48,6 +50,16 @@ enum CliCommand {
         submission_id: String,
         store_file: PathBuf,
     },
+    EvalSingle {
+        task_id: String,
+        submission_id: String,
+        prompt: String,
+        store_file: Option<PathBuf>,
+    },
+    EvalBatch {
+        tasks_file: PathBuf,
+        store_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +67,113 @@ struct CommandExecution {
     events: Vec<Event>,
     exit_code: i32,
     diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct EnvSingleActionExtension {
+    name: &'static str,
+    priority: i32,
+    action: NextAction,
+    used: bool,
+}
+
+impl EnvSingleActionExtension {
+    fn continue_once(input: String, priority: i32) -> Self {
+        Self {
+            name: "env-continue-once",
+            priority,
+            action: NextAction::Continue { input },
+            used: false,
+        }
+    }
+
+    fn ask_human_message_once(message: String, priority: i32) -> Self {
+        Self {
+            name: "env-ask-human-message-once",
+            priority,
+            action: NextAction::AskHumanMessage { message },
+            used: false,
+        }
+    }
+
+    fn stop_once(priority: i32) -> Self {
+        Self {
+            name: "env-stop-once",
+            priority,
+            action: NextAction::Stop,
+            used: false,
+        }
+    }
+}
+
+impl CliExtension for EnvSingleActionExtension {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn priority(&self) -> i32 {
+        self.priority
+    }
+
+    fn propose_next_action(
+        &mut self,
+        _context: &TurnContext,
+    ) -> Result<Option<NextAction>, String> {
+        if self.used {
+            return Ok(None);
+        }
+        self.used = true;
+        Ok(Some(self.action.clone()))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct EvalTokenUsage {
+    estimated_input_tokens: u64,
+    estimated_output_tokens: u64,
+    estimation_method: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct EvalRunMetadata {
+    submission_id: String,
+    provider: String,
+    model: String,
+    seed: Option<String>,
+    protocol_schema_version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct EvalResult {
+    schema_version: u32,
+    task_id: String,
+    outcome_or_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stop_facts: Option<StopFacts>,
+    tool_calls: Vec<ToolCall>,
+    steps: u64,
+    latency_ms: u64,
+    token_usage: EvalTokenUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_type: Option<String>,
+    version: String,
+    submission_id: String,
+    run_metadata: EvalRunMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct EvalResultSet {
+    schema_version: u32,
+    version: String,
+    results: Vec<EvalResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct EvalTaskInput {
+    task_id: String,
+    prompt: String,
+    #[serde(default)]
+    submission_id: Option<String>,
 }
 
 fn print_usage(program: &str) {
@@ -65,6 +184,8 @@ fn print_usage(program: &str) {
   {program} resume --store-file <path> [--submission-id <id>] [--checkpoint-id <id>]
   {program} approve --store-file <path> [--submission-id <id>] --request-id <id> --approved <true|false> [--reason <text>]
   {program} replay --store-file <path> [--submission-id <id>]
+  {program} eval --task-id <id> [--submission-id <id>] [--store-file <path>] <prompt>
+  {program} eval --tasks-file <path> [--store-dir <dir>]
 
 Options:
   -h, --help     Show this help message
@@ -73,6 +194,7 @@ Options:
 Notes:
   - The shorthand `{program} <prompt>` is kept for backward compatibility.
   - Lifecycle subcommands (`run/resume/approve/replay`) require `--store-file` for persistence.
+  - `eval` supports single-task and batch-task execution with machine-readable JSON output.
 
 LLM env:
   AGENT_LLM_PROVIDER=mock|openai|openai_compatible (default: mock)
@@ -81,7 +203,13 @@ LLM env:
   AGENT_LLM_MODEL (default: gpt-4o-mini)
   AGENT_LLM_NAME (optional provider display name)
   AGENT_LLM_TOOLS (optional comma list; supported: echo)
-  AGENT_LLM_TOOL_CHOICE (optional: auto|required|none|echo|function:<name>)"
+  AGENT_LLM_TOOL_CHOICE (optional: auto|required|none|echo|function:<name>)
+
+Extension env (optional):
+  AGENT_EXTENSION_MAX_FOLLOW_UP_TURNS (default: 4)
+  AGENT_EXTENSION_CONTINUE_ONCE (inject one continue input)
+  AGENT_EXTENSION_ASK_HUMAN_MESSAGE_ONCE (inject one ask-human message)
+  AGENT_EXTENSION_STOP_ONCE=true|false (inject one stop action)"
     );
 }
 
@@ -202,6 +330,7 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
         "resume" => parse_resume_subcommand(&args[1..]),
         "approve" => parse_approve_subcommand(&args[1..]),
         "replay" => parse_replay_subcommand(&args[1..]),
+        "eval" => parse_eval_subcommand(&args[1..]),
         flag if flag.starts_with('-') => Err(format!("unsupported option `{flag}`")),
         _ => {
             let prompt = args.join(" ");
@@ -360,6 +489,109 @@ fn parse_replay_subcommand(args: &[String]) -> Result<CliCommand, String> {
     })
 }
 
+fn parse_eval_subcommand(args: &[String]) -> Result<CliCommand, String> {
+    let mut task_id: Option<String> = None;
+    let mut submission_id: Option<String> = None;
+    let mut tasks_file: Option<PathBuf> = None;
+    let mut store_file: Option<PathBuf> = None;
+    let mut store_dir: Option<PathBuf> = None;
+    let mut prompt_start: Option<usize> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => return Ok(CliCommand::Help),
+            "--task-id" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`eval --task-id` requires a value".to_string());
+                }
+                task_id = Some(args[i].clone());
+            }
+            "--submission-id" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`eval --submission-id` requires a value".to_string());
+                }
+                submission_id = Some(args[i].clone());
+            }
+            "--tasks-file" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`eval --tasks-file` requires a value".to_string());
+                }
+                tasks_file = Some(PathBuf::from(&args[i]));
+            }
+            "--store-file" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`eval --store-file` requires a value".to_string());
+                }
+                store_file = Some(PathBuf::from(&args[i]));
+            }
+            "--store-dir" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`eval --store-dir` requires a value".to_string());
+                }
+                store_dir = Some(PathBuf::from(&args[i]));
+            }
+            unknown if unknown.starts_with("--") => {
+                return Err(format!("unknown `eval` option `{unknown}`"));
+            }
+            _ => {
+                prompt_start = Some(i);
+                break;
+            }
+        }
+        i += 1;
+    }
+
+    if let Some(tasks_file) = tasks_file {
+        if prompt_start.is_some() {
+            return Err("`eval --tasks-file` does not accept a positional prompt".to_string());
+        }
+        if task_id.is_some() {
+            return Err("`eval --tasks-file` cannot be combined with `--task-id`".to_string());
+        }
+        if store_file.is_some() {
+            return Err("`eval --tasks-file` cannot be combined with `--store-file`".to_string());
+        }
+        if submission_id.is_some() {
+            return Err(
+                "`eval --tasks-file` cannot be combined with `--submission-id`".to_string(),
+            );
+        }
+        return Ok(CliCommand::EvalBatch {
+            tasks_file,
+            store_dir,
+        });
+    }
+
+    let Some(task_id) = task_id else {
+        return Err("`eval` requires `--task-id <id>` or `--tasks-file <path>`".to_string());
+    };
+    let Some(prompt_start) = prompt_start else {
+        return Err("`eval` single task requires a prompt".to_string());
+    };
+
+    let prompt = args[prompt_start..].join(" ");
+    if prompt.trim().is_empty() {
+        return Err("`eval` prompt cannot be empty".to_string());
+    }
+    if store_dir.is_some() {
+        return Err("`eval` single task cannot use `--store-dir`".to_string());
+    }
+
+    let submission_id = submission_id.unwrap_or_else(|| format!("eval-{task_id}"));
+    Ok(CliCommand::EvalSingle {
+        task_id,
+        submission_id,
+        prompt,
+        store_file,
+    })
+}
+
 fn parse_approve_subcommand(args: &[String]) -> Result<CliCommand, String> {
     let mut submission_id = DEFAULT_SUBMISSION_ID.to_string();
     let mut request_id: Option<String> = None;
@@ -447,6 +679,57 @@ fn build_tools() -> ToolRegistry {
     tools
 }
 
+fn parse_bool_env(var: &str, raw: &str) -> Result<bool, String> {
+    match raw.trim() {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        other => Err(format!(
+            "{var} must be one of: true,false,1,0,yes,no (got `{other}`)"
+        )),
+    }
+}
+
+fn build_extension_host_from_env() -> Result<ExtensionHost, String> {
+    let mut host = ExtensionHost::default();
+
+    if let Ok(raw_max_follow_up_turns) = std::env::var("AGENT_EXTENSION_MAX_FOLLOW_UP_TURNS") {
+        let parsed = raw_max_follow_up_turns
+            .trim()
+            .parse::<usize>()
+            .map_err(|err| format!("AGENT_EXTENSION_MAX_FOLLOW_UP_TURNS must be usize: {err}"))?;
+        host.set_max_follow_up_turns(parsed);
+    }
+
+    if let Ok(input) = std::env::var("AGENT_EXTENSION_CONTINUE_ONCE") {
+        let trimmed = input.trim();
+        if !trimmed.is_empty() {
+            host.add_extension(Box::new(EnvSingleActionExtension::continue_once(
+                trimmed.to_string(),
+                100,
+            )));
+        }
+    }
+
+    if let Ok(message) = std::env::var("AGENT_EXTENSION_ASK_HUMAN_MESSAGE_ONCE") {
+        let trimmed = message.trim();
+        if !trimmed.is_empty() {
+            host.add_extension(Box::new(EnvSingleActionExtension::ask_human_message_once(
+                trimmed.to_string(),
+                90,
+            )));
+        }
+    }
+
+    if let Ok(raw_stop_once) = std::env::var("AGENT_EXTENSION_STOP_ONCE") {
+        let should_stop = parse_bool_env("AGENT_EXTENSION_STOP_ONCE", &raw_stop_once)?;
+        if should_stop {
+            host.add_extension(Box::new(EnvSingleActionExtension::stop_once(80)));
+        }
+    }
+
+    Ok(host)
+}
+
 fn execute_parsed_command(
     command: CliCommand,
     llm: Option<&dyn LlmGateway>,
@@ -459,7 +742,7 @@ fn execute_parsed_command_with_extensions(
     llm: Option<&dyn LlmGateway>,
     extension_host: Option<&mut ExtensionHost>,
 ) -> Result<CommandExecution, String> {
-    let mut default_host = ExtensionHost::default();
+    let mut default_host = build_extension_host_from_env()?;
     let host = match extension_host {
         Some(host) => host,
         None => &mut default_host,
@@ -504,6 +787,9 @@ fn execute_parsed_command_with_extensions(
             submission_id,
             store_file,
         } => execute_replay(submission_id, store_file),
+        CliCommand::EvalSingle { .. } | CliCommand::EvalBatch { .. } => {
+            Err("use eval execution path for `eval` subcommand".to_string())
+        }
         CliCommand::Help | CliCommand::Version => Err("cannot execute help/version".to_string()),
     }
 }
@@ -704,6 +990,317 @@ fn execute_approve(
     )
 }
 
+fn execute_eval_command(
+    command: CliCommand,
+    llm: &dyn LlmGateway,
+) -> Result<EvalResultSet, String> {
+    match command {
+        CliCommand::EvalSingle {
+            task_id,
+            submission_id,
+            prompt,
+            store_file,
+        } => {
+            let result = execute_eval_task(task_id, submission_id, prompt, store_file, llm);
+            Ok(EvalResultSet {
+                schema_version: EVAL_RESULT_SCHEMA_VERSION,
+                version: VERSION.to_string(),
+                results: vec![result],
+            })
+        }
+        CliCommand::EvalBatch {
+            tasks_file,
+            store_dir,
+        } => {
+            let tasks = load_eval_tasks(&tasks_file)?;
+            if let Some(dir) = &store_dir {
+                fs::create_dir_all(dir).map_err(|err| {
+                    format!("failed to create eval store dir `{}`: {err}", dir.display())
+                })?;
+            }
+
+            let mut results = Vec::with_capacity(tasks.len());
+            for (index, task) in tasks.into_iter().enumerate() {
+                let submission_id = task.submission_id.unwrap_or_else(|| {
+                    format!(
+                        "eval-{}-{}",
+                        sanitize_for_filename(&task.task_id),
+                        index.saturating_add(1)
+                    )
+                });
+                let task_store_file = store_dir.as_ref().map(|dir| {
+                    dir.join(format!("{}.jsonl", sanitize_for_filename(&submission_id)))
+                });
+                let result = execute_eval_task(
+                    task.task_id,
+                    submission_id,
+                    task.prompt,
+                    task_store_file,
+                    llm,
+                );
+                results.push(result);
+            }
+
+            Ok(EvalResultSet {
+                schema_version: EVAL_RESULT_SCHEMA_VERSION,
+                version: VERSION.to_string(),
+                results,
+            })
+        }
+        _ => Err("not an eval command".to_string()),
+    }
+}
+
+fn execute_eval_task(
+    task_id: String,
+    submission_id: String,
+    prompt: String,
+    store_file: Option<PathBuf>,
+    llm: &dyn LlmGateway,
+) -> EvalResult {
+    let started = Instant::now();
+    let run_metadata = build_eval_run_metadata(submission_id.clone());
+    let mut host = ExtensionHost::default();
+    let execution = execute_run(
+        submission_id.clone(),
+        prompt.clone(),
+        store_file,
+        llm,
+        &mut host,
+    );
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    match execution {
+        Ok(execution) => build_eval_result_from_events(
+            task_id,
+            submission_id,
+            prompt,
+            execution.events,
+            execution.diagnostics,
+            latency_ms,
+            run_metadata,
+        ),
+        Err(err) => EvalResult {
+            schema_version: EVAL_RESULT_SCHEMA_VERSION,
+            task_id,
+            outcome_or_status: "error".to_string(),
+            stop_facts: None,
+            tool_calls: Vec::new(),
+            steps: 0,
+            latency_ms,
+            token_usage: EvalTokenUsage {
+                estimated_input_tokens: estimate_cli_tokens(&prompt),
+                estimated_output_tokens: 0,
+                estimation_method: "heuristic_word_count".to_string(),
+            },
+            error_type: Some(format!("command_error:{err}")),
+            version: VERSION.to_string(),
+            submission_id,
+            run_metadata,
+        },
+    }
+}
+
+fn build_eval_result_from_events(
+    task_id: String,
+    submission_id: String,
+    prompt: String,
+    events: Vec<Event>,
+    diagnostics: Vec<String>,
+    latency_ms: u64,
+    run_metadata: EvalRunMetadata,
+) -> EvalResult {
+    let steps = events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::ContextBuilt { .. }))
+        .count() as u64;
+    let tool_calls = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ToolCallProposed { call } => Some(call.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let output_tokens = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::LlmText { text } => Some(estimate_cli_tokens(text)),
+            _ => None,
+        })
+        .sum::<u64>();
+
+    let llm_turns = steps.max(1);
+    let input_tokens = estimate_cli_tokens(&prompt).saturating_mul(llm_turns);
+    let (stop_reason, stop_facts) =
+        final_stop_from_events(&events).unwrap_or((StopReason::Interrupted, None));
+    let mut error_type = derive_error_type(&stop_reason, stop_facts.as_ref(), &events);
+    if error_type.is_none() && !diagnostics.is_empty() {
+        error_type = Some("extension_diagnostic".to_string());
+    }
+
+    EvalResult {
+        schema_version: EVAL_RESULT_SCHEMA_VERSION,
+        task_id,
+        outcome_or_status: stop_reason_to_status(&stop_reason).to_string(),
+        stop_facts,
+        tool_calls,
+        steps,
+        latency_ms,
+        token_usage: EvalTokenUsage {
+            estimated_input_tokens: input_tokens,
+            estimated_output_tokens: output_tokens,
+            estimation_method: "heuristic_word_count".to_string(),
+        },
+        error_type,
+        version: VERSION.to_string(),
+        submission_id,
+        run_metadata,
+    }
+}
+
+fn final_stop_from_events(events: &[Event]) -> Option<(StopReason, Option<StopFacts>)> {
+    events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::TurnStopped { reason, facts } => Some((reason.clone(), facts.clone())),
+        _ => None,
+    })
+}
+
+fn derive_error_type(
+    stop_reason: &StopReason,
+    stop_facts: Option<&StopFacts>,
+    events: &[Event],
+) -> Option<String> {
+    match stop_reason {
+        StopReason::Done => None,
+        StopReason::Error => {
+            if events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::LlmError { .. }))
+            {
+                Some("llm_error".to_string())
+            } else if stop_facts
+                .map(|facts| facts.tool_error_count > 0)
+                .unwrap_or(false)
+            {
+                Some("tool_error".to_string())
+            } else {
+                Some("runtime_error".to_string())
+            }
+        }
+        StopReason::BudgetExceeded => Some("budget_exceeded".to_string()),
+        StopReason::PolicyDenied => Some("policy_denied".to_string()),
+        StopReason::HumanApprovalRequired => Some("human_approval_required".to_string()),
+        StopReason::Interrupted => Some("interrupted".to_string()),
+    }
+}
+
+fn stop_reason_to_status(stop_reason: &StopReason) -> &'static str {
+    match stop_reason {
+        StopReason::Done => "done",
+        StopReason::Interrupted => "interrupted",
+        StopReason::Error => "error",
+        StopReason::BudgetExceeded => "budget_exceeded",
+        StopReason::PolicyDenied => "policy_denied",
+        StopReason::HumanApprovalRequired => "human_approval_required",
+    }
+}
+
+fn estimate_cli_tokens(text: &str) -> u64 {
+    text.split_whitespace().count() as u64
+}
+
+fn build_eval_run_metadata(submission_id: String) -> EvalRunMetadata {
+    let provider = std::env::var("AGENT_LLM_PROVIDER").unwrap_or_else(|_| "mock".to_string());
+    let model = std::env::var("AGENT_LLM_MODEL").unwrap_or_else(|_| {
+        if provider == "mock" {
+            "mock-static".to_string()
+        } else {
+            "gpt-4o-mini".to_string()
+        }
+    });
+    let seed = std::env::var("AGENT_EVAL_SEED")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    EvalRunMetadata {
+        submission_id,
+        provider,
+        model,
+        seed,
+        protocol_schema_version: PROTOCOL_SCHEMA_VERSION,
+    }
+}
+
+fn load_eval_tasks(path: &PathBuf) -> Result<Vec<EvalTaskInput>, String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read tasks file `{}`: {err}", path.display()))?;
+
+    if let Ok(tasks) = serde_json::from_str::<Vec<EvalTaskInput>>(&raw) {
+        return validate_eval_tasks(tasks, path);
+    }
+
+    let mut tasks = Vec::new();
+    for (line_number, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let task = serde_json::from_str::<EvalTaskInput>(trimmed).map_err(|err| {
+            format!(
+                "invalid tasks file `{}` at line {}: {err}",
+                path.display(),
+                line_number + 1
+            )
+        })?;
+        tasks.push(task);
+    }
+    validate_eval_tasks(tasks, path)
+}
+
+fn validate_eval_tasks(
+    tasks: Vec<EvalTaskInput>,
+    path: &PathBuf,
+) -> Result<Vec<EvalTaskInput>, String> {
+    if tasks.is_empty() {
+        return Err(format!("tasks file `{}` contains no tasks", path.display()));
+    }
+
+    for task in &tasks {
+        if task.task_id.trim().is_empty() {
+            return Err(format!(
+                "tasks file `{}` contains a task with empty `task_id`",
+                path.display()
+            ));
+        }
+        if task.prompt.trim().is_empty() {
+            return Err(format!(
+                "tasks file `{}` contains empty prompt for task `{}`",
+                path.display(),
+                task.task_id
+            ));
+        }
+    }
+    Ok(tasks)
+}
+
+fn sanitize_for_filename(input: &str) -> String {
+    let mut sanitized = input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+
+    if sanitized.trim_matches('_').is_empty() {
+        sanitized = "submission".to_string();
+    }
+    sanitized
+}
+
 fn main() {
     let mut args = std::env::args();
     let program = args.next().unwrap_or_else(|| "agent-cli".to_string());
@@ -756,6 +1353,26 @@ fn main() {
                 std::process::exit(execution.exit_code);
             }
         }
+        CliCommand::EvalSingle { .. } | CliCommand::EvalBatch { .. } => {
+            let llm = match build_gateway_from_env() {
+                Ok(gateway) => gateway,
+                Err(err) => {
+                    eprintln!("LLM configuration error: {err}");
+                    std::process::exit(2);
+                }
+            };
+
+            let result_set = match execute_eval_command(parsed, &llm) {
+                Ok(result_set) => result_set,
+                Err(err) => {
+                    eprintln!("Command failed: {err}");
+                    std::process::exit(2);
+                }
+            };
+
+            let line = serde_json::to_string(&result_set).expect("serialize eval result set");
+            println!("{line}");
+        }
         CliCommand::Replay { .. } => {
             let execution = match execute_parsed_command(parsed, None) {
                 Ok(result) => result,
@@ -785,7 +1402,8 @@ mod tests {
     };
 
     use super::{
-        CliCommand, execute_parsed_command, execute_parsed_command_with_extensions,
+        CliCommand, EvalResult, EvalResultSet, EvalRunMetadata, EvalTokenUsage,
+        execute_eval_command, execute_parsed_command, execute_parsed_command_with_extensions,
         parse_cli_command, parse_tool_choice_env, parse_tools_env,
     };
     use crate::extensions::{
@@ -798,7 +1416,7 @@ mod tests {
         protocol::{Event, EventKind, StopFacts, StopReason, ToolCall},
     };
     use agent_llm::{MultiProviderGateway, OpenAiToolChoice, StaticProvider};
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -869,6 +1487,27 @@ mod tests {
         ]))
         .expect("parse approve");
         assert!(matches!(approve, CliCommand::Approve { .. }));
+
+        let eval_single = parse_cli_command(&args(&[
+            "eval",
+            "--task-id",
+            "task-1",
+            "--submission-id",
+            "eval-sub-1",
+            "solve this task",
+        ]))
+        .expect("parse eval single");
+        assert!(matches!(eval_single, CliCommand::EvalSingle { .. }));
+
+        let eval_batch = parse_cli_command(&args(&[
+            "eval",
+            "--tasks-file",
+            "/tmp/tasks.jsonl",
+            "--store-dir",
+            "/tmp/eval-stores",
+        ]))
+        .expect("parse eval batch");
+        assert!(matches!(eval_batch, CliCommand::EvalBatch { .. }));
     }
 
     #[test]
@@ -1138,6 +1777,137 @@ mod tests {
         match choice {
             OpenAiToolChoice::Function { name } => assert_eq!(name, "echo"),
             _ => panic!("expected function tool choice"),
+        }
+    }
+
+    #[test]
+    fn eval_result_schema_shape_is_stable() {
+        let result_set = EvalResultSet {
+            schema_version: 1,
+            version: super::VERSION.to_string(),
+            results: vec![EvalResult {
+                schema_version: 1,
+                task_id: "task-1".to_string(),
+                outcome_or_status: "done".to_string(),
+                stop_facts: None,
+                tool_calls: vec![ToolCall {
+                    name: "echo".to_string(),
+                    args: json!({"text":"hello"}),
+                }],
+                steps: 1,
+                latency_ms: 12,
+                token_usage: EvalTokenUsage {
+                    estimated_input_tokens: 2,
+                    estimated_output_tokens: 3,
+                    estimation_method: "heuristic_word_count".to_string(),
+                },
+                error_type: None,
+                version: super::VERSION.to_string(),
+                submission_id: "submission-1".to_string(),
+                run_metadata: EvalRunMetadata {
+                    submission_id: "submission-1".to_string(),
+                    provider: "mock".to_string(),
+                    model: "mock-static".to_string(),
+                    seed: Some("42".to_string()),
+                    protocol_schema_version: 1,
+                },
+            }],
+        };
+
+        let actual = serde_json::to_string_pretty(&result_set).expect("serialize eval result set");
+        let expected = format!(
+            r#"{{
+  "schema_version": 1,
+  "version": "{}",
+  "results": [
+    {{
+      "schema_version": 1,
+      "task_id": "task-1",
+      "outcome_or_status": "done",
+      "tool_calls": [
+        {{
+          "name": "echo",
+          "args": {{
+            "text": "hello"
+          }}
+        }}
+      ],
+      "steps": 1,
+      "latency_ms": 12,
+      "token_usage": {{
+        "estimated_input_tokens": 2,
+        "estimated_output_tokens": 3,
+        "estimation_method": "heuristic_word_count"
+      }},
+      "version": "{}",
+      "submission_id": "submission-1",
+      "run_metadata": {{
+        "submission_id": "submission-1",
+        "provider": "mock",
+        "model": "mock-static",
+        "seed": "42",
+        "protocol_schema_version": 1
+      }}
+    }}
+  ]
+}}"#,
+            super::VERSION,
+            super::VERSION
+        );
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn eval_batch_fixture_outputs_parseable_results() {
+        let tasks_path = temp_store_path("eval-tasks");
+        let store_dir = std::env::temp_dir()
+            .join("agent-cli-tests")
+            .join(format!("eval-store-dir-{}", std::process::id()));
+        if let Some(parent) = tasks_path.parent() {
+            fs::create_dir_all(parent).expect("create temp dir");
+        }
+        fs::create_dir_all(&store_dir).expect("create eval store dir");
+
+        let tasks_content = r#"{"task_id":"task-a","prompt":"say hello once"}
+{"task_id":"task-b","prompt":"call echo tool with text hi"}"#;
+        fs::write(&tasks_path, tasks_content).expect("write tasks file");
+
+        let llm =
+            MultiProviderGateway::new().with_provider(StaticProvider::new("mock", "assistant> "));
+        let tasks_path_str = tasks_path.to_string_lossy().to_string();
+        let store_dir_str = store_dir.to_string_lossy().to_string();
+        let eval_command = parse_cli_command(&args(&[
+            "eval",
+            "--tasks-file",
+            &tasks_path_str,
+            "--store-dir",
+            &store_dir_str,
+        ]))
+        .expect("parse eval batch command");
+
+        let result_set = execute_eval_command(eval_command, &llm).expect("execute eval batch");
+        assert_eq!(result_set.schema_version, 1);
+        assert_eq!(result_set.results.len(), 2);
+        assert_eq!(result_set.results[0].task_id, "task-a");
+        assert_eq!(result_set.results[1].task_id, "task-b");
+
+        let encoded = serde_json::to_string(&result_set).expect("serialize result set");
+        let decoded: Value = serde_json::from_str(&encoded).expect("decode as generic json");
+        let results = decoded
+            .get("results")
+            .and_then(Value::as_array)
+            .expect("results array");
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .all(|entry| entry.get("task_id").and_then(Value::as_str).is_some())
+        );
+
+        fs::remove_file(&tasks_path).expect("cleanup tasks file");
+        let _ = fs::remove_dir_all(&store_dir);
+        if let Some(parent) = tasks_path.parent() {
+            let _ = fs::remove_dir(parent);
         }
     }
 

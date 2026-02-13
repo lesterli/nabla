@@ -55,13 +55,23 @@ impl ExtensionHost {
             if let Err(err) = safe_invoke(extension_name, "on_turn_end", || {
                 extension.on_turn_end(context)
             }) {
-                self.diagnostics.push(err);
+                self.diagnostics.push(format!(
+                    "{err} [submission_id={}, stop_reason={:?}, events={}]",
+                    context.submission_id,
+                    context.stop_reason,
+                    context.events.len()
+                ));
                 continue;
             }
             if let Err(err) = safe_invoke(extension_name, "on_stop_facts", || {
                 extension.on_stop_facts(&context.stop_facts)
             }) {
-                self.diagnostics.push(err);
+                self.diagnostics.push(format!(
+                    "{err} [submission_id={}, stop_reason={:?}, events={}]",
+                    context.submission_id,
+                    context.stop_reason,
+                    context.events.len()
+                ));
                 continue;
             }
             match safe_invoke(extension_name, "propose_next_action", || {
@@ -73,7 +83,12 @@ impl ExtensionHost {
                     action,
                 }),
                 Ok(None) => {}
-                Err(err) => self.diagnostics.push(err),
+                Err(err) => self.diagnostics.push(format!(
+                    "{err} [submission_id={}, stop_reason={:?}, events={}]",
+                    context.submission_id,
+                    context.stop_reason,
+                    context.events.len()
+                )),
             }
         }
 
