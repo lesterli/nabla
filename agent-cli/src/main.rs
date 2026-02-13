@@ -1,8 +1,11 @@
+use std::path::PathBuf;
+
 use agent_core::{
-    memory::InMemoryEventStore,
+    memory::{EventStore, InMemoryEventStore},
+    memory_file::FileEventStore,
     policy::AllowAllPolicy,
-    protocol::{Op, StopReason},
-    runtime::AgentRuntime,
+    protocol::{Event, Op, StopReason},
+    runtime::{AgentRuntime, LlmGateway},
     tools::{EchoTool, ToolRegistry},
 };
 use agent_llm::{
@@ -12,10 +15,58 @@ use agent_llm::{
 use serde_json::json;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const DEFAULT_SUBMISSION_ID: &str = "cli-session-1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CliCommand {
+    Help,
+    Version,
+    Run {
+        submission_id: String,
+        prompt: String,
+        store_file: Option<PathBuf>,
+    },
+    Resume {
+        submission_id: String,
+        checkpoint_id: Option<String>,
+        store_file: PathBuf,
+    },
+    Replay {
+        submission_id: String,
+        store_file: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct CommandExecution {
+    events: Vec<Event>,
+    exit_code: i32,
+}
 
 fn print_usage(program: &str) {
     println!(
-        "Usage: {program} [OPTIONS] <prompt>\n\nOptions:\n  -h, --help     Show this help message\n  -V, --version  Show version\n\nLLM env:\n  AGENT_LLM_PROVIDER=mock|openai|openai_compatible (default: mock)\n  AGENT_LLM_BASE_URL (default: https://api.openai.com/v1)\n  AGENT_LLM_API_KEY (required for openai/openai_compatible)\n  AGENT_LLM_MODEL (default: gpt-4o-mini)\n  AGENT_LLM_NAME (optional provider display name)\n  AGENT_LLM_TOOLS (optional comma list; supported: echo)\n  AGENT_LLM_TOOL_CHOICE (optional: auto|required|none|echo|function:<name>)"
+        "Usage:
+  {program} [OPTIONS] <prompt>
+  {program} run --store-file <path> [--submission-id <id>] <prompt>
+  {program} resume --store-file <path> [--submission-id <id>] [--checkpoint-id <id>]
+  {program} replay --store-file <path> [--submission-id <id>]
+
+Options:
+  -h, --help     Show this help message
+  -V, --version  Show version
+
+Notes:
+  - The shorthand `{program} <prompt>` is kept for backward compatibility.
+  - Lifecycle subcommands (`run/resume/replay`) require `--store-file` for persistence.
+
+LLM env:
+  AGENT_LLM_PROVIDER=mock|openai|openai_compatible (default: mock)
+  AGENT_LLM_BASE_URL (default: https://api.openai.com/v1)
+  AGENT_LLM_API_KEY (required for openai/openai_compatible)
+  AGENT_LLM_MODEL (default: gpt-4o-mini)
+  AGENT_LLM_NAME (optional provider display name)
+  AGENT_LLM_TOOLS (optional comma list; supported: echo)
+  AGENT_LLM_TOOL_CHOICE (optional: auto|required|none|echo|function:<name>)"
     );
 }
 
@@ -118,87 +169,517 @@ fn build_gateway_from_env() -> Result<MultiProviderGateway, String> {
     }
 }
 
-fn main() {
-    let mut args = std::env::args();
-    let program = args.next().unwrap_or_else(|| "agent-cli".to_string());
-    let rest: Vec<String> = args.collect();
-
-    if rest.is_empty() {
-        print_usage(&program);
-        std::process::exit(2);
+fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
+    if args.is_empty() {
+        return Err("missing command or prompt".to_string());
     }
 
-    if rest.len() == 1 {
-        match rest[0].as_str() {
-            "-h" | "--help" => {
-                print_usage(&program);
-                return;
-            }
-            "-V" | "--version" => {
-                println!("{VERSION}");
-                return;
-            }
+    if args.len() == 1 {
+        match args[0].as_str() {
+            "-h" | "--help" => return Ok(CliCommand::Help),
+            "-V" | "--version" => return Ok(CliCommand::Version),
             _ => {}
         }
     }
 
-    if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
-        print_usage(&program);
-        return;
+    match args[0].as_str() {
+        "run" => parse_run_subcommand(&args[1..]),
+        "resume" => parse_resume_subcommand(&args[1..]),
+        "replay" => parse_replay_subcommand(&args[1..]),
+        flag if flag.starts_with('-') => Err(format!("unsupported option `{flag}`")),
+        _ => {
+            let prompt = args.join(" ");
+            if prompt.trim().is_empty() {
+                return Err("prompt cannot be empty".to_string());
+            }
+            Ok(CliCommand::Run {
+                submission_id: DEFAULT_SUBMISSION_ID.to_string(),
+                prompt,
+                store_file: None,
+            })
+        }
+    }
+}
+
+fn parse_run_subcommand(args: &[String]) -> Result<CliCommand, String> {
+    let mut submission_id = DEFAULT_SUBMISSION_ID.to_string();
+    let mut store_file: Option<PathBuf> = None;
+    let mut prompt_start: Option<usize> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => return Ok(CliCommand::Help),
+            "--submission-id" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`run --submission-id` requires a value".to_string());
+                }
+                submission_id = args[i].clone();
+            }
+            "--store-file" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`run --store-file` requires a value".to_string());
+                }
+                store_file = Some(PathBuf::from(&args[i]));
+            }
+            unknown if unknown.starts_with("--") => {
+                return Err(format!("unknown `run` option `{unknown}`"));
+            }
+            _ => {
+                prompt_start = Some(i);
+                break;
+            }
+        }
+        i += 1;
     }
 
-    if rest.iter().any(|arg| arg == "-V" || arg == "--version") {
-        println!("{VERSION}");
-        return;
-    }
+    let Some(prompt_start) = prompt_start else {
+        return Err("`run` requires a prompt".to_string());
+    };
 
-    let prompt = rest.join(" ");
+    let prompt = args[prompt_start..].join(" ");
     if prompt.trim().is_empty() {
-        print_usage(&program);
-        std::process::exit(2);
+        return Err("`run` prompt cannot be empty".to_string());
     }
 
-    let mut runtime = AgentRuntime::default();
-    let policy = AllowAllPolicy;
+    if store_file.is_none() {
+        return Err("`run` requires --store-file <path>".to_string());
+    }
 
+    Ok(CliCommand::Run {
+        submission_id,
+        prompt,
+        store_file,
+    })
+}
+
+fn parse_resume_subcommand(args: &[String]) -> Result<CliCommand, String> {
+    let mut submission_id = DEFAULT_SUBMISSION_ID.to_string();
+    let mut checkpoint_id: Option<String> = None;
+    let mut store_file: Option<PathBuf> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => return Ok(CliCommand::Help),
+            "--submission-id" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`resume --submission-id` requires a value".to_string());
+                }
+                submission_id = args[i].clone();
+            }
+            "--checkpoint-id" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`resume --checkpoint-id` requires a value".to_string());
+                }
+                checkpoint_id = Some(args[i].clone());
+            }
+            "--store-file" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`resume --store-file` requires a value".to_string());
+                }
+                store_file = Some(PathBuf::from(&args[i]));
+            }
+            unknown if unknown.starts_with("--") => {
+                return Err(format!("unknown `resume` option `{unknown}`"));
+            }
+            value => return Err(format!("unexpected argument for `resume`: `{value}`")),
+        }
+        i += 1;
+    }
+
+    let Some(store_file) = store_file else {
+        return Err("`resume` requires --store-file <path>".to_string());
+    };
+
+    Ok(CliCommand::Resume {
+        submission_id,
+        checkpoint_id,
+        store_file,
+    })
+}
+
+fn parse_replay_subcommand(args: &[String]) -> Result<CliCommand, String> {
+    let mut submission_id = DEFAULT_SUBMISSION_ID.to_string();
+    let mut store_file: Option<PathBuf> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => return Ok(CliCommand::Help),
+            "--submission-id" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`replay --submission-id` requires a value".to_string());
+                }
+                submission_id = args[i].clone();
+            }
+            "--store-file" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`replay --store-file` requires a value".to_string());
+                }
+                store_file = Some(PathBuf::from(&args[i]));
+            }
+            unknown if unknown.starts_with("--") => {
+                return Err(format!("unknown `replay` option `{unknown}`"));
+            }
+            value => return Err(format!("unexpected argument for `replay`: `{value}`")),
+        }
+        i += 1;
+    }
+
+    let Some(store_file) = store_file else {
+        return Err("`replay` requires --store-file <path>".to_string());
+    };
+
+    Ok(CliCommand::Replay {
+        submission_id,
+        store_file,
+    })
+}
+
+fn build_tools() -> ToolRegistry {
     let mut tools = ToolRegistry::default();
     tools.register(EchoTool);
+    tools
+}
 
-    let mut store = InMemoryEventStore::default();
+fn execute_parsed_command(
+    command: CliCommand,
+    llm: Option<&dyn LlmGateway>,
+) -> Result<CommandExecution, String> {
+    match command {
+        CliCommand::Run {
+            submission_id,
+            prompt,
+            store_file,
+        } => {
+            let llm = llm.ok_or_else(|| "run requires an LLM gateway".to_string())?;
+            execute_run(submission_id, prompt, store_file, llm)
+        }
+        CliCommand::Resume {
+            submission_id,
+            checkpoint_id,
+            store_file,
+        } => {
+            let llm = llm.ok_or_else(|| "resume requires an LLM gateway".to_string())?;
+            execute_resume(submission_id, checkpoint_id, store_file, llm)
+        }
+        CliCommand::Replay {
+            submission_id,
+            store_file,
+        } => execute_replay(submission_id, store_file),
+        CliCommand::Help | CliCommand::Version => Err("cannot execute help/version".to_string()),
+    }
+}
 
-    let llm = match build_gateway_from_env() {
-        Ok(gateway) => gateway,
-        Err(err) => {
-            eprintln!("LLM configuration error: {err}");
-            std::process::exit(2);
+fn execute_run(
+    submission_id: String,
+    prompt: String,
+    store_file: Option<PathBuf>,
+    llm: &dyn LlmGateway,
+) -> Result<CommandExecution, String> {
+    let mut runtime = AgentRuntime::default();
+    let policy = AllowAllPolicy;
+    let tools = build_tools();
+
+    let turn = match store_file {
+        Some(path) => {
+            let mut store = FileEventStore::open(&path)
+                .map_err(|err| format!("failed to open store file `{}`: {err}", path.display()))?;
+            runtime.run_turn(
+                Op::UserInput {
+                    submission_id,
+                    input: prompt,
+                },
+                llm,
+                &policy,
+                &tools,
+                &mut store,
+            )
+        }
+        None => {
+            let mut store = InMemoryEventStore::default();
+            runtime.run_turn(
+                Op::UserInput {
+                    submission_id,
+                    input: prompt,
+                },
+                llm,
+                &policy,
+                &tools,
+                &mut store,
+            )
         }
     };
 
+    let exit_code = if turn.stop_reason == StopReason::Done {
+        0
+    } else {
+        1
+    };
+    Ok(CommandExecution {
+        events: turn.events,
+        exit_code,
+    })
+}
+
+fn execute_resume(
+    submission_id: String,
+    checkpoint_id: Option<String>,
+    store_file: PathBuf,
+    llm: &dyn LlmGateway,
+) -> Result<CommandExecution, String> {
+    let mut runtime = AgentRuntime::default();
+    let policy = AllowAllPolicy;
+    let tools = build_tools();
+    let mut store = FileEventStore::open(&store_file).map_err(|err| {
+        format!(
+            "failed to open store file `{}`: {err}",
+            store_file.display()
+        )
+    })?;
+
     let turn = runtime.run_turn(
-        Op::UserInput {
-            submission_id: "cli-session-1".to_string(),
-            input: prompt,
+        Op::Resume {
+            submission_id,
+            checkpoint_id,
         },
-        &llm,
+        llm,
         &policy,
         &tools,
         &mut store,
     );
 
-    for event in turn.events {
-        let line = serde_json::to_string(&event).expect("serialize event");
-        println!("{line}");
-    }
+    let exit_code = match turn.stop_reason {
+        StopReason::Error | StopReason::PolicyDenied | StopReason::BudgetExceeded => 1,
+        _ => 0,
+    };
+    Ok(CommandExecution {
+        events: turn.events,
+        exit_code,
+    })
+}
 
-    if turn.stop_reason != StopReason::Done {
-        std::process::exit(1);
+fn execute_replay(submission_id: String, store_file: PathBuf) -> Result<CommandExecution, String> {
+    let store = FileEventStore::open(&store_file).map_err(|err| {
+        format!(
+            "failed to open store file `{}`: {err}",
+            store_file.display()
+        )
+    })?;
+
+    Ok(CommandExecution {
+        events: store.events_for_submission(&submission_id),
+        exit_code: 0,
+    })
+}
+
+fn main() {
+    let mut args = std::env::args();
+    let program = args.next().unwrap_or_else(|| "agent-cli".to_string());
+    let rest: Vec<String> = args.collect();
+
+    let parsed = match parse_cli_command(&rest) {
+        Ok(command) => command,
+        Err(err) => {
+            eprintln!("Argument error: {err}");
+            print_usage(&program);
+            std::process::exit(2);
+        }
+    };
+
+    match parsed {
+        CliCommand::Help => {
+            print_usage(&program);
+            return;
+        }
+        CliCommand::Version => {
+            println!("{VERSION}");
+            return;
+        }
+        CliCommand::Run { .. } | CliCommand::Resume { .. } => {
+            let llm = match build_gateway_from_env() {
+                Ok(gateway) => gateway,
+                Err(err) => {
+                    eprintln!("LLM configuration error: {err}");
+                    std::process::exit(2);
+                }
+            };
+
+            let execution = match execute_parsed_command(parsed, Some(&llm)) {
+                Ok(result) => result,
+                Err(err) => {
+                    eprintln!("Command failed: {err}");
+                    std::process::exit(2);
+                }
+            };
+
+            for event in execution.events {
+                let line = serde_json::to_string(&event).expect("serialize event");
+                println!("{line}");
+            }
+
+            if execution.exit_code != 0 {
+                std::process::exit(execution.exit_code);
+            }
+        }
+        CliCommand::Replay { .. } => {
+            let execution = match execute_parsed_command(parsed, None) {
+                Ok(result) => result,
+                Err(err) => {
+                    eprintln!("Command failed: {err}");
+                    std::process::exit(2);
+                }
+            };
+
+            for event in execution.events {
+                let line = serde_json::to_string(&event).expect("serialize event");
+                println!("{line}");
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_tool_choice_env, parse_tools_env};
-    use agent_llm::OpenAiToolChoice;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::{
+        CliCommand, execute_parsed_command, parse_cli_command, parse_tool_choice_env,
+        parse_tools_env,
+    };
+    use agent_core::{memory::EventStore, memory_file::FileEventStore, protocol::EventKind};
+    use agent_llm::{MultiProviderGateway, OpenAiToolChoice, StaticProvider};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn temp_store_path(test_name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir()
+            .join("agent-cli-tests")
+            .join(format!("{test_name}-{nanos}-{}.jsonl", std::process::id()))
+    }
+
+    #[test]
+    fn routes_help_version_and_subcommands() {
+        assert!(matches!(
+            parse_cli_command(&args(&["--help"])).expect("parse help"),
+            CliCommand::Help
+        ));
+        assert!(matches!(
+            parse_cli_command(&args(&["--version"])).expect("parse version"),
+            CliCommand::Version
+        ));
+
+        let run = parse_cli_command(&args(&[
+            "run",
+            "--submission-id",
+            "s1",
+            "--store-file",
+            "/tmp/events.jsonl",
+            "hello",
+        ]))
+        .expect("parse run");
+        assert!(matches!(run, CliCommand::Run { .. }));
+
+        let resume = parse_cli_command(&args(&[
+            "resume",
+            "--submission-id",
+            "s1",
+            "--store-file",
+            "/tmp/events.jsonl",
+        ]))
+        .expect("parse resume");
+        assert!(matches!(resume, CliCommand::Resume { .. }));
+
+        let replay = parse_cli_command(&args(&[
+            "replay",
+            "--submission-id",
+            "s1",
+            "--store-file",
+            "/tmp/events.jsonl",
+        ]))
+        .expect("parse replay");
+        assert!(matches!(replay, CliCommand::Replay { .. }));
+    }
+
+    #[test]
+    fn run_then_resume_continues_same_submission_in_persistent_store() {
+        let store_path = temp_store_path("run-resume");
+        if let Some(parent) = store_path.parent() {
+            fs::create_dir_all(parent).expect("create temp dir");
+        }
+
+        let llm =
+            MultiProviderGateway::new().with_provider(StaticProvider::new("mock", "assistant> "));
+
+        let store_path_str = store_path.to_string_lossy().to_string();
+        let run_command = parse_cli_command(&args(&[
+            "run",
+            "--submission-id",
+            "submission-e2e",
+            "--store-file",
+            &store_path_str,
+            "hello",
+            "world",
+        ]))
+        .expect("parse run");
+        let run_result =
+            execute_parsed_command(run_command, Some(&llm)).expect("execute run command");
+        assert_eq!(run_result.exit_code, 0);
+
+        let resume_command = parse_cli_command(&args(&[
+            "resume",
+            "--submission-id",
+            "submission-e2e",
+            "--store-file",
+            &store_path_str,
+        ]))
+        .expect("parse resume");
+        let resume_result =
+            execute_parsed_command(resume_command, Some(&llm)).expect("execute resume command");
+        assert_eq!(resume_result.exit_code, 0);
+
+        let store = FileEventStore::open(&store_path).expect("open store for validation");
+        let events = store.events_for_submission("submission-e2e");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::UserInput { .. })),
+            "expected user input event in persisted stream",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::TurnResumed { .. })),
+            "expected turn resumed event in persisted stream",
+        );
+        assert!(
+            events.windows(2).all(|pair| pair[1].index > pair[0].index),
+            "event indices should remain strictly increasing",
+        );
+
+        fs::remove_file(&store_path).expect("cleanup store file");
+        if let Some(parent) = store_path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
 
     #[test]
     fn parses_supported_tools_list() {
