@@ -8,9 +8,13 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+const DEFAULT_CONTEXT_MAX_EVENTS: usize = 24;
+const DEFAULT_CONTEXT_MAX_CHARS: usize = 4000;
+const DEFAULT_EVENT_TEXT_MAX_CHARS: usize = 280;
+
 pub trait ProviderAdapter: Send + Sync {
     fn name(&self) -> &str;
-    fn complete(&self, prompt: &str) -> Result<ProviderResponse, String>;
+    fn complete(&self, prompt: &str, recent_events: &[Event]) -> Result<ProviderResponse, String>;
 }
 
 #[derive(Debug, Clone)]
@@ -96,7 +100,7 @@ impl MultiProviderGateway {
 }
 
 impl LlmGateway for MultiProviderGateway {
-    fn complete(&self, prompt: &str, _recent_events: &[Event]) -> Result<LlmOutput, String> {
+    fn complete(&self, prompt: &str, recent_events: &[Event]) -> Result<LlmOutput, String> {
         if self.providers.is_empty() {
             let mut stats = self.stats.lock().expect("llm gateway stats mutex poisoned");
             stats.failed_requests += 1;
@@ -123,7 +127,7 @@ impl LlmGateway for MultiProviderGateway {
                     provider_stats.attempts += 1;
                 }
 
-                match provider.complete(prompt) {
+                match provider.complete(prompt, recent_events) {
                     Ok(response) => {
                         let mut stats =
                             self.stats.lock().expect("llm gateway stats mutex poisoned");
@@ -232,7 +236,7 @@ impl ProviderAdapter for StaticProvider {
         &self.name
     }
 
-    fn complete(&self, prompt: &str) -> Result<ProviderResponse, String> {
+    fn complete(&self, prompt: &str, _recent_events: &[Event]) -> Result<ProviderResponse, String> {
         Ok(ProviderResponse {
             text: format!("{}{}", self.response_prefix, prompt),
             tool_calls: Vec::new(),
@@ -250,6 +254,8 @@ pub struct OpenAiCompatibleProvider {
     model: String,
     tools: Vec<OpenAiFunctionTool>,
     tool_choice: Option<OpenAiToolChoice>,
+    context_max_events: usize,
+    context_max_chars: usize,
     client: Client,
 }
 
@@ -296,6 +302,8 @@ impl OpenAiCompatibleProvider {
             model: model.into(),
             tools: Vec::new(),
             tool_choice: None,
+            context_max_events: DEFAULT_CONTEXT_MAX_EVENTS,
+            context_max_chars: DEFAULT_CONTEXT_MAX_CHARS,
             client,
         })
     }
@@ -314,7 +322,17 @@ impl OpenAiCompatibleProvider {
         self
     }
 
-    fn build_chat_completions_request(&self, prompt: &str) -> OpenAiChatCompletionsRequest {
+    pub fn with_context_window(mut self, max_events: usize, max_chars: usize) -> Self {
+        self.context_max_events = max_events.max(1);
+        self.context_max_chars = max_chars.max(64);
+        self
+    }
+
+    fn build_chat_completions_request(
+        &self,
+        prompt: &str,
+        recent_events: &[Event],
+    ) -> OpenAiChatCompletionsRequest {
         let tools = if self.tools.is_empty() {
             None
         } else {
@@ -347,12 +365,25 @@ impl OpenAiCompatibleProvider {
             None
         };
 
+        let mut messages = Vec::new();
+        if let Some(context_message) = build_recent_context_message(
+            recent_events,
+            self.context_max_events,
+            self.context_max_chars,
+        ) {
+            messages.push(OpenAiMessage {
+                role: "system".to_string(),
+                content: context_message,
+            });
+        }
+        messages.push(OpenAiMessage {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+        });
+
         OpenAiChatCompletionsRequest {
             model: self.model.clone(),
-            messages: vec![OpenAiMessage {
-                role: "user".to_string(),
-                content: prompt.to_string(),
-            }],
+            messages,
             tools,
             tool_choice,
         }
@@ -364,8 +395,8 @@ impl ProviderAdapter for OpenAiCompatibleProvider {
         &self.name
     }
 
-    fn complete(&self, prompt: &str) -> Result<ProviderResponse, String> {
-        let request = self.build_chat_completions_request(prompt);
+    fn complete(&self, prompt: &str, recent_events: &[Event]) -> Result<ProviderResponse, String> {
+        let request = self.build_chat_completions_request(prompt, recent_events);
 
         let response = self
             .client
@@ -386,6 +417,129 @@ impl ProviderAdapter for OpenAiCompatibleProvider {
 
         parse_openai_chat_completions_response(&body, prompt)
     }
+}
+
+fn build_recent_context_message(
+    recent_events: &[Event],
+    max_events: usize,
+    max_chars: usize,
+) -> Option<String> {
+    let summaries: Vec<String> = recent_events
+        .iter()
+        .filter_map(summarize_event_for_context)
+        .collect();
+
+    if summaries.is_empty() {
+        return None;
+    }
+
+    let tail_start = summaries.len().saturating_sub(max_events.max(1));
+    let mut selected = summaries[tail_start..].to_vec();
+    trim_lines_to_char_budget(&mut selected, max_chars.max(64));
+
+    Some(format!(
+        "Session context from recent events:\n{}",
+        selected.join("\n")
+    ))
+}
+
+fn summarize_event_for_context(event: &Event) -> Option<String> {
+    let line = match &event.kind {
+        agent_core::protocol::EventKind::UserInput { input } => {
+            format!(
+                "event#{} user_input: {}",
+                event.index,
+                truncate_text(input, DEFAULT_EVENT_TEXT_MAX_CHARS)
+            )
+        }
+        agent_core::protocol::EventKind::LlmText { text } => {
+            format!(
+                "event#{} llm_text: {}",
+                event.index,
+                truncate_text(text, DEFAULT_EVENT_TEXT_MAX_CHARS)
+            )
+        }
+        agent_core::protocol::EventKind::ToolCallProposed { call } => format!(
+            "event#{} tool_call: {} args={}",
+            event.index,
+            call.name,
+            compact_json(&call.args, DEFAULT_EVENT_TEXT_MAX_CHARS)
+        ),
+        agent_core::protocol::EventKind::ToolExecuted { result } => format!(
+            "event#{} tool_executed: {} is_error={} output={}",
+            event.index,
+            result.call_name,
+            result.is_error,
+            compact_json(&result.output, DEFAULT_EVENT_TEXT_MAX_CHARS)
+        ),
+        agent_core::protocol::EventKind::HumanApprovalRequested {
+            request_id, reason, ..
+        } => format!(
+            "event#{} approval_requested: request_id={} reason={}",
+            event.index,
+            request_id,
+            truncate_text(reason, DEFAULT_EVENT_TEXT_MAX_CHARS)
+        ),
+        agent_core::protocol::EventKind::HumanApprovalResolved {
+            request_id,
+            approved,
+            reason,
+        } => format!(
+            "event#{} approval_resolved: request_id={} approved={} reason={}",
+            event.index,
+            request_id,
+            approved,
+            truncate_text(
+                reason.as_deref().unwrap_or(""),
+                DEFAULT_EVENT_TEXT_MAX_CHARS
+            )
+        ),
+        agent_core::protocol::EventKind::LlmError { message } => format!(
+            "event#{} llm_error: {}",
+            event.index,
+            truncate_text(message, DEFAULT_EVENT_TEXT_MAX_CHARS)
+        ),
+        agent_core::protocol::EventKind::TurnStopped { reason } => {
+            format!("event#{} turn_stopped: {reason:?}", event.index)
+        }
+        _ => return None,
+    };
+
+    Some(line)
+}
+
+fn trim_lines_to_char_budget(lines: &mut Vec<String>, max_chars: usize) {
+    while lines.len() > 1 && total_chars(lines) > max_chars {
+        lines.remove(0);
+    }
+
+    let still_over_budget = total_chars(lines) > max_chars;
+    if still_over_budget {
+        if let Some(last) = lines.last_mut() {
+            *last = truncate_text(last, max_chars.saturating_sub(3));
+        }
+    }
+}
+
+fn total_chars(lines: &[String]) -> usize {
+    lines.iter().map(|line| line.chars().count() + 1).sum()
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 3 {
+        return "...".to_string();
+    }
+    let kept: String = text.chars().take(max_chars - 3).collect();
+    format!("{kept}...")
+}
+
+fn compact_json(value: &Value, max_chars: usize) -> String {
+    let serialized =
+        serde_json::to_string(value).unwrap_or_else(|_| "<invalid_json_value>".to_string());
+    truncate_text(&serialized, max_chars)
 }
 
 fn estimate_tokens(text: &str) -> u32 {
@@ -571,12 +725,13 @@ mod tests {
     use super::{
         MultiProviderGateway, OpenAiCompatibleProvider, OpenAiFunctionTool, OpenAiToolChoice,
         ProviderAdapter, ProviderResponse, RetryPolicy, StaticProvider,
-        extract_openai_message_text, parse_openai_chat_completions_response,
+        build_recent_context_message, extract_openai_message_text,
+        parse_openai_chat_completions_response,
     };
     use agent_core::{
         memory::{EventStore, InMemoryEventStore},
         policy::AllowAllPolicy,
-        protocol::{Event, EventKind, Op, StopReason},
+        protocol::{Event, EventKind, Op, StopReason, ToolCall},
         runtime::{AgentRuntime, LlmGateway},
         tools::{EchoTool, ToolRegistry},
     };
@@ -700,7 +855,7 @@ mod tests {
         ))
         .with_tool_choice(OpenAiToolChoice::Required);
 
-        let request = provider.build_chat_completions_request("say hi");
+        let request = provider.build_chat_completions_request("say hi", &[]);
         let payload = serde_json::to_value(&request).expect("serialize request");
 
         assert_eq!(payload["tools"][0]["type"], "function");
@@ -719,11 +874,98 @@ mod tests {
         .expect("provider should build")
         .with_tool_choice(OpenAiToolChoice::Required);
 
-        let request = provider.build_chat_completions_request("say hi");
+        let request = provider.build_chat_completions_request("say hi", &[]);
         let payload = serde_json::to_value(&request).expect("serialize request");
 
         assert!(payload.get("tools").is_none());
         assert!(payload.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn request_payload_contains_serialized_recent_context() {
+        let provider = OpenAiCompatibleProvider::new(
+            "openai-compatible",
+            "https://api.openai.com/v1",
+            "test-key",
+            "gpt-4o-mini",
+        )
+        .expect("provider should build")
+        .with_context_window(8, 500);
+
+        let recent_events = vec![
+            Event::new(
+                "sub-ctx".to_string(),
+                1,
+                EventKind::UserInput {
+                    input: "analyze file src/main.rs".to_string(),
+                },
+            ),
+            Event::new(
+                "sub-ctx".to_string(),
+                2,
+                EventKind::ToolExecuted {
+                    result: agent_core::protocol::ToolResult {
+                        call_name: "echo".to_string(),
+                        output: json!({ "echo": "tool output line" }),
+                        is_error: false,
+                        message: None,
+                    },
+                },
+            ),
+        ];
+
+        let request = provider.build_chat_completions_request("continue", &recent_events);
+        let payload = serde_json::to_value(&request).expect("serialize request");
+
+        assert_eq!(payload["messages"][0]["role"], "system");
+        let context = payload["messages"][0]["content"]
+            .as_str()
+            .expect("context content should be string");
+        assert!(context.contains("Session context from recent events"));
+        assert!(context.contains("user_input"));
+        assert!(context.contains("tool_executed"));
+        assert_eq!(payload["messages"][1]["role"], "user");
+        assert_eq!(payload["messages"][1]["content"], "continue");
+    }
+
+    #[test]
+    fn recent_context_truncation_is_deterministic() {
+        let events = vec![
+            Event::new(
+                "sub-trunc".to_string(),
+                1,
+                EventKind::UserInput {
+                    input: "older context".to_string(),
+                },
+            ),
+            Event::new(
+                "sub-trunc".to_string(),
+                2,
+                EventKind::LlmText {
+                    text: "middle context".to_string(),
+                },
+            ),
+            Event::new(
+                "sub-trunc".to_string(),
+                3,
+                EventKind::ToolExecuted {
+                    result: agent_core::protocol::ToolResult {
+                        call_name: "echo".to_string(),
+                        output: json!({ "echo": "newest context should survive" }),
+                        is_error: false,
+                        message: None,
+                    },
+                },
+            ),
+        ];
+
+        let context =
+            build_recent_context_message(&events, 3, 120).expect("context should be generated");
+        assert!(context.contains("event#3"));
+        assert!(
+            !context.contains("event#1"),
+            "oldest line should be truncated first"
+        );
     }
 
     #[derive(Debug)]
@@ -738,7 +980,11 @@ mod tests {
             "fixture-parsed"
         }
 
-        fn complete(&self, prompt: &str) -> Result<ProviderResponse, String> {
+        fn complete(
+            &self,
+            prompt: &str,
+            _recent_events: &[Event],
+        ) -> Result<ProviderResponse, String> {
             let mut call_count = self
                 .call_count
                 .lock()
@@ -828,6 +1074,113 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct ResumeContextProvider {
+        call_count: Mutex<usize>,
+    }
+
+    impl ProviderAdapter for ResumeContextProvider {
+        fn name(&self) -> &str {
+            "resume-context"
+        }
+
+        fn complete(
+            &self,
+            _prompt: &str,
+            recent_events: &[Event],
+        ) -> Result<ProviderResponse, String> {
+            let mut call_count = self
+                .call_count
+                .lock()
+                .expect("resume context provider mutex poisoned");
+            let current_call = *call_count;
+            *call_count += 1;
+
+            if current_call == 0 {
+                return Ok(ProviderResponse {
+                    text: "call tool".to_string(),
+                    tool_calls: vec![ToolCall {
+                        name: "echo".to_string(),
+                        args: json!({ "text": "from-tool" }),
+                    }],
+                    estimated_input_tokens: 2,
+                    estimated_output_tokens: 3,
+                });
+            }
+
+            if current_call == 1 {
+                return Ok(ProviderResponse {
+                    text: "first turn done".to_string(),
+                    tool_calls: Vec::new(),
+                    estimated_input_tokens: 1,
+                    estimated_output_tokens: 2,
+                });
+            }
+
+            let saw_prior_tool_output = recent_events.iter().any(|event| {
+                matches!(
+                    event.kind,
+                    EventKind::ToolExecuted { ref result }
+                        if result.call_name == "echo"
+                            && result.output == json!({ "echo": "from-tool" })
+                            && !result.is_error
+                )
+            });
+            if !saw_prior_tool_output {
+                return Err("resume call did not receive prior tool output context".to_string());
+            }
+
+            Ok(ProviderResponse {
+                text: "resume saw prior tool output".to_string(),
+                tool_calls: Vec::new(),
+                estimated_input_tokens: 1,
+                estimated_output_tokens: 3,
+            })
+        }
+    }
+
+    #[test]
+    fn run_then_resume_receives_prior_tool_output_context() {
+        let llm = MultiProviderGateway::new().with_provider(ResumeContextProvider {
+            call_count: Mutex::new(0),
+        });
+        let mut runtime = AgentRuntime::default();
+        let mut tools = ToolRegistry::default();
+        tools.register(EchoTool);
+        let mut store = InMemoryEventStore::default();
+
+        let first = runtime.run_turn(
+            Op::UserInput {
+                submission_id: "sub-resume-ctx".to_string(),
+                input: "start".to_string(),
+            },
+            &llm,
+            &AllowAllPolicy,
+            &tools,
+            &mut store,
+        );
+        assert_eq!(first.stop_reason, StopReason::Done);
+
+        let mut resumed_runtime = AgentRuntime::default();
+        let second = resumed_runtime.run_turn(
+            Op::Resume {
+                submission_id: "sub-resume-ctx".to_string(),
+                checkpoint_id: None,
+            },
+            &llm,
+            &AllowAllPolicy,
+            &tools,
+            &mut store,
+        );
+        assert_eq!(second.stop_reason, StopReason::Done);
+        assert!(second.events.iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::LlmText { ref text } if text == "resume saw prior tool output"
+            )
+        }));
+    }
+
+    #[derive(Debug)]
     struct FlakyRetryableProvider {
         name: String,
         failures_before_success: usize,
@@ -839,7 +1192,11 @@ mod tests {
             &self.name
         }
 
-        fn complete(&self, prompt: &str) -> Result<ProviderResponse, String> {
+        fn complete(
+            &self,
+            prompt: &str,
+            _recent_events: &[Event],
+        ) -> Result<ProviderResponse, String> {
             let mut attempts = self
                 .attempts
                 .lock()
@@ -869,7 +1226,11 @@ mod tests {
             &self.name
         }
 
-        fn complete(&self, _prompt: &str) -> Result<ProviderResponse, String> {
+        fn complete(
+            &self,
+            _prompt: &str,
+            _recent_events: &[Event],
+        ) -> Result<ProviderResponse, String> {
             Err(self.error_message.clone())
         }
     }
