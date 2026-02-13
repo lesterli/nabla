@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::{collections::HashMap, sync::Mutex, thread, time::Duration};
 
 use agent_core::{
     protocol::{Event, ToolCall},
@@ -21,18 +21,47 @@ pub struct ProviderResponse {
     pub estimated_output_tokens: u32,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct GatewayStats {
     pub successful_requests: u64,
     pub failed_requests: u64,
+    pub retry_attempts: u64,
+    pub provider_attempts: u64,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    pub provider_stats: HashMap<String, ProviderStats>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProviderStats {
+    pub successful_requests: u64,
+    pub failed_attempts: u64,
+    pub attempts: u64,
+    pub retry_attempts: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    pub max_attempts_per_provider: u32,
+    pub initial_backoff_ms: u64,
+    pub max_backoff_ms: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts_per_provider: 3,
+            initial_backoff_ms: 50,
+            max_backoff_ms: 500,
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct MultiProviderGateway {
     providers: Vec<Box<dyn ProviderAdapter>>,
     stats: Mutex<GatewayStats>,
+    retry_policy: RetryPolicy,
 }
 
 impl MultiProviderGateway {
@@ -49,8 +78,20 @@ impl MultiProviderGateway {
         self.providers.push(Box::new(provider));
     }
 
+    pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
+    }
+
+    pub fn set_retry_policy(&mut self, retry_policy: RetryPolicy) {
+        self.retry_policy = retry_policy;
+    }
+
     pub fn stats(&self) -> GatewayStats {
-        *self.stats.lock().expect("llm gateway stats mutex poisoned")
+        self.stats
+            .lock()
+            .expect("llm gateway stats mutex poisoned")
+            .clone()
     }
 }
 
@@ -62,23 +103,88 @@ impl LlmGateway for MultiProviderGateway {
             return Err("no provider adapters registered".to_string());
         }
 
-        let mut last_error = "all providers failed".to_string();
+        let max_attempts = self.retry_policy.max_attempts_per_provider.max(1);
+        let mut provider_failures = Vec::new();
 
         for provider in &self.providers {
-            match provider.complete(prompt) {
-                Ok(response) => {
-                    let mut stats = self.stats.lock().expect("llm gateway stats mutex poisoned");
-                    stats.successful_requests += 1;
-                    stats.total_input_tokens += u64::from(response.estimated_input_tokens);
-                    stats.total_output_tokens += u64::from(response.estimated_output_tokens);
+            let mut backoff_ms = self.retry_policy.initial_backoff_ms;
+            let mut attempt = 0u32;
+            let mut attempt_errors = Vec::new();
 
-                    return Ok(LlmOutput {
-                        text: response.text,
-                        tool_calls: response.tool_calls,
-                    });
+            loop {
+                attempt += 1;
+                {
+                    let mut stats = self.stats.lock().expect("llm gateway stats mutex poisoned");
+                    stats.provider_attempts += 1;
+                    let provider_stats = stats
+                        .provider_stats
+                        .entry(provider.name().to_string())
+                        .or_default();
+                    provider_stats.attempts += 1;
                 }
-                Err(err) => {
-                    last_error = format!("{}: {}", provider.name(), err);
+
+                match provider.complete(prompt) {
+                    Ok(response) => {
+                        let mut stats =
+                            self.stats.lock().expect("llm gateway stats mutex poisoned");
+                        stats.successful_requests += 1;
+                        stats.total_input_tokens += u64::from(response.estimated_input_tokens);
+                        stats.total_output_tokens += u64::from(response.estimated_output_tokens);
+                        if let Some(provider_stats) = stats.provider_stats.get_mut(provider.name())
+                        {
+                            provider_stats.successful_requests += 1;
+                        }
+
+                        return Ok(LlmOutput {
+                            text: response.text,
+                            tool_calls: response.tool_calls,
+                        });
+                    }
+                    Err(err) => {
+                        {
+                            let mut stats =
+                                self.stats.lock().expect("llm gateway stats mutex poisoned");
+                            if let Some(provider_stats) =
+                                stats.provider_stats.get_mut(provider.name())
+                            {
+                                provider_stats.failed_attempts += 1;
+                            }
+                        }
+
+                        let retryable = is_retryable_error(&err);
+                        attempt_errors.push(format!(
+                            "attempt {attempt}: retryable={retryable}, error={err}"
+                        ));
+
+                        if retryable && attempt < max_attempts {
+                            let mut stats =
+                                self.stats.lock().expect("llm gateway stats mutex poisoned");
+                            stats.retry_attempts += 1;
+                            if let Some(provider_stats) =
+                                stats.provider_stats.get_mut(provider.name())
+                            {
+                                provider_stats.retry_attempts += 1;
+                            }
+                            drop(stats);
+
+                            if backoff_ms > 0 {
+                                thread::sleep(Duration::from_millis(backoff_ms));
+                            }
+                            if self.retry_policy.max_backoff_ms > 0 {
+                                backoff_ms = (backoff_ms.saturating_mul(2))
+                                    .min(self.retry_policy.max_backoff_ms);
+                            }
+                            continue;
+                        }
+
+                        provider_failures.push(format!(
+                            "provider `{}` failed after {} attempt(s): {}",
+                            provider.name(),
+                            attempt,
+                            attempt_errors.join(" | ")
+                        ));
+                        break;
+                    }
                 }
             }
         }
@@ -86,8 +192,24 @@ impl LlmGateway for MultiProviderGateway {
         let mut stats = self.stats.lock().expect("llm gateway stats mutex poisoned");
         stats.failed_requests += 1;
 
-        Err(last_error)
+        Err(format!(
+            "all providers failed; {}",
+            provider_failures.join(" ; ")
+        ))
     }
+}
+
+fn is_retryable_error(err: &str) -> bool {
+    let normalized = err.to_ascii_lowercase();
+    normalized.contains("request failed")
+        || normalized.contains("timeout")
+        || normalized.contains("timed out")
+        || normalized.contains("connection")
+        || normalized.contains("http 429")
+        || normalized.contains("http 500")
+        || normalized.contains("http 502")
+        || normalized.contains("http 503")
+        || normalized.contains("http 504")
 }
 
 #[derive(Debug, Clone)]
@@ -444,12 +566,12 @@ struct OpenAiUsage {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::{
         MultiProviderGateway, OpenAiCompatibleProvider, OpenAiFunctionTool, OpenAiToolChoice,
-        ProviderAdapter, ProviderResponse, StaticProvider, extract_openai_message_text,
-        parse_openai_chat_completions_response,
+        ProviderAdapter, ProviderResponse, RetryPolicy, StaticProvider,
+        extract_openai_message_text, parse_openai_chat_completions_response,
     };
     use agent_core::{
         memory::{EventStore, InMemoryEventStore},
@@ -703,5 +825,136 @@ mod tests {
             )
         });
         assert!(executed, "expected runtime to execute parsed tool call");
+    }
+
+    #[derive(Debug)]
+    struct FlakyRetryableProvider {
+        name: String,
+        failures_before_success: usize,
+        attempts: Arc<Mutex<usize>>,
+    }
+
+    impl ProviderAdapter for FlakyRetryableProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn complete(&self, prompt: &str) -> Result<ProviderResponse, String> {
+            let mut attempts = self
+                .attempts
+                .lock()
+                .expect("flaky provider attempts mutex poisoned");
+            *attempts += 1;
+            if *attempts <= self.failures_before_success {
+                return Err("HTTP 503 upstream unavailable".to_string());
+            }
+
+            Ok(ProviderResponse {
+                text: format!("ok: {prompt}"),
+                tool_calls: Vec::new(),
+                estimated_input_tokens: 2,
+                estimated_output_tokens: 3,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct AlwaysFailProvider {
+        name: String,
+        error_message: String,
+    }
+
+    impl ProviderAdapter for AlwaysFailProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn complete(&self, _prompt: &str) -> Result<ProviderResponse, String> {
+            Err(self.error_message.clone())
+        }
+    }
+
+    #[test]
+    fn flaky_provider_succeeds_after_retry_and_metrics_reflect_retries() {
+        let attempts = Arc::new(Mutex::new(0usize));
+        let gateway = MultiProviderGateway::new()
+            .with_retry_policy(RetryPolicy {
+                max_attempts_per_provider: 3,
+                initial_backoff_ms: 0,
+                max_backoff_ms: 0,
+            })
+            .with_provider(FlakyRetryableProvider {
+                name: "flaky-a".to_string(),
+                failures_before_success: 2,
+                attempts: attempts.clone(),
+            });
+
+        let response = gateway
+            .complete("retry me", &Vec::<Event>::new())
+            .expect("gateway should eventually succeed");
+        assert_eq!(response.text, "ok: retry me");
+        assert_eq!(
+            *attempts.lock().expect("attempts mutex poisoned"),
+            3,
+            "provider should be attempted until success",
+        );
+
+        let stats = gateway.stats();
+        assert_eq!(stats.successful_requests, 1);
+        assert_eq!(stats.failed_requests, 0);
+        assert_eq!(stats.retry_attempts, 2);
+        assert_eq!(stats.provider_attempts, 3);
+        let flaky_stats = stats
+            .provider_stats
+            .get("flaky-a")
+            .expect("provider stats should include flaky-a");
+        assert_eq!(flaky_stats.attempts, 3);
+        assert_eq!(flaky_stats.failed_attempts, 2);
+        assert_eq!(flaky_stats.retry_attempts, 2);
+        assert_eq!(flaky_stats.successful_requests, 1);
+    }
+
+    #[test]
+    fn all_provider_failure_returns_aggregated_diagnostic_context() {
+        let gateway = MultiProviderGateway::new()
+            .with_retry_policy(RetryPolicy {
+                max_attempts_per_provider: 2,
+                initial_backoff_ms: 0,
+                max_backoff_ms: 0,
+            })
+            .with_provider(AlwaysFailProvider {
+                name: "provider-a".to_string(),
+                error_message: "HTTP 503 upstream unavailable".to_string(),
+            })
+            .with_provider(AlwaysFailProvider {
+                name: "provider-b".to_string(),
+                error_message: "invalid provider response: malformed json".to_string(),
+            });
+
+        let err = gateway
+            .complete("hello", &Vec::<Event>::new())
+            .expect_err("all providers should fail");
+
+        assert!(err.contains("all providers failed"));
+        assert!(err.contains("provider `provider-a` failed after 2 attempt(s)"));
+        assert!(err.contains("provider `provider-b` failed after 1 attempt(s)"));
+        assert!(err.contains("retryable=true"));
+        assert!(err.contains("retryable=false"));
+
+        let stats = gateway.stats();
+        assert_eq!(stats.successful_requests, 0);
+        assert_eq!(stats.failed_requests, 1);
+        assert_eq!(stats.retry_attempts, 1);
+        assert_eq!(stats.provider_attempts, 3);
+        let provider_a_stats = stats
+            .provider_stats
+            .get("provider-a")
+            .expect("provider-a stats should be present");
+        assert_eq!(provider_a_stats.attempts, 2);
+        let provider_b_stats = stats
+            .provider_stats
+            .get("provider-b")
+            .expect("provider-b stats should be present");
+        assert_eq!(provider_b_stats.attempts, 1);
     }
 }
