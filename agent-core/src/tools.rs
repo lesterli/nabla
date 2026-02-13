@@ -1,8 +1,23 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Arc, mpsc},
+    thread,
+    time::Duration,
+};
 
 use serde_json::{Value, json};
 
 use crate::protocol::{ToolCall, ToolResult};
+
+pub const IDEMPOTENCY_KEY_ARG: &str = "_idempotency_key";
+
+pub fn idempotency_key_for_call(call: &ToolCall) -> Option<&str> {
+    call.args
+        .as_object()
+        .and_then(|args| args.get(IDEMPOTENCY_KEY_ARG))
+        .and_then(Value::as_str)
+}
 
 #[derive(Debug, Clone)]
 pub enum ToolArgType {
@@ -175,14 +190,27 @@ pub trait Tool: Send + Sync {
     fn run(&self, args: &Value) -> Result<Value, String>;
 }
 
-#[derive(Default)]
 pub struct ToolRegistry {
-    tools: HashMap<String, Box<dyn Tool>>,
+    tools: HashMap<String, Arc<dyn Tool>>,
+    execution_timeout: Duration,
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self {
+            tools: HashMap::new(),
+            execution_timeout: Duration::from_secs(10),
+        }
+    }
 }
 
 impl ToolRegistry {
     pub fn register<T: Tool + 'static>(&mut self, tool: T) {
-        self.tools.insert(tool.name().to_string(), Box::new(tool));
+        self.tools.insert(tool.name().to_string(), Arc::new(tool));
+    }
+
+    pub fn set_execution_timeout(&mut self, timeout: Duration) {
+        self.execution_timeout = timeout;
     }
 
     pub fn execute(&self, call: &ToolCall) -> ToolResult {
@@ -195,7 +223,9 @@ impl ToolRegistry {
             };
         };
 
-        if let Err(err) = tool.schema().validate(&call.args) {
+        let sanitized_args = strip_internal_args(&call.args);
+
+        if let Err(err) = tool.schema().validate(&sanitized_args) {
             return ToolResult {
                 call_name: call.name.clone(),
                 output: err.to_output(),
@@ -207,7 +237,12 @@ impl ToolRegistry {
             };
         }
 
-        match tool.run(&call.args) {
+        match run_tool_with_guards(
+            Arc::clone(tool),
+            sanitized_args,
+            self.execution_timeout,
+            &call.name,
+        ) {
             Ok(output) => ToolResult {
                 call_name: call.name.clone(),
                 output,
@@ -248,12 +283,78 @@ impl Tool for EchoTool {
     }
 }
 
+fn strip_internal_args(args: &Value) -> Value {
+    let Some(object) = args.as_object() else {
+        return args.clone();
+    };
+    let mut object = object.clone();
+    object.remove(IDEMPOTENCY_KEY_ARG);
+    Value::Object(object)
+}
+
+fn run_tool_with_guards(
+    tool: Arc<dyn Tool>,
+    args: Value,
+    timeout: Duration,
+    call_name: &str,
+) -> Result<Value, String> {
+    enum GuardedToolOutcome {
+        Success(Value),
+        ToolError(String),
+        Panic(String),
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let call_name_for_thread = call_name.to_string();
+
+    thread::Builder::new()
+        .name(format!("tool-{call_name}"))
+        .spawn(move || {
+            let outcome = match catch_unwind(AssertUnwindSafe(|| tool.run(&args))) {
+                Ok(Ok(output)) => GuardedToolOutcome::Success(output),
+                Ok(Err(err)) => GuardedToolOutcome::ToolError(err),
+                Err(payload) => GuardedToolOutcome::Panic(format!(
+                    "panic during `{call_name_for_thread}` execution: {}",
+                    panic_payload_to_string(payload)
+                )),
+            };
+            let _ = tx.send(outcome);
+        })
+        .map_err(|err| format!("failed to spawn tool execution thread: {err}"))?;
+
+    match rx.recv_timeout(timeout) {
+        Ok(GuardedToolOutcome::Success(output)) => Ok(output),
+        Ok(GuardedToolOutcome::ToolError(err)) => Err(err),
+        Ok(GuardedToolOutcome::Panic(message)) => {
+            Err(format!("tool `{call_name}` panicked: {message}"))
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "tool `{call_name}` timed out after {}ms",
+            timeout.as_millis()
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(format!("tool `{call_name}` execution channel disconnected"))
+        }
+    }
+}
+
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown panic payload".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+    use std::{thread, time::Duration};
 
     use serde_json::json;
 
@@ -346,5 +447,71 @@ mod tests {
 
         assert!(result.is_error);
         assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    struct PanicTool;
+
+    impl Tool for PanicTool {
+        fn name(&self) -> &str {
+            "panic_tool"
+        }
+
+        fn run(&self, _args: &serde_json::Value) -> Result<serde_json::Value, String> {
+            panic!("panic from tool");
+        }
+    }
+
+    #[test]
+    fn panic_isolated_as_error_result() {
+        let mut tools = ToolRegistry::default();
+        tools.register(PanicTool);
+
+        let result = tools.execute(&ToolCall {
+            name: "panic_tool".to_string(),
+            args: json!({}),
+        });
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("panicked")
+        );
+    }
+
+    struct SlowTool;
+
+    impl Tool for SlowTool {
+        fn name(&self) -> &str {
+            "slow_tool"
+        }
+
+        fn run(&self, _args: &serde_json::Value) -> Result<serde_json::Value, String> {
+            thread::sleep(Duration::from_millis(80));
+            Ok(json!({ "ok": true }))
+        }
+    }
+
+    #[test]
+    fn timeout_guard_returns_consistent_error() {
+        let mut tools = ToolRegistry::default();
+        tools.set_execution_timeout(Duration::from_millis(20));
+        tools.register(SlowTool);
+
+        let result = tools.execute(&ToolCall {
+            name: "slow_tool".to_string(),
+            args: json!({}),
+        });
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("timed out")
+        );
     }
 }

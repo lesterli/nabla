@@ -1,8 +1,12 @@
+use std::collections::HashMap;
+
 use crate::{
     memory::EventStore,
     policy::PolicyEngine,
-    protocol::{BudgetKind, Event, EventKind, Op, PolicyDecision, StopReason, ToolCall},
-    tools::ToolRegistry,
+    protocol::{
+        BudgetKind, Event, EventKind, Op, PolicyDecision, StopReason, ToolCall, ToolResult,
+    },
+    tools::{ToolRegistry, idempotency_key_for_call},
 };
 
 pub trait LlmGateway {
@@ -82,6 +86,7 @@ impl AgentRuntime {
                     return result;
                 }
 
+                let mut idempotency_results = build_idempotency_result_cache(store, &submission_id);
                 self.run_control_loop(
                     &submission_id,
                     &input,
@@ -92,6 +97,7 @@ impl AgentRuntime {
                     store,
                     0,
                     0,
+                    &mut idempotency_results,
                 )
             }
             Op::Resume { checkpoint_id, .. } => {
@@ -124,6 +130,7 @@ impl AgentRuntime {
                 reason,
                 ..
             } => {
+                let mut idempotency_results = build_idempotency_result_cache(store, &submission_id);
                 let request_id_for_lookup = request_id.clone();
                 let pending_call =
                     find_pending_human_approval_call(store, &submission_id, &request_id_for_lookup);
@@ -200,7 +207,19 @@ impl AgentRuntime {
                         Err(result) => return result,
                     };
 
-                let execution = tools.execute(&pending_call);
+                let execution = if let Some(idempotency_key) =
+                    idempotency_key_for_call(&pending_call)
+                {
+                    if let Some(cached) = idempotency_results.get(idempotency_key) {
+                        cached.clone()
+                    } else {
+                        let executed = tools.execute(&pending_call);
+                        idempotency_results.insert(idempotency_key.to_string(), executed.clone());
+                        executed
+                    }
+                } else {
+                    tools.execute(&pending_call)
+                };
                 let is_error = execution.is_error;
                 if let Some(result) = self.try_push_event(
                     &submission_id,
@@ -258,6 +277,7 @@ impl AgentRuntime {
                     store,
                     total_tool_calls,
                     0,
+                    &mut idempotency_results,
                 )
             }
         }
@@ -275,6 +295,7 @@ impl AgentRuntime {
         store: &mut dyn EventStore,
         mut total_tool_calls: u64,
         mut total_tokens: u64,
+        idempotency_results: &mut HashMap<String, ToolResult>,
     ) -> TurnResult {
         for _ in 0..self.config.max_control_loop_iterations {
             if let Some(result) = self.try_push_event(
@@ -392,7 +413,19 @@ impl AgentRuntime {
 
                 match decision {
                     PolicyDecision::Allow => {
-                        let result = tools.execute(&call);
+                        let result = if let Some(idempotency_key) = idempotency_key_for_call(&call)
+                        {
+                            if let Some(cached) = idempotency_results.get(idempotency_key) {
+                                cached.clone()
+                            } else {
+                                let executed = tools.execute(&call);
+                                idempotency_results
+                                    .insert(idempotency_key.to_string(), executed.clone());
+                                executed
+                            }
+                        } else {
+                            tools.execute(&call)
+                        };
                         let is_error = result.is_error;
                         if let Some(stop) = self.try_push_event(
                             submission_id,
@@ -630,13 +663,40 @@ fn latest_user_input_for_submission(store: &dyn EventStore, submission_id: &str)
         })
 }
 
+fn build_idempotency_result_cache(
+    store: &dyn EventStore,
+    submission_id: &str,
+) -> HashMap<String, ToolResult> {
+    let mut cache = HashMap::new();
+    let mut pending_idempotency_key: Option<String> = None;
+
+    for event in store.events_for_submission(submission_id) {
+        match event.kind {
+            EventKind::ToolCallProposed { call } => {
+                pending_idempotency_key = idempotency_key_for_call(&call).map(str::to_string);
+            }
+            EventKind::ToolExecuted { result } => {
+                if let Some(idempotency_key) = pending_idempotency_key.take() {
+                    cache.insert(idempotency_key, result);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    cache
+}
+
 fn estimate_text_tokens(text: &str) -> u64 {
     text.split_whitespace().count() as u64
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use serde_json::json;
 
@@ -645,7 +705,7 @@ mod tests {
         memory::{EventStore, InMemoryEventStore},
         policy::{AllowAllPolicy, DenyAllPolicy, PolicyEngine},
         protocol::{BudgetKind, Event, EventKind, Op, PolicyDecision, StopReason, ToolCall},
-        tools::{EchoTool, ToolRegistry},
+        tools::{EchoTool, Tool, ToolRegistry},
     };
 
     struct StaticGateway {
@@ -910,6 +970,89 @@ mod tests {
             .iter()
             .any(|event| matches!(event.kind, EventKind::ToolExecuted { .. }));
         assert!(!executed);
+    }
+
+    struct CounterTool {
+        runs: Arc<AtomicUsize>,
+    }
+
+    impl Tool for CounterTool {
+        fn name(&self) -> &str {
+            "counter"
+        }
+
+        fn run(&self, _args: &serde_json::Value) -> Result<serde_json::Value, String> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "ok": true }))
+        }
+    }
+
+    #[test]
+    fn duplicate_idempotency_key_reuses_previous_result_without_rerun() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::default();
+        tools.register(CounterTool { runs: runs.clone() });
+
+        let llm_first = SequenceGateway::new(vec![
+            LlmOutput {
+                text: "first".to_string(),
+                tool_calls: vec![ToolCall {
+                    name: "counter".to_string(),
+                    args: json!({ "value": "x", "_idempotency_key": "counter-key-1" }),
+                }],
+            },
+            LlmOutput {
+                text: "done".to_string(),
+                tool_calls: Vec::new(),
+            },
+        ]);
+
+        let mut runtime_first = AgentRuntime::default();
+        let mut store = InMemoryEventStore::default();
+        let first = runtime_first.run_turn(
+            Op::UserInput {
+                submission_id: "sub-idempotency".to_string(),
+                input: "first".to_string(),
+            },
+            &llm_first,
+            &AllowAllPolicy,
+            &tools,
+            &mut store,
+        );
+        assert_eq!(first.stop_reason, StopReason::Done);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        let llm_second = SequenceGateway::new(vec![
+            LlmOutput {
+                text: "second".to_string(),
+                tool_calls: vec![ToolCall {
+                    name: "counter".to_string(),
+                    args: json!({ "value": "x", "_idempotency_key": "counter-key-1" }),
+                }],
+            },
+            LlmOutput {
+                text: "done".to_string(),
+                tool_calls: Vec::new(),
+            },
+        ]);
+
+        let mut runtime_second = AgentRuntime::default();
+        let second = runtime_second.run_turn(
+            Op::UserInput {
+                submission_id: "sub-idempotency".to_string(),
+                input: "second".to_string(),
+            },
+            &llm_second,
+            &AllowAllPolicy,
+            &tools,
+            &mut store,
+        );
+        assert_eq!(second.stop_reason, StopReason::Done);
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "tool should not re-run for duplicate idempotency key",
+        );
     }
 
     #[test]
