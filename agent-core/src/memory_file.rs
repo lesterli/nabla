@@ -140,6 +140,7 @@ mod tests {
                 2,
                 EventKind::TurnStopped {
                     reason: StopReason::Done,
+                    facts: None,
                 },
             ));
             assert_eq!(store.last_event_index(), Some(2));
@@ -187,6 +188,7 @@ mod tests {
             1,
             EventKind::TurnStopped {
                 reason: StopReason::Done,
+                facts: None,
             },
         ))
         .expect("serialize valid event");

@@ -77,6 +77,23 @@ pub enum BudgetKind {
     Tokens,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetExceededFact {
+    pub budget: BudgetKind,
+    pub limit: u64,
+    pub observed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StopFacts {
+    pub stop_reason: StopReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_exceeded: Option<BudgetExceededFact>,
+    pub tool_error_count: u64,
+    pub last_tool_calls: Vec<ToolCall>,
+    pub has_pending_approval: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventKind {
@@ -125,6 +142,8 @@ pub enum EventKind {
     },
     TurnStopped {
         reason: StopReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        facts: Option<StopFacts>,
     },
 }
 
@@ -151,7 +170,9 @@ impl Event {
 mod tests {
     use serde_json::json;
 
-    use super::{BudgetKind, Event, EventKind, Op, StopReason, ToolCall};
+    use super::{
+        BudgetExceededFact, BudgetKind, Event, EventKind, Op, StopFacts, StopReason, ToolCall,
+    };
 
     fn assert_stable_json<T: serde::Serialize>(actual: T, expected: &str) {
         let actual =
@@ -166,6 +187,13 @@ mod tests {
             7,
             EventKind::TurnStopped {
                 reason: StopReason::Done,
+                facts: Some(StopFacts {
+                    stop_reason: StopReason::Done,
+                    budget_exceeded: None,
+                    tool_error_count: 0,
+                    last_tool_calls: Vec::new(),
+                    has_pending_approval: false,
+                }),
             },
         );
 
@@ -176,7 +204,13 @@ mod tests {
   "index": 7,
   "kind": {
     "kind": "turn_stopped",
-    "reason": "done"
+    "reason": "done",
+    "facts": {
+      "stop_reason": "done",
+      "tool_error_count": 0,
+      "last_tool_calls": [],
+      "has_pending_approval": false
+    }
   }
 }"#;
 
@@ -345,6 +379,84 @@ mod tests {
 }"#;
 
         assert_stable_json(event, expected);
+    }
+
+    #[test]
+    fn protocol_schema_turn_stopped_with_budget_fact_json_shape_is_stable() {
+        let event = Event::new(
+            "submission-42".to_string(),
+            13,
+            EventKind::TurnStopped {
+                reason: StopReason::BudgetExceeded,
+                facts: Some(StopFacts {
+                    stop_reason: StopReason::BudgetExceeded,
+                    budget_exceeded: Some(BudgetExceededFact {
+                        budget: BudgetKind::Tokens,
+                        limit: 16,
+                        observed: 17,
+                    }),
+                    tool_error_count: 1,
+                    last_tool_calls: vec![ToolCall {
+                        name: "echo".to_string(),
+                        args: json!({ "text": "hello" }),
+                    }],
+                    has_pending_approval: false,
+                }),
+            },
+        );
+        let expected = r#"{
+  "schema_version": 1,
+  "submission_id": "submission-42",
+  "index": 13,
+  "kind": {
+    "kind": "turn_stopped",
+    "reason": "budget_exceeded",
+    "facts": {
+      "stop_reason": "budget_exceeded",
+      "budget_exceeded": {
+        "budget": "tokens",
+        "limit": 16,
+        "observed": 17
+      },
+      "tool_error_count": 1,
+      "last_tool_calls": [
+        {
+          "name": "echo",
+          "args": {
+            "text": "hello"
+          }
+        }
+      ],
+      "has_pending_approval": false
+    }
+  }
+}"#;
+
+        assert_stable_json(event, expected);
+    }
+
+    #[test]
+    fn protocol_schema_turn_stopped_without_facts_deserializes_for_compatibility() {
+        let event = serde_json::from_str::<Event>(
+            r#"{
+                "schema_version": 1,
+                "submission_id": "submission-42",
+                "index": 1,
+                "kind": {
+                    "kind": "turn_stopped",
+                    "reason": "done"
+                }
+            }"#,
+        )
+        .expect("legacy turn_stopped should deserialize");
+
+        assert!(matches!(
+            event.kind,
+            EventKind::TurnStopped {
+                reason: StopReason::Done,
+                facts: None
+            }
+        ));
     }
 
     #[test]

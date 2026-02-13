@@ -499,8 +499,18 @@ fn summarize_event_for_context(event: &Event) -> Option<String> {
             event.index,
             truncate_text(message, DEFAULT_EVENT_TEXT_MAX_CHARS)
         ),
-        agent_core::protocol::EventKind::TurnStopped { reason } => {
-            format!("event#{} turn_stopped: {reason:?}", event.index)
+        agent_core::protocol::EventKind::TurnStopped { reason, facts } => {
+            if let Some(facts) = facts {
+                format!(
+                    "event#{} turn_stopped: {:?} tool_errors={} pending_approval={}",
+                    event.index,
+                    facts.stop_reason,
+                    facts.tool_error_count,
+                    facts.has_pending_approval
+                )
+            } else {
+                format!("event#{} turn_stopped: {reason:?}", event.index)
+            }
         }
         _ => return None,
     };

@@ -1,10 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     memory::EventStore,
     policy::PolicyEngine,
     protocol::{
-        BudgetKind, Event, EventKind, Op, PolicyDecision, StopReason, ToolCall, ToolResult,
+        BudgetExceededFact, BudgetKind, Event, EventKind, Op, PolicyDecision, StopFacts,
+        StopReason, ToolCall, ToolResult,
     },
     tools::{ToolRegistry, idempotency_key_for_call},
 };
@@ -43,6 +44,7 @@ pub struct LlmOutput {
 #[derive(Debug, Clone)]
 pub struct TurnResult {
     pub stop_reason: StopReason,
+    pub stop_facts: StopFacts,
     pub events: Vec<Event>,
 }
 
@@ -119,18 +121,12 @@ impl AgentRuntime {
                         &mut emitted,
                         store,
                     );
-                    self.push_event(
+                    return self.finalize_turn(
                         &submission_id,
-                        EventKind::TurnStopped {
-                            reason: StopReason::Error,
-                        },
+                        StopReason::Error,
                         &mut emitted,
                         store,
                     );
-                    return TurnResult {
-                        stop_reason: StopReason::Error,
-                        events: emitted,
-                    };
                 };
 
                 let mut idempotency_results = build_idempotency_result_cache(store, &submission_id);
@@ -172,19 +168,12 @@ impl AgentRuntime {
                 }
 
                 if !approved {
-                    self.push_event(
+                    return self.finalize_turn(
                         &submission_id,
-                        EventKind::TurnStopped {
-                            reason: StopReason::PolicyDenied,
-                        },
+                        StopReason::PolicyDenied,
                         &mut emitted,
                         store,
                     );
-
-                    return TurnResult {
-                        stop_reason: StopReason::PolicyDenied,
-                        events: emitted,
-                    };
                 }
 
                 let Some(pending_call) = pending_call else {
@@ -198,19 +187,12 @@ impl AgentRuntime {
                         &mut emitted,
                         store,
                     );
-                    self.push_event(
+                    return self.finalize_turn(
                         &submission_id,
-                        EventKind::TurnStopped {
-                            reason: StopReason::Error,
-                        },
+                        StopReason::Error,
                         &mut emitted,
                         store,
                     );
-
-                    return TurnResult {
-                        stop_reason: StopReason::Error,
-                        events: emitted,
-                    };
                 };
 
                 if let Some(result) = self.try_push_event(
@@ -253,18 +235,12 @@ impl AgentRuntime {
                     return result;
                 }
                 if is_error {
-                    self.push_event(
+                    return self.finalize_turn(
                         &submission_id,
-                        EventKind::TurnStopped {
-                            reason: StopReason::Error,
-                        },
+                        StopReason::Error,
                         &mut emitted,
                         store,
                     );
-                    return TurnResult {
-                        stop_reason: StopReason::Error,
-                        events: emitted,
-                    };
                 }
 
                 let Some(prompt) = latest_user_input_for_submission(store, &submission_id) else {
@@ -276,18 +252,12 @@ impl AgentRuntime {
                         &mut emitted,
                         store,
                     );
-                    self.push_event(
+                    return self.finalize_turn(
                         &submission_id,
-                        EventKind::TurnStopped {
-                            reason: StopReason::Error,
-                        },
+                        StopReason::Error,
                         &mut emitted,
                         store,
                     );
-                    return TurnResult {
-                        stop_reason: StopReason::Error,
-                        events: emitted,
-                    };
                 };
 
                 self.run_control_loop(
@@ -344,19 +314,7 @@ impl AgentRuntime {
                         return result;
                     }
 
-                    self.push_event(
-                        submission_id,
-                        EventKind::TurnStopped {
-                            reason: StopReason::Error,
-                        },
-                        emitted,
-                        store,
-                    );
-
-                    return TurnResult {
-                        stop_reason: StopReason::Error,
-                        events: emitted.clone(),
-                    };
+                    return self.finalize_turn(submission_id, StopReason::Error, emitted, store);
                 }
             };
 
@@ -386,19 +344,7 @@ impl AgentRuntime {
             }
 
             if llm_output.tool_calls.is_empty() {
-                self.push_event(
-                    submission_id,
-                    EventKind::TurnStopped {
-                        reason: StopReason::Done,
-                    },
-                    emitted,
-                    store,
-                );
-
-                return TurnResult {
-                    stop_reason: StopReason::Done,
-                    events: emitted.clone(),
-                };
+                return self.finalize_turn(submission_id, StopReason::Done, emitted, store);
             }
 
             for call in llm_output.tool_calls {
@@ -460,35 +406,21 @@ impl AgentRuntime {
                         }
 
                         if is_error {
-                            self.push_event(
+                            return self.finalize_turn(
                                 submission_id,
-                                EventKind::TurnStopped {
-                                    reason: StopReason::Error,
-                                },
+                                StopReason::Error,
                                 emitted,
                                 store,
                             );
-
-                            return TurnResult {
-                                stop_reason: StopReason::Error,
-                                events: emitted.clone(),
-                            };
                         }
                     }
                     PolicyDecision::Deny { .. } => {
-                        self.push_event(
+                        return self.finalize_turn(
                             submission_id,
-                            EventKind::TurnStopped {
-                                reason: StopReason::PolicyDenied,
-                            },
+                            StopReason::PolicyDenied,
                             emitted,
                             store,
                         );
-
-                        return TurnResult {
-                            stop_reason: StopReason::PolicyDenied,
-                            events: emitted.clone(),
-                        };
                     }
                     PolicyDecision::AskHuman { reason } => {
                         let request_id = format!("approval-{}", self.next_event_index);
@@ -505,37 +437,18 @@ impl AgentRuntime {
                             return result;
                         }
 
-                        self.push_event(
+                        return self.finalize_turn(
                             submission_id,
-                            EventKind::TurnStopped {
-                                reason: StopReason::HumanApprovalRequired,
-                            },
+                            StopReason::HumanApprovalRequired,
                             emitted,
                             store,
                         );
-
-                        return TurnResult {
-                            stop_reason: StopReason::HumanApprovalRequired,
-                            events: emitted.clone(),
-                        };
                     }
                 }
             }
         }
 
-        self.push_event(
-            submission_id,
-            EventKind::TurnStopped {
-                reason: StopReason::Interrupted,
-            },
-            emitted,
-            store,
-        );
-
-        TurnResult {
-            stop_reason: StopReason::Interrupted,
-            events: emitted.clone(),
-        }
+        self.finalize_turn(submission_id, StopReason::Interrupted, emitted, store)
     }
 
     fn consume_tool_call_budget(
@@ -605,17 +518,29 @@ impl AgentRuntime {
             emitted,
             store,
         );
+        self.finalize_turn(submission_id, StopReason::BudgetExceeded, emitted, store)
+    }
+
+    fn finalize_turn(
+        &mut self,
+        submission_id: &str,
+        stop_reason: StopReason,
+        emitted: &mut Vec<Event>,
+        store: &mut dyn EventStore,
+    ) -> TurnResult {
+        let stop_facts = build_stop_facts(stop_reason.clone(), emitted, store, submission_id);
         self.push_event(
             submission_id,
             EventKind::TurnStopped {
-                reason: StopReason::BudgetExceeded,
+                reason: stop_reason.clone(),
+                facts: Some(stop_facts.clone()),
             },
             emitted,
             store,
         );
-
         TurnResult {
-            stop_reason: StopReason::BudgetExceeded,
+            stop_reason,
+            stop_facts,
             events: emitted.clone(),
         }
     }
@@ -714,6 +639,78 @@ fn estimate_text_tokens(text: &str) -> u64 {
     text.split_whitespace().count() as u64
 }
 
+fn build_stop_facts(
+    stop_reason: StopReason,
+    emitted: &[Event],
+    store: &dyn EventStore,
+    submission_id: &str,
+) -> StopFacts {
+    let mut last_tool_calls = emitted
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ToolCallProposed { call } => Some(call.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    const MAX_STOP_FACTS_TOOL_CALLS: usize = 8;
+    if last_tool_calls.len() > MAX_STOP_FACTS_TOOL_CALLS {
+        let start = last_tool_calls.len() - MAX_STOP_FACTS_TOOL_CALLS;
+        last_tool_calls = last_tool_calls.split_off(start);
+    }
+
+    let tool_error_count = emitted
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::ToolExecuted {
+                    result: ToolResult { is_error: true, .. }
+                }
+            )
+        })
+        .count() as u64;
+
+    StopFacts {
+        stop_reason,
+        budget_exceeded: extract_budget_exceeded_fact(emitted),
+        tool_error_count,
+        last_tool_calls,
+        has_pending_approval: has_pending_human_approval(store, submission_id),
+    }
+}
+
+fn extract_budget_exceeded_fact(events: &[Event]) -> Option<BudgetExceededFact> {
+    events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::BudgetExceeded {
+            budget,
+            limit,
+            observed,
+        } => Some(BudgetExceededFact {
+            budget: budget.clone(),
+            limit: *limit,
+            observed: *observed,
+        }),
+        _ => None,
+    })
+}
+
+fn has_pending_human_approval(store: &dyn EventStore, submission_id: &str) -> bool {
+    let mut pending = HashSet::new();
+    for event in store.events_for_submission(submission_id) {
+        match event.kind {
+            EventKind::HumanApprovalRequested { request_id, .. } => {
+                pending.insert(request_id);
+            }
+            EventKind::HumanApprovalResolved { request_id, .. } => {
+                pending.remove(&request_id);
+            }
+            _ => {}
+        }
+    }
+
+    !pending.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -727,7 +724,10 @@ mod tests {
     use crate::{
         memory::{EventStore, InMemoryEventStore},
         policy::{AllowAllPolicy, DenyAllPolicy, PolicyEngine},
-        protocol::{BudgetKind, Event, EventKind, Op, PolicyDecision, StopReason, ToolCall},
+        protocol::{
+            BudgetExceededFact, BudgetKind, Event, EventKind, Op, PolicyDecision, StopReason,
+            ToolCall,
+        },
         tools::{EchoTool, Tool, ToolRegistry},
     };
 
@@ -818,6 +818,8 @@ mod tests {
         );
 
         assert_eq!(result.stop_reason, StopReason::PolicyDenied);
+        assert_eq!(result.stop_facts.stop_reason, StopReason::PolicyDenied);
+        assert!(!result.stop_facts.has_pending_approval);
         assert!(
             store
                 .events()
@@ -862,6 +864,7 @@ mod tests {
         );
 
         assert_eq!(result.stop_reason, StopReason::Done);
+        assert_eq!(result.stop_facts.stop_reason, StopReason::Done);
         assert!(store.events().iter().any(|event| {
             matches!(
                 event.kind,
@@ -900,6 +903,7 @@ mod tests {
         );
 
         assert_eq!(result.stop_reason, StopReason::Error);
+        assert_eq!(result.stop_facts.stop_reason, StopReason::Error);
         assert!(store.events().iter().any(|event| {
             matches!(
                 event.kind,
@@ -940,6 +944,11 @@ mod tests {
             &mut store,
         );
         assert_eq!(first.stop_reason, StopReason::HumanApprovalRequired);
+        assert_eq!(
+            first.stop_facts.stop_reason,
+            StopReason::HumanApprovalRequired
+        );
+        assert!(first.stop_facts.has_pending_approval);
 
         let expected_request_id = first
             .events
@@ -965,6 +974,8 @@ mod tests {
         );
 
         assert_eq!(second.stop_reason, StopReason::Done);
+        assert_eq!(second.stop_facts.stop_reason, StopReason::Done);
+        assert!(!second.stop_facts.has_pending_approval);
         assert!(store.events().iter().any(|event| {
             matches!(
                 event.kind,
@@ -1033,6 +1044,8 @@ mod tests {
         );
 
         assert_eq!(second.stop_reason, StopReason::PolicyDenied);
+        assert_eq!(second.stop_facts.stop_reason, StopReason::PolicyDenied);
+        assert!(!second.stop_facts.has_pending_approval);
         let executed = store
             .events()
             .iter()
@@ -1088,6 +1101,7 @@ mod tests {
             &mut store,
         );
         assert_eq!(first.stop_reason, StopReason::Done);
+        assert_eq!(first.stop_facts.stop_reason, StopReason::Done);
         assert_eq!(runs.load(Ordering::SeqCst), 1);
 
         let llm_second = SequenceGateway::new(vec![
@@ -1116,6 +1130,7 @@ mod tests {
             &mut store,
         );
         assert_eq!(second.stop_reason, StopReason::Done);
+        assert_eq!(second.stop_facts.stop_reason, StopReason::Done);
         assert_eq!(
             runs.load(Ordering::SeqCst),
             1,
@@ -1248,6 +1263,7 @@ mod tests {
         );
 
         assert_eq!(result.stop_reason, StopReason::Done);
+        assert_eq!(result.stop_facts.stop_reason, StopReason::Done);
         let executed_outputs = store
             .events()
             .iter()
@@ -1297,6 +1313,8 @@ mod tests {
         );
 
         assert_eq!(result.stop_reason, StopReason::Error);
+        assert_eq!(result.stop_facts.stop_reason, StopReason::Error);
+        assert_eq!(result.stop_facts.tool_error_count, 1);
 
         let has_error_tool_result = store.events().iter().any(|event| {
             matches!(
@@ -1312,9 +1330,19 @@ mod tests {
         assert!(matches!(
             last_event.kind,
             EventKind::TurnStopped {
-                reason: StopReason::Error
+                reason: StopReason::Error,
+                ..
             }
         ));
+        if let EventKind::TurnStopped { facts, .. } = &last_event.kind {
+            let facts = facts
+                .as_ref()
+                .expect("turn_stopped should include standardized stop facts");
+            assert_eq!(facts.stop_reason, StopReason::Error);
+            assert_eq!(facts.tool_error_count, 1);
+        } else {
+            panic!("expected turn_stopped event");
+        }
     }
 
     #[test]
@@ -1357,6 +1385,15 @@ mod tests {
         );
 
         assert_eq!(result.stop_reason, StopReason::BudgetExceeded);
+        assert_eq!(result.stop_facts.stop_reason, StopReason::BudgetExceeded);
+        assert_eq!(
+            result.stop_facts.budget_exceeded,
+            Some(BudgetExceededFact {
+                budget: BudgetKind::ToolCalls,
+                limit: 1,
+                observed: 2
+            })
+        );
         assert!(store.events().iter().any(|event| {
             matches!(
                 event.kind,
@@ -1397,6 +1434,15 @@ mod tests {
         );
 
         assert_eq!(result.stop_reason, StopReason::BudgetExceeded);
+        assert_eq!(result.stop_facts.stop_reason, StopReason::BudgetExceeded);
+        assert_eq!(
+            result.stop_facts.budget_exceeded,
+            Some(BudgetExceededFact {
+                budget: BudgetKind::Events,
+                limit: 2,
+                observed: 3
+            })
+        );
         assert!(store.events().iter().any(|event| {
             matches!(
                 event.kind,
@@ -1437,6 +1483,15 @@ mod tests {
         );
 
         assert_eq!(result.stop_reason, StopReason::BudgetExceeded);
+        assert_eq!(result.stop_facts.stop_reason, StopReason::BudgetExceeded);
+        assert_eq!(
+            result.stop_facts.budget_exceeded,
+            Some(BudgetExceededFact {
+                budget: BudgetKind::Tokens,
+                limit: 2,
+                observed: 3
+            })
+        );
         assert!(store.events().iter().any(|event| {
             matches!(
                 event.kind,

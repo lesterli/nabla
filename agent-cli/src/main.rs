@@ -874,6 +874,7 @@ mod tests {
                 2,
                 EventKind::TurnStopped {
                     reason: StopReason::HumanApprovalRequired,
+                    facts: None,
                 },
             ));
         }
@@ -922,7 +923,8 @@ mod tests {
             matches!(
                 event.kind,
                 EventKind::TurnStopped {
-                    reason: StopReason::Done
+                    reason: StopReason::Done,
+                    ..
                 }
             )
         }));
@@ -966,6 +968,7 @@ mod tests {
                 2,
                 EventKind::TurnStopped {
                     reason: StopReason::HumanApprovalRequired,
+                    facts: None,
                 },
             ));
         }
@@ -1013,7 +1016,8 @@ mod tests {
             matches!(
                 event.kind,
                 EventKind::TurnStopped {
-                    reason: StopReason::PolicyDenied
+                    reason: StopReason::PolicyDenied,
+                    ..
                 }
             )
         }));
