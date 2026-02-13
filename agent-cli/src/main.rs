@@ -31,6 +31,13 @@ enum CliCommand {
         checkpoint_id: Option<String>,
         store_file: PathBuf,
     },
+    Approve {
+        submission_id: String,
+        request_id: String,
+        approved: bool,
+        reason: Option<String>,
+        store_file: PathBuf,
+    },
     Replay {
         submission_id: String,
         store_file: PathBuf,
@@ -49,6 +56,7 @@ fn print_usage(program: &str) {
   {program} [OPTIONS] <prompt>
   {program} run --store-file <path> [--submission-id <id>] <prompt>
   {program} resume --store-file <path> [--submission-id <id>] [--checkpoint-id <id>]
+  {program} approve --store-file <path> [--submission-id <id>] --request-id <id> --approved <true|false> [--reason <text>]
   {program} replay --store-file <path> [--submission-id <id>]
 
 Options:
@@ -57,7 +65,7 @@ Options:
 
 Notes:
   - The shorthand `{program} <prompt>` is kept for backward compatibility.
-  - Lifecycle subcommands (`run/resume/replay`) require `--store-file` for persistence.
+  - Lifecycle subcommands (`run/resume/approve/replay`) require `--store-file` for persistence.
 
 LLM env:
   AGENT_LLM_PROVIDER=mock|openai|openai_compatible (default: mock)
@@ -185,6 +193,7 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
     match args[0].as_str() {
         "run" => parse_run_subcommand(&args[1..]),
         "resume" => parse_resume_subcommand(&args[1..]),
+        "approve" => parse_approve_subcommand(&args[1..]),
         "replay" => parse_replay_subcommand(&args[1..]),
         flag if flag.starts_with('-') => Err(format!("unsupported option `{flag}`")),
         _ => {
@@ -344,6 +353,87 @@ fn parse_replay_subcommand(args: &[String]) -> Result<CliCommand, String> {
     })
 }
 
+fn parse_approve_subcommand(args: &[String]) -> Result<CliCommand, String> {
+    let mut submission_id = DEFAULT_SUBMISSION_ID.to_string();
+    let mut request_id: Option<String> = None;
+    let mut approved: Option<bool> = None;
+    let mut reason: Option<String> = None;
+    let mut store_file: Option<PathBuf> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => return Ok(CliCommand::Help),
+            "--submission-id" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`approve --submission-id` requires a value".to_string());
+                }
+                submission_id = args[i].clone();
+            }
+            "--request-id" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`approve --request-id` requires a value".to_string());
+                }
+                request_id = Some(args[i].clone());
+            }
+            "--approved" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`approve --approved` requires a value".to_string());
+                }
+                approved = Some(match args[i].as_str() {
+                    "true" => true,
+                    "false" => false,
+                    other => {
+                        return Err(format!(
+                            "`approve --approved` expects `true` or `false`, got `{other}`"
+                        ));
+                    }
+                });
+            }
+            "--reason" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`approve --reason` requires a value".to_string());
+                }
+                reason = Some(args[i].clone());
+            }
+            "--store-file" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`approve --store-file` requires a value".to_string());
+                }
+                store_file = Some(PathBuf::from(&args[i]));
+            }
+            unknown if unknown.starts_with("--") => {
+                return Err(format!("unknown `approve` option `{unknown}`"));
+            }
+            value => return Err(format!("unexpected argument for `approve`: `{value}`")),
+        }
+        i += 1;
+    }
+
+    let Some(request_id) = request_id else {
+        return Err("`approve` requires --request-id <id>".to_string());
+    };
+    let Some(approved) = approved else {
+        return Err("`approve` requires --approved <true|false>".to_string());
+    };
+    let Some(store_file) = store_file else {
+        return Err("`approve` requires --store-file <path>".to_string());
+    };
+
+    Ok(CliCommand::Approve {
+        submission_id,
+        request_id,
+        approved,
+        reason,
+        store_file,
+    })
+}
+
 fn build_tools() -> ToolRegistry {
     let mut tools = ToolRegistry::default();
     tools.register(EchoTool);
@@ -370,6 +460,16 @@ fn execute_parsed_command(
         } => {
             let llm = llm.ok_or_else(|| "resume requires an LLM gateway".to_string())?;
             execute_resume(submission_id, checkpoint_id, store_file, llm)
+        }
+        CliCommand::Approve {
+            submission_id,
+            request_id,
+            approved,
+            reason,
+            store_file,
+        } => {
+            let llm = llm.ok_or_else(|| "approve requires an LLM gateway".to_string())?;
+            execute_approve(submission_id, request_id, approved, reason, store_file, llm)
         }
         CliCommand::Replay {
             submission_id,
@@ -481,6 +581,47 @@ fn execute_replay(submission_id: String, store_file: PathBuf) -> Result<CommandE
     })
 }
 
+fn execute_approve(
+    submission_id: String,
+    request_id: String,
+    approved: bool,
+    reason: Option<String>,
+    store_file: PathBuf,
+    llm: &dyn LlmGateway,
+) -> Result<CommandExecution, String> {
+    let mut runtime = AgentRuntime::default();
+    let policy = AllowAllPolicy;
+    let tools = build_tools();
+    let mut store = FileEventStore::open(&store_file).map_err(|err| {
+        format!(
+            "failed to open store file `{}`: {err}",
+            store_file.display()
+        )
+    })?;
+
+    let turn = runtime.run_turn(
+        Op::HumanApprovalResponse {
+            submission_id,
+            request_id,
+            approved,
+            reason,
+        },
+        llm,
+        &policy,
+        &tools,
+        &mut store,
+    );
+
+    let exit_code = match turn.stop_reason {
+        StopReason::Error | StopReason::PolicyDenied | StopReason::BudgetExceeded => 1,
+        _ => 0,
+    };
+    Ok(CommandExecution {
+        events: turn.events,
+        exit_code,
+    })
+}
+
 fn main() {
     let mut args = std::env::args();
     let program = args.next().unwrap_or_else(|| "agent-cli".to_string());
@@ -504,7 +645,7 @@ fn main() {
             println!("{VERSION}");
             return;
         }
-        CliCommand::Run { .. } | CliCommand::Resume { .. } => {
+        CliCommand::Run { .. } | CliCommand::Resume { .. } | CliCommand::Approve { .. } => {
             let llm = match build_gateway_from_env() {
                 Ok(gateway) => gateway,
                 Err(err) => {
@@ -559,8 +700,13 @@ mod tests {
         CliCommand, execute_parsed_command, parse_cli_command, parse_tool_choice_env,
         parse_tools_env,
     };
-    use agent_core::{memory::EventStore, memory_file::FileEventStore, protocol::EventKind};
+    use agent_core::{
+        memory::EventStore,
+        memory_file::FileEventStore,
+        protocol::{Event, EventKind, StopReason, ToolCall},
+    };
     use agent_llm::{MultiProviderGateway, OpenAiToolChoice, StaticProvider};
+    use serde_json::json;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -617,6 +763,20 @@ mod tests {
         ]))
         .expect("parse replay");
         assert!(matches!(replay, CliCommand::Replay { .. }));
+
+        let approve = parse_cli_command(&args(&[
+            "approve",
+            "--submission-id",
+            "s1",
+            "--request-id",
+            "approval-1",
+            "--approved",
+            "true",
+            "--store-file",
+            "/tmp/events.jsonl",
+        ]))
+        .expect("parse approve");
+        assert!(matches!(approve, CliCommand::Approve { .. }));
     }
 
     #[test]
@@ -674,6 +834,189 @@ mod tests {
             events.windows(2).all(|pair| pair[1].index > pair[0].index),
             "event indices should remain strictly increasing",
         );
+
+        fs::remove_file(&store_path).expect("cleanup store file");
+        if let Some(parent) = store_path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+
+    #[test]
+    fn approve_true_resumes_pending_call_and_continues_loop() {
+        let store_path = temp_store_path("approve-true");
+        if let Some(parent) = store_path.parent() {
+            fs::create_dir_all(parent).expect("create temp dir");
+        }
+
+        {
+            let mut store = FileEventStore::open(&store_path).expect("open seed store");
+            store.append(Event::new(
+                "submission-approve".to_string(),
+                0,
+                EventKind::UserInput {
+                    input: "need approval".to_string(),
+                },
+            ));
+            store.append(Event::new(
+                "submission-approve".to_string(),
+                1,
+                EventKind::HumanApprovalRequested {
+                    request_id: "approval-7".to_string(),
+                    call: ToolCall {
+                        name: "echo".to_string(),
+                        args: json!({ "text": "approved" }),
+                    },
+                    reason: "needs human".to_string(),
+                },
+            ));
+            store.append(Event::new(
+                "submission-approve".to_string(),
+                2,
+                EventKind::TurnStopped {
+                    reason: StopReason::HumanApprovalRequired,
+                },
+            ));
+        }
+
+        let llm =
+            MultiProviderGateway::new().with_provider(StaticProvider::new("mock", "assistant> "));
+        let store_path_str = store_path.to_string_lossy().to_string();
+        let approve_command = parse_cli_command(&args(&[
+            "approve",
+            "--submission-id",
+            "submission-approve",
+            "--request-id",
+            "approval-7",
+            "--approved",
+            "true",
+            "--reason",
+            "approved in cli test",
+            "--store-file",
+            &store_path_str,
+        ]))
+        .expect("parse approve");
+        let approve_result =
+            execute_parsed_command(approve_command, Some(&llm)).expect("execute approve");
+        assert_eq!(approve_result.exit_code, 0);
+
+        let store = FileEventStore::open(&store_path).expect("open store for assertions");
+        let events = store.events_for_submission("submission-approve");
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::HumanApprovalResolved {
+                    approved: true,
+                    reason: Some(ref reason),
+                    ..
+                } if reason == "approved in cli test"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::ToolExecuted { ref result }
+                    if result.call_name == "echo" && !result.is_error
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::TurnStopped {
+                    reason: StopReason::Done
+                }
+            )
+        }));
+
+        fs::remove_file(&store_path).expect("cleanup store file");
+        if let Some(parent) = store_path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+
+    #[test]
+    fn approve_false_records_denial_without_tool_execution() {
+        let store_path = temp_store_path("approve-false");
+        if let Some(parent) = store_path.parent() {
+            fs::create_dir_all(parent).expect("create temp dir");
+        }
+
+        {
+            let mut store = FileEventStore::open(&store_path).expect("open seed store");
+            store.append(Event::new(
+                "submission-deny".to_string(),
+                0,
+                EventKind::UserInput {
+                    input: "need approval".to_string(),
+                },
+            ));
+            store.append(Event::new(
+                "submission-deny".to_string(),
+                1,
+                EventKind::HumanApprovalRequested {
+                    request_id: "approval-8".to_string(),
+                    call: ToolCall {
+                        name: "echo".to_string(),
+                        args: json!({ "text": "should-not-run" }),
+                    },
+                    reason: "needs human".to_string(),
+                },
+            ));
+            store.append(Event::new(
+                "submission-deny".to_string(),
+                2,
+                EventKind::TurnStopped {
+                    reason: StopReason::HumanApprovalRequired,
+                },
+            ));
+        }
+
+        let llm =
+            MultiProviderGateway::new().with_provider(StaticProvider::new("mock", "assistant> "));
+        let store_path_str = store_path.to_string_lossy().to_string();
+        let deny_command = parse_cli_command(&args(&[
+            "approve",
+            "--submission-id",
+            "submission-deny",
+            "--request-id",
+            "approval-8",
+            "--approved",
+            "false",
+            "--reason",
+            "rejected in cli test",
+            "--store-file",
+            &store_path_str,
+        ]))
+        .expect("parse deny command");
+        let deny_result =
+            execute_parsed_command(deny_command, Some(&llm)).expect("execute deny command");
+        assert_eq!(deny_result.exit_code, 1);
+
+        let store = FileEventStore::open(&store_path).expect("open store for assertions");
+        let events = store.events_for_submission("submission-deny");
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::HumanApprovalResolved {
+                    approved: false,
+                    reason: Some(ref reason),
+                    ..
+                } if reason == "rejected in cli test"
+            )
+        }));
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event.kind, EventKind::ToolExecuted { .. })),
+            "tool execution must not happen after denial",
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::TurnStopped {
+                    reason: StopReason::PolicyDenied
+                }
+            )
+        }));
 
         fs::remove_file(&store_path).expect("cleanup store file");
         if let Some(parent) = store_path.parent() {

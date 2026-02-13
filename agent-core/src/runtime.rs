@@ -110,19 +110,42 @@ impl AgentRuntime {
                     return result;
                 }
 
-                self.push_event(
+                let Some(prompt) = latest_user_input_for_submission(store, &submission_id) else {
+                    self.push_event(
+                        &submission_id,
+                        EventKind::LlmError {
+                            message: "cannot resume: missing prior user input".to_string(),
+                        },
+                        &mut emitted,
+                        store,
+                    );
+                    self.push_event(
+                        &submission_id,
+                        EventKind::TurnStopped {
+                            reason: StopReason::Error,
+                        },
+                        &mut emitted,
+                        store,
+                    );
+                    return TurnResult {
+                        stop_reason: StopReason::Error,
+                        events: emitted,
+                    };
+                };
+
+                let mut idempotency_results = build_idempotency_result_cache(store, &submission_id);
+                self.run_control_loop(
                     &submission_id,
-                    EventKind::TurnStopped {
-                        reason: StopReason::Interrupted,
-                    },
+                    &prompt,
+                    llm,
+                    policy,
+                    tools,
                     &mut emitted,
                     store,
-                );
-
-                TurnResult {
-                    stop_reason: StopReason::Interrupted,
-                    events: emitted,
-                }
+                    0,
+                    0,
+                    &mut idempotency_results,
+                )
             }
             Op::HumanApprovalResponse {
                 request_id,
@@ -810,14 +833,22 @@ mod tests {
     }
 
     #[test]
-    fn resume_op_emits_turn_resumed_and_stops_interrupted() {
+    fn resume_op_continues_control_loop_with_prior_user_input() {
         let mut runtime = AgentRuntime::default();
         let mut store = InMemoryEventStore::default();
         let tools = ToolRegistry::default();
         let llm = StaticGateway {
-            text: "unused".to_string(),
+            text: "continued".to_string(),
             tool_calls: Vec::new(),
         };
+
+        store.append(Event::new(
+            "sub-resume".to_string(),
+            0,
+            EventKind::UserInput {
+                input: "previous prompt".to_string(),
+            },
+        ));
 
         let result = runtime.run_turn(
             Op::Resume {
@@ -830,13 +861,50 @@ mod tests {
             &mut store,
         );
 
-        assert_eq!(result.stop_reason, StopReason::Interrupted);
+        assert_eq!(result.stop_reason, StopReason::Done);
         assert!(store.events().iter().any(|event| {
             matches!(
                 event.kind,
                 EventKind::TurnResumed {
                     checkpoint_id: Some(ref checkpoint_id),
                 } if checkpoint_id == "ckpt-1"
+            )
+        }));
+        assert!(store.events().iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::LlmText { ref text } if text == "continued"
+            )
+        }));
+    }
+
+    #[test]
+    fn resume_without_prior_user_input_stops_with_error() {
+        let mut runtime = AgentRuntime::default();
+        let mut store = InMemoryEventStore::default();
+        let tools = ToolRegistry::default();
+        let llm = StaticGateway {
+            text: "unused".to_string(),
+            tool_calls: Vec::new(),
+        };
+
+        let result = runtime.run_turn(
+            Op::Resume {
+                submission_id: "sub-empty".to_string(),
+                checkpoint_id: None,
+            },
+            &llm,
+            &AllowAllPolicy,
+            &tools,
+            &mut store,
+        );
+
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert!(store.events().iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::LlmError { ref message }
+                    if message == "cannot resume: missing prior user input"
             )
         }));
     }
