@@ -12,6 +12,10 @@ use crate::{
 
 pub trait LlmGateway {
     fn complete(&self, prompt: &str, recent_events: &[Event]) -> Result<LlmOutput, String>;
+
+    fn usage_snapshot(&self) -> Option<LlmUsageSnapshot> {
+        None
+    }
 }
 
 const DEFAULT_MAX_CONTROL_LOOP_ITERATIONS: usize = 16;
@@ -39,6 +43,14 @@ impl Default for RuntimeConfig {
 pub struct LlmOutput {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LlmUsageSnapshot {
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub native_usage_calls: u64,
+    pub heuristic_usage_calls: u64,
 }
 
 #[derive(Debug, Clone)]

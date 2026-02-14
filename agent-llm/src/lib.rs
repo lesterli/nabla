@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Mutex, thread, time::Duration};
 
 use agent_core::{
     protocol::{Event, ToolCall},
-    runtime::{LlmGateway, LlmOutput},
+    runtime::{LlmGateway, LlmOutput, LlmUsageSnapshot},
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,13 @@ pub struct ProviderResponse {
     pub tool_calls: Vec<ToolCall>,
     pub estimated_input_tokens: u32,
     pub estimated_output_tokens: u32,
+    pub usage_source: TokenUsageSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenUsageSource {
+    ProviderNative,
+    HeuristicEstimate,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -33,6 +40,12 @@ pub struct GatewayStats {
     pub provider_attempts: u64,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    pub native_usage_calls: u64,
+    pub heuristic_usage_calls: u64,
+    pub native_input_tokens: u64,
+    pub native_output_tokens: u64,
+    pub heuristic_input_tokens: u64,
+    pub heuristic_output_tokens: u64,
     pub provider_stats: HashMap<String, ProviderStats>,
 }
 
@@ -134,6 +147,22 @@ impl LlmGateway for MultiProviderGateway {
                         stats.successful_requests += 1;
                         stats.total_input_tokens += u64::from(response.estimated_input_tokens);
                         stats.total_output_tokens += u64::from(response.estimated_output_tokens);
+                        match response.usage_source {
+                            TokenUsageSource::ProviderNative => {
+                                stats.native_usage_calls += 1;
+                                stats.native_input_tokens +=
+                                    u64::from(response.estimated_input_tokens);
+                                stats.native_output_tokens +=
+                                    u64::from(response.estimated_output_tokens);
+                            }
+                            TokenUsageSource::HeuristicEstimate => {
+                                stats.heuristic_usage_calls += 1;
+                                stats.heuristic_input_tokens +=
+                                    u64::from(response.estimated_input_tokens);
+                                stats.heuristic_output_tokens +=
+                                    u64::from(response.estimated_output_tokens);
+                            }
+                        }
                         if let Some(provider_stats) = stats.provider_stats.get_mut(provider.name())
                         {
                             provider_stats.successful_requests += 1;
@@ -201,6 +230,16 @@ impl LlmGateway for MultiProviderGateway {
             provider_failures.join(" ; ")
         ))
     }
+
+    fn usage_snapshot(&self) -> Option<LlmUsageSnapshot> {
+        let stats = self.stats.lock().expect("llm gateway stats mutex poisoned");
+        Some(LlmUsageSnapshot {
+            total_input_tokens: stats.total_input_tokens,
+            total_output_tokens: stats.total_output_tokens,
+            native_usage_calls: stats.native_usage_calls,
+            heuristic_usage_calls: stats.heuristic_usage_calls,
+        })
+    }
 }
 
 fn is_retryable_error(err: &str) -> bool {
@@ -242,6 +281,7 @@ impl ProviderAdapter for StaticProvider {
             tool_calls: Vec::new(),
             estimated_input_tokens: prompt.split_whitespace().count() as u32,
             estimated_output_tokens: 8,
+            usage_source: TokenUsageSource::HeuristicEstimate,
         })
     }
 }
@@ -577,12 +617,18 @@ fn parse_openai_chat_completions_response(
         .usage
         .as_ref()
         .map_or_else(|| estimate_tokens(&text), |usage| usage.completion_tokens);
+    let usage_source = if parsed.usage.is_some() {
+        TokenUsageSource::ProviderNative
+    } else {
+        TokenUsageSource::HeuristicEstimate
+    };
 
     Ok(ProviderResponse {
         text,
         tool_calls,
         estimated_input_tokens,
         estimated_output_tokens,
+        usage_source,
     })
 }
 
@@ -734,7 +780,7 @@ mod tests {
 
     use super::{
         MultiProviderGateway, OpenAiCompatibleProvider, OpenAiFunctionTool, OpenAiToolChoice,
-        ProviderAdapter, ProviderResponse, RetryPolicy, StaticProvider,
+        ProviderAdapter, ProviderResponse, RetryPolicy, StaticProvider, TokenUsageSource,
         build_recent_context_message, extract_openai_message_text,
         parse_openai_chat_completions_response,
     };
@@ -1114,6 +1160,7 @@ mod tests {
                     }],
                     estimated_input_tokens: 2,
                     estimated_output_tokens: 3,
+                    usage_source: TokenUsageSource::HeuristicEstimate,
                 });
             }
 
@@ -1123,6 +1170,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     estimated_input_tokens: 1,
                     estimated_output_tokens: 2,
+                    usage_source: TokenUsageSource::HeuristicEstimate,
                 });
             }
 
@@ -1144,6 +1192,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 estimated_input_tokens: 1,
                 estimated_output_tokens: 3,
+                usage_source: TokenUsageSource::HeuristicEstimate,
             })
         }
     }
@@ -1221,6 +1270,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 estimated_input_tokens: 2,
                 estimated_output_tokens: 3,
+                usage_source: TokenUsageSource::HeuristicEstimate,
             })
         }
     }
