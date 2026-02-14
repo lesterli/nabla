@@ -8,7 +8,7 @@ use agent_core::{
     memory_file::FileEventStore,
     policy::AllowAllPolicy,
     protocol::{Event, EventKind, Op, PROTOCOL_SCHEMA_VERSION, StopFacts, StopReason, ToolCall},
-    runtime::{AgentRuntime, LlmGateway},
+    runtime::{AgentRuntime, LlmGateway, LlmUsageSnapshot},
     tools::ToolRegistry,
 };
 use agent_llm::{MultiProviderGateway, OpenAiCompatibleProvider, OpenAiToolChoice, StaticProvider};
@@ -1197,6 +1197,7 @@ fn execute_eval_task(
 ) -> EvalResult {
     let started = Instant::now();
     let run_metadata = build_eval_run_metadata(submission_id.clone());
+    let usage_before = llm.usage_snapshot();
     let mut host = ExtensionHost::default();
     let execution = execute_run(
         submission_id.clone(),
@@ -1206,6 +1207,8 @@ fn execute_eval_task(
         &mut host,
         tooling,
     );
+    let usage_after = llm.usage_snapshot();
+    let usage_delta = diff_usage_snapshots(usage_before, usage_after);
     let latency_ms = started.elapsed().as_millis() as u64;
 
     match execution {
@@ -1217,6 +1220,7 @@ fn execute_eval_task(
             execution.diagnostics,
             latency_ms,
             run_metadata,
+            usage_delta,
         ),
         Err(err) => EvalResult {
             schema_version: EVAL_RESULT_SCHEMA_VERSION,
@@ -1226,11 +1230,7 @@ fn execute_eval_task(
             tool_calls: Vec::new(),
             steps: 0,
             latency_ms,
-            token_usage: EvalTokenUsage {
-                estimated_input_tokens: estimate_cli_tokens(&prompt),
-                estimated_output_tokens: 0,
-                estimation_method: "heuristic_word_count".to_string(),
-            },
+            token_usage: token_usage_for_error(&prompt, usage_delta),
             error_type: Some(format!("command_error:{err}")),
             version: VERSION.to_string(),
             submission_id,
@@ -1247,6 +1247,7 @@ fn build_eval_result_from_events(
     diagnostics: Vec<String>,
     latency_ms: u64,
     run_metadata: EvalRunMetadata,
+    usage_delta: Option<LlmUsageSnapshot>,
 ) -> EvalResult {
     let steps = events
         .iter()
@@ -1269,6 +1270,11 @@ fn build_eval_result_from_events(
 
     let llm_turns = steps.max(1);
     let input_tokens = estimate_cli_tokens(&prompt).saturating_mul(llm_turns);
+    let heuristic_usage = EvalTokenUsage {
+        estimated_input_tokens: input_tokens,
+        estimated_output_tokens: output_tokens,
+        estimation_method: "heuristic_word_count".to_string(),
+    };
     let (stop_reason, stop_facts) =
         final_stop_from_events(&events).unwrap_or((StopReason::Interrupted, None));
     let mut error_type = derive_error_type(&stop_reason, stop_facts.as_ref(), &events);
@@ -1284,16 +1290,75 @@ fn build_eval_result_from_events(
         tool_calls,
         steps,
         latency_ms,
-        token_usage: EvalTokenUsage {
-            estimated_input_tokens: input_tokens,
-            estimated_output_tokens: output_tokens,
-            estimation_method: "heuristic_word_count".to_string(),
-        },
+        token_usage: token_usage_for_eval(usage_delta, heuristic_usage),
         error_type,
         version: VERSION.to_string(),
         submission_id,
         run_metadata,
     }
+}
+
+fn diff_usage_snapshots(
+    before: Option<LlmUsageSnapshot>,
+    after: Option<LlmUsageSnapshot>,
+) -> Option<LlmUsageSnapshot> {
+    let (Some(before), Some(after)) = (before, after) else {
+        return None;
+    };
+
+    Some(LlmUsageSnapshot {
+        total_input_tokens: after
+            .total_input_tokens
+            .saturating_sub(before.total_input_tokens),
+        total_output_tokens: after
+            .total_output_tokens
+            .saturating_sub(before.total_output_tokens),
+        native_usage_calls: after
+            .native_usage_calls
+            .saturating_sub(before.native_usage_calls),
+        heuristic_usage_calls: after
+            .heuristic_usage_calls
+            .saturating_sub(before.heuristic_usage_calls),
+    })
+}
+
+fn token_usage_for_eval(
+    usage_delta: Option<LlmUsageSnapshot>,
+    heuristic_usage: EvalTokenUsage,
+) -> EvalTokenUsage {
+    let Some(delta) = usage_delta else {
+        return heuristic_usage;
+    };
+
+    let total_calls = delta
+        .native_usage_calls
+        .saturating_add(delta.heuristic_usage_calls);
+    if total_calls == 0 {
+        return heuristic_usage;
+    }
+
+    let estimation_method = if delta.native_usage_calls > 0 && delta.heuristic_usage_calls == 0 {
+        "provider_native"
+    } else if delta.native_usage_calls > 0 && delta.heuristic_usage_calls > 0 {
+        "mixed_provider_native_and_heuristic"
+    } else {
+        "heuristic_word_count"
+    };
+
+    EvalTokenUsage {
+        estimated_input_tokens: delta.total_input_tokens,
+        estimated_output_tokens: delta.total_output_tokens,
+        estimation_method: estimation_method.to_string(),
+    }
+}
+
+fn token_usage_for_error(prompt: &str, usage_delta: Option<LlmUsageSnapshot>) -> EvalTokenUsage {
+    let heuristic_usage = EvalTokenUsage {
+        estimated_input_tokens: estimate_cli_tokens(prompt),
+        estimated_output_tokens: 0,
+        estimation_method: "heuristic_word_count".to_string(),
+    };
+    token_usage_for_eval(usage_delta, heuristic_usage)
 }
 
 fn final_stop_from_events(events: &[Event]) -> Option<(StopReason, Option<StopFacts>)> {
@@ -1569,8 +1634,9 @@ mod tests {
 
     use super::{
         CliCommand, EvalResult, EvalResultSet, EvalRunMetadata, EvalTokenUsage,
-        execute_eval_command, execute_parsed_command, execute_parsed_command_with_extensions,
-        parse_cli_command, parse_tool_choice_env,
+        diff_usage_snapshots, execute_eval_command, execute_parsed_command,
+        execute_parsed_command_with_extensions, parse_cli_command, parse_tool_choice_env,
+        token_usage_for_eval,
     };
     use crate::extensions::{
         host::ExtensionHost,
@@ -1581,6 +1647,7 @@ mod tests {
         memory::EventStore,
         memory_file::FileEventStore,
         protocol::{Event, EventKind, StopFacts, StopReason, ToolCall},
+        runtime::LlmUsageSnapshot,
     };
     use agent_llm::{MultiProviderGateway, OpenAiToolChoice, StaticProvider};
     use serde_json::{Value, json};
@@ -2467,5 +2534,48 @@ mod tests {
         if let Some(parent) = store_path.parent() {
             let _ = fs::remove_dir(parent);
         }
+    }
+
+    #[test]
+    fn usage_snapshot_delta_computes_saturating_differences() {
+        let before = LlmUsageSnapshot {
+            total_input_tokens: 10,
+            total_output_tokens: 8,
+            native_usage_calls: 1,
+            heuristic_usage_calls: 2,
+        };
+        let after = LlmUsageSnapshot {
+            total_input_tokens: 22,
+            total_output_tokens: 17,
+            native_usage_calls: 3,
+            heuristic_usage_calls: 2,
+        };
+
+        let delta = diff_usage_snapshots(Some(before), Some(after)).expect("delta");
+        assert_eq!(delta.total_input_tokens, 12);
+        assert_eq!(delta.total_output_tokens, 9);
+        assert_eq!(delta.native_usage_calls, 2);
+        assert_eq!(delta.heuristic_usage_calls, 0);
+    }
+
+    #[test]
+    fn token_usage_prefers_provider_native_when_available() {
+        let usage = token_usage_for_eval(
+            Some(LlmUsageSnapshot {
+                total_input_tokens: 111,
+                total_output_tokens: 37,
+                native_usage_calls: 2,
+                heuristic_usage_calls: 0,
+            }),
+            EvalTokenUsage {
+                estimated_input_tokens: 1,
+                estimated_output_tokens: 1,
+                estimation_method: "heuristic_word_count".to_string(),
+            },
+        );
+
+        assert_eq!(usage.estimated_input_tokens, 111);
+        assert_eq!(usage.estimated_output_tokens, 37);
+        assert_eq!(usage.estimation_method, "provider_native");
     }
 }
