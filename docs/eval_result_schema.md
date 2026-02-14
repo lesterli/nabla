@@ -19,13 +19,20 @@
         "last_tool_calls": [],
         "has_pending_approval": false
       },
+      "enabled_tools": ["read", "write", "edit", "bash"],
       "tool_calls": [],
+      "tool_call_stats": {
+        "total_proposed": 0,
+        "total_executed": 0,
+        "total_errors": 0,
+        "by_tool": []
+      },
       "steps": 1,
       "latency_ms": 12,
       "token_usage": {
         "estimated_input_tokens": 4,
         "estimated_output_tokens": 3,
-        "estimation_method": "heuristic_word_count"
+        "estimation_method": "provider_native"
       },
       "error_type": null,
       "version": "0.1.0",
@@ -52,10 +59,17 @@ Task-level fields:
 - `task_id`: task identifier from CLI (`--task-id`) or task file.
 - `outcome_or_status`: current stop status (`done`, `error`, `budget_exceeded`, `policy_denied`, `human_approval_required`, `interrupted`).
 - `stop_facts`: final `turn_stopped.facts` if available.
+- `enabled_tools`: tools enabled for this eval task execution.
 - `tool_calls`: tool calls proposed during execution.
+- `tool_call_stats`: aggregated tool-call metrics:
+  - `total_proposed`
+  - `total_executed`
+  - `total_errors`
+  - `by_tool[]` (`name`, `proposed`, `executed`, `errors`)
 - `steps`: number of `context_built` events (control-loop steps).
 - `latency_ms`: wall-clock latency for the task run.
-- `token_usage`: estimated token usage (heuristic word-count in PR16).
+- `token_usage`: usage metrics (`provider_native` preferred, fallback to heuristic):
+  - `estimation_method`: `provider_native | mixed_provider_native_and_heuristic | heuristic_word_count`
 - `error_type`: nullable normalized error classification.
 - `submission_id`: submission identifier used for this task run.
 - `run_metadata`: deterministic run metadata.
@@ -83,3 +97,13 @@ Task object fields:
 - `task_id` (string, required)
 - `prompt` (string, required)
 - `submission_id` (string, optional)
+
+## Tooling baseline fixtures
+
+- Reproducible tooling eval fixtures live under:
+  - `agent-cli/fixtures/eval/tools/default-four-tools.jsonl`
+- Includes task slices for:
+  - read
+  - write
+  - edit
+  - bash

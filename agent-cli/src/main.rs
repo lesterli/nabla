@@ -1,7 +1,7 @@
 mod extensions;
 mod tooling;
 
-use std::{fs, path::PathBuf, time::Instant};
+use std::{collections::BTreeMap, fs, path::PathBuf, time::Instant};
 
 use agent_core::{
     memory::{EventStore, InMemoryEventStore},
@@ -150,6 +150,22 @@ struct EvalTokenUsage {
     estimation_method: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct EvalToolCallStats {
+    total_proposed: u64,
+    total_executed: u64,
+    total_errors: u64,
+    by_tool: Vec<EvalToolCallStat>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct EvalToolCallStat {
+    name: String,
+    proposed: u64,
+    executed: u64,
+    errors: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct EvalRunMetadata {
     submission_id: String,
@@ -166,7 +182,9 @@ struct EvalResult {
     outcome_or_status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stop_facts: Option<StopFacts>,
+    enabled_tools: Vec<String>,
     tool_calls: Vec<ToolCall>,
+    tool_call_stats: EvalToolCallStats,
     steps: u64,
     latency_ms: u64,
     token_usage: EvalTokenUsage,
@@ -1197,6 +1215,11 @@ fn execute_eval_task(
 ) -> EvalResult {
     let started = Instant::now();
     let run_metadata = build_eval_run_metadata(submission_id.clone());
+    let enabled_tools = tooling
+        .enabled_tool_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     let usage_before = llm.usage_snapshot();
     let mut host = ExtensionHost::default();
     let execution = execute_run(
@@ -1221,13 +1244,16 @@ fn execute_eval_task(
             latency_ms,
             run_metadata,
             usage_delta,
+            enabled_tools,
         ),
         Err(err) => EvalResult {
             schema_version: EVAL_RESULT_SCHEMA_VERSION,
             task_id,
             outcome_or_status: "error".to_string(),
             stop_facts: None,
+            enabled_tools,
             tool_calls: Vec::new(),
+            tool_call_stats: EvalToolCallStats::default(),
             steps: 0,
             latency_ms,
             token_usage: token_usage_for_error(&prompt, usage_delta),
@@ -1248,6 +1274,7 @@ fn build_eval_result_from_events(
     latency_ms: u64,
     run_metadata: EvalRunMetadata,
     usage_delta: Option<LlmUsageSnapshot>,
+    enabled_tools: Vec<String>,
 ) -> EvalResult {
     let steps = events
         .iter()
@@ -1277,6 +1304,7 @@ fn build_eval_result_from_events(
     };
     let (stop_reason, stop_facts) =
         final_stop_from_events(&events).unwrap_or((StopReason::Interrupted, None));
+    let tool_call_stats = build_tool_call_stats(&events);
     let mut error_type = derive_error_type(&stop_reason, stop_facts.as_ref(), &events);
     if error_type.is_none() && !diagnostics.is_empty() {
         error_type = Some("extension_diagnostic".to_string());
@@ -1287,7 +1315,9 @@ fn build_eval_result_from_events(
         task_id,
         outcome_or_status: stop_reason_to_status(&stop_reason).to_string(),
         stop_facts,
+        enabled_tools,
         tool_calls,
+        tool_call_stats,
         steps,
         latency_ms,
         token_usage: token_usage_for_eval(usage_delta, heuristic_usage),
@@ -1359,6 +1389,55 @@ fn token_usage_for_error(prompt: &str, usage_delta: Option<LlmUsageSnapshot>) ->
         estimation_method: "heuristic_word_count".to_string(),
     };
     token_usage_for_eval(usage_delta, heuristic_usage)
+}
+
+fn build_tool_call_stats(events: &[Event]) -> EvalToolCallStats {
+    #[derive(Default)]
+    struct Acc {
+        proposed: u64,
+        executed: u64,
+        errors: u64,
+    }
+
+    let mut by_tool: BTreeMap<String, Acc> = BTreeMap::new();
+    let mut total_proposed = 0u64;
+    let mut total_executed = 0u64;
+    let mut total_errors = 0u64;
+
+    for event in events {
+        match &event.kind {
+            EventKind::ToolCallProposed { call } => {
+                total_proposed = total_proposed.saturating_add(1);
+                let entry = by_tool.entry(call.name.clone()).or_default();
+                entry.proposed = entry.proposed.saturating_add(1);
+            }
+            EventKind::ToolExecuted { result } => {
+                total_executed = total_executed.saturating_add(1);
+                let entry = by_tool.entry(result.call_name.clone()).or_default();
+                entry.executed = entry.executed.saturating_add(1);
+                if result.is_error {
+                    total_errors = total_errors.saturating_add(1);
+                    entry.errors = entry.errors.saturating_add(1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    EvalToolCallStats {
+        total_proposed,
+        total_executed,
+        total_errors,
+        by_tool: by_tool
+            .into_iter()
+            .map(|(name, acc)| EvalToolCallStat {
+                name,
+                proposed: acc.proposed,
+                executed: acc.executed,
+                errors: acc.errors,
+            })
+            .collect(),
+    }
 }
 
 fn final_stop_from_events(events: &[Event]) -> Option<(StopReason, Option<StopFacts>)> {
@@ -1633,7 +1712,8 @@ mod tests {
     };
 
     use super::{
-        CliCommand, EvalResult, EvalResultSet, EvalRunMetadata, EvalTokenUsage,
+        CliCommand, EvalResult, EvalResultSet, EvalRunMetadata, EvalTokenUsage, EvalToolCallStat,
+        EvalToolCallStats,
         diff_usage_snapshots, execute_eval_command, execute_parsed_command,
         execute_parsed_command_with_extensions, parse_cli_command, parse_tool_choice_env,
         token_usage_for_eval,
@@ -1647,7 +1727,7 @@ mod tests {
         memory::EventStore,
         memory_file::FileEventStore,
         protocol::{Event, EventKind, StopFacts, StopReason, ToolCall},
-        runtime::LlmUsageSnapshot,
+        runtime::{LlmGateway, LlmOutput, LlmUsageSnapshot},
     };
     use agent_llm::{MultiProviderGateway, OpenAiToolChoice, StaticProvider};
     use serde_json::{Value, json};
@@ -1681,6 +1761,67 @@ mod tests {
         file.write_all(content.as_bytes())
             .expect("write workspace temp file");
         (relative.clone(), relative.to_string_lossy().to_string())
+    }
+
+    fn tooling_fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("eval")
+            .join("tools")
+            .join(name)
+    }
+
+    #[derive(Debug, Default)]
+    struct ToolingEvalFixtureGateway;
+
+    impl LlmGateway for ToolingEvalFixtureGateway {
+        fn complete(&self, prompt: &str, recent_events: &[Event]) -> Result<LlmOutput, String> {
+            let has_tool_result = recent_events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::ToolExecuted { .. }));
+            if has_tool_result {
+                return Ok(LlmOutput {
+                    text: "done".to_string(),
+                    tool_calls: Vec::new(),
+                });
+            }
+
+            let tool_call = if prompt.contains("TOOL_EVAL_READ") {
+                Some(ToolCall {
+                    name: "read".to_string(),
+                    args: json!({ "path": "Cargo.toml" }),
+                })
+            } else if prompt.contains("TOOL_EVAL_WRITE") {
+                Some(ToolCall {
+                    name: "write".to_string(),
+                    args: json!({
+                        "path": "target/agent-cli-tests/pr27-tooling-write.txt",
+                        "content": "tooling eval write"
+                    }),
+                })
+            } else if prompt.contains("TOOL_EVAL_EDIT") {
+                Some(ToolCall {
+                    name: "edit".to_string(),
+                    args: json!({
+                        "path": "target/agent-cli-tests/pr27-tooling-edit.txt",
+                        "old_text": "before",
+                        "new_text": "after"
+                    }),
+                })
+            } else if prompt.contains("TOOL_EVAL_BASH") {
+                Some(ToolCall {
+                    name: "bash".to_string(),
+                    args: json!({ "command": "printf tooling-eval-bash" }),
+                })
+            } else {
+                None
+            };
+
+            Ok(LlmOutput {
+                text: String::new(),
+                tool_calls: tool_call.into_iter().collect(),
+            })
+        }
     }
 
     #[test]
@@ -2123,10 +2264,22 @@ mod tests {
                 task_id: "task-1".to_string(),
                 outcome_or_status: "done".to_string(),
                 stop_facts: None,
+                enabled_tools: vec!["read".to_string()],
                 tool_calls: vec![ToolCall {
                     name: "read".to_string(),
                     args: json!({"path":"Cargo.toml"}),
                 }],
+                tool_call_stats: EvalToolCallStats {
+                    total_proposed: 1,
+                    total_executed: 1,
+                    total_errors: 0,
+                    by_tool: vec![EvalToolCallStat {
+                        name: "read".to_string(),
+                        proposed: 1,
+                        executed: 1,
+                        errors: 0,
+                    }],
+                },
                 steps: 1,
                 latency_ms: 12,
                 token_usage: EvalTokenUsage {
@@ -2157,6 +2310,9 @@ mod tests {
       "schema_version": 1,
       "task_id": "task-1",
       "outcome_or_status": "done",
+      "enabled_tools": [
+        "read"
+      ],
       "tool_calls": [
         {{
           "name": "read",
@@ -2165,6 +2321,19 @@ mod tests {
           }}
         }}
       ],
+      "tool_call_stats": {{
+        "total_proposed": 1,
+        "total_executed": 1,
+        "total_errors": 0,
+        "by_tool": [
+          {{
+            "name": "read",
+            "proposed": 1,
+            "executed": 1,
+            "errors": 0
+          }}
+        ]
+      }},
       "steps": 1,
       "latency_ms": 12,
       "token_usage": {{
@@ -2238,12 +2407,131 @@ mod tests {
                 .iter()
                 .all(|entry| entry.get("task_id").and_then(Value::as_str).is_some())
         );
+        assert!(results.iter().all(|entry| {
+            entry
+                .get("enabled_tools")
+                .and_then(Value::as_array)
+                .is_some()
+        }));
+        assert!(results.iter().all(|entry| {
+            entry
+                .get("tool_call_stats")
+                .and_then(Value::as_object)
+                .is_some()
+        }));
 
         fs::remove_file(&tasks_path).expect("cleanup tasks file");
         let _ = fs::remove_dir_all(&store_dir);
         if let Some(parent) = tasks_path.parent() {
             let _ = fs::remove_dir(parent);
         }
+    }
+
+    #[test]
+    fn tooling_fixture_batch_eval_is_machine_readable_and_stats_are_populated() {
+        let fixture = tooling_fixture_path("default-four-tools.jsonl");
+        let edit_file = PathBuf::from("target")
+            .join("agent-cli-tests")
+            .join("pr27-tooling-edit.txt");
+        if let Some(parent) = edit_file.parent() {
+            fs::create_dir_all(parent).expect("create parent dir");
+        }
+        fs::write(&edit_file, "before\n").expect("seed edit target");
+
+        let fixture_str = fixture.to_string_lossy().to_string();
+        let eval_command = parse_cli_command(&args(&[
+            "eval",
+            "--tasks-file",
+            &fixture_str,
+            "--tools",
+            "read,write,edit,bash",
+        ]))
+        .expect("parse eval fixture command");
+        let tooling = resolve_tooling_from_cli(&ToolingCliConfig {
+            no_tools: false,
+            tools: Some(vec![
+                "read".to_string(),
+                "write".to_string(),
+                "edit".to_string(),
+                "bash".to_string(),
+            ]),
+        })
+        .expect("resolve tooling");
+
+        let llm = ToolingEvalFixtureGateway;
+        let result_set =
+            execute_eval_command(eval_command, &llm, &tooling).expect("execute fixture eval");
+        assert_eq!(result_set.results.len(), 4);
+
+        for result in &result_set.results {
+            assert_eq!(
+                result.enabled_tools,
+                vec![
+                    "read".to_string(),
+                    "write".to_string(),
+                    "edit".to_string(),
+                    "bash".to_string()
+                ]
+            );
+            assert_eq!(result.outcome_or_status, "done");
+            assert_eq!(result.tool_call_stats.total_proposed, 1);
+            assert_eq!(result.tool_call_stats.total_executed, 1);
+            assert_eq!(result.tool_call_stats.total_errors, 0);
+            assert_eq!(result.tool_call_stats.by_tool.len(), 1);
+        }
+
+        let encoded = serde_json::to_string(&result_set).expect("serialize");
+        let decoded: Value = serde_json::from_str(&encoded).expect("decode");
+        assert!(
+            decoded
+                .get("results")
+                .and_then(Value::as_array)
+                .expect("results")
+                .iter()
+                .all(|entry| entry.get("tool_call_stats").is_some())
+        );
+
+        let _ = fs::remove_file(
+            PathBuf::from("target")
+                .join("agent-cli-tests")
+                .join("pr27-tooling-write.txt"),
+        );
+        let _ = fs::remove_file(&edit_file);
+    }
+
+    #[test]
+    fn tooling_fixture_with_no_tools_fails_with_tool_error_label() {
+        let fixture = tooling_fixture_path("default-four-tools.jsonl");
+        let fixture_str = fixture.to_string_lossy().to_string();
+        let eval_command =
+            parse_cli_command(&args(&["eval", "--tasks-file", &fixture_str, "--no-tools"]))
+                .expect("parse eval no-tools fixture command");
+        let tooling = resolve_tooling_from_cli(&ToolingCliConfig {
+            no_tools: true,
+            tools: None,
+        })
+        .expect("resolve no-tools");
+
+        let llm = ToolingEvalFixtureGateway;
+        let result_set =
+            execute_eval_command(eval_command, &llm, &tooling).expect("execute fixture eval");
+        assert_eq!(result_set.results.len(), 4);
+        assert!(
+            result_set
+                .results
+                .iter()
+                .all(|result| result.enabled_tools.is_empty())
+        );
+        assert!(
+            result_set
+                .results
+                .iter()
+                .all(|result| result.outcome_or_status == "error")
+        );
+        assert!(result_set.results.iter().all(|result| {
+            result.error_type.as_deref() == Some("tool_error")
+                && result.tool_call_stats.total_errors >= 1
+        }));
     }
 
     struct FollowUpOnceExtension {
