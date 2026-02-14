@@ -1,4 +1,5 @@
 mod extensions;
+mod tooling;
 
 use std::{fs, path::PathBuf, time::Instant};
 
@@ -8,18 +9,15 @@ use agent_core::{
     policy::AllowAllPolicy,
     protocol::{Event, EventKind, Op, PROTOCOL_SCHEMA_VERSION, StopFacts, StopReason, ToolCall},
     runtime::{AgentRuntime, LlmGateway},
-    tools::{EchoTool, ToolRegistry},
+    tools::ToolRegistry,
 };
-use agent_llm::{
-    MultiProviderGateway, OpenAiCompatibleProvider, OpenAiFunctionTool, OpenAiToolChoice,
-    StaticProvider,
-};
+use agent_llm::{MultiProviderGateway, OpenAiCompatibleProvider, OpenAiToolChoice, StaticProvider};
 use extensions::{
     host::ExtensionHost,
     types::{CliExtension, NextAction, TurnContext},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use tooling::{ToolingCliConfig, ToolingSelection, resolve_tooling_from_cli};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_SUBMISSION_ID: &str = "cli-session-1";
@@ -33,11 +31,13 @@ enum CliCommand {
         submission_id: String,
         prompt: String,
         store_file: Option<PathBuf>,
+        tooling: ToolingCliConfig,
     },
     Resume {
         submission_id: String,
         checkpoint_id: Option<String>,
         store_file: PathBuf,
+        tooling: ToolingCliConfig,
     },
     Approve {
         submission_id: String,
@@ -45,6 +45,7 @@ enum CliCommand {
         approved: bool,
         reason: Option<String>,
         store_file: PathBuf,
+        tooling: ToolingCliConfig,
     },
     Replay {
         submission_id: String,
@@ -55,11 +56,26 @@ enum CliCommand {
         submission_id: String,
         prompt: String,
         store_file: Option<PathBuf>,
+        tooling: ToolingCliConfig,
     },
     EvalBatch {
         tasks_file: PathBuf,
         store_dir: Option<PathBuf>,
+        tooling: ToolingCliConfig,
     },
+}
+
+impl CliCommand {
+    fn tooling_config(&self) -> Option<&ToolingCliConfig> {
+        match self {
+            CliCommand::Run { tooling, .. }
+            | CliCommand::Resume { tooling, .. }
+            | CliCommand::Approve { tooling, .. }
+            | CliCommand::EvalSingle { tooling, .. }
+            | CliCommand::EvalBatch { tooling, .. } => Some(tooling),
+            CliCommand::Help | CliCommand::Version | CliCommand::Replay { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -202,8 +218,11 @@ LLM env:
   AGENT_LLM_API_KEY (required for openai/openai_compatible)
   AGENT_LLM_MODEL (default: gpt-4o-mini)
   AGENT_LLM_NAME (optional provider display name)
-  AGENT_LLM_TOOLS (optional comma list; supported: echo)
   AGENT_LLM_TOOL_CHOICE (optional: auto|required|none|echo|function:<name>)
+
+Tool options:
+  --tools <list>   Enable specific built-in tools (supported: echo)
+  --no-tools       Disable all built-in tools (if combined with --tools, only listed tools are enabled)
 
 Extension env (optional):
   AGENT_EXTENSION_MAX_FOLLOW_UP_TURNS (default: 4)
@@ -211,19 +230,6 @@ Extension env (optional):
   AGENT_EXTENSION_ASK_HUMAN_MESSAGE_ONCE (inject one ask-human message)
   AGENT_EXTENSION_STOP_ONCE=true|false (inject one stop action)"
     );
-}
-
-fn parse_tools_env(raw: &str) -> Result<Vec<&str>, String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(|tool| match tool {
-            "echo" => Ok("echo"),
-            other => Err(format!(
-                "unsupported tool `{other}` in AGENT_LLM_TOOLS (supported: echo)"
-            )),
-        })
-        .collect()
 }
 
 fn parse_tool_choice_env(raw: &str) -> Result<OpenAiToolChoice, String> {
@@ -258,22 +264,26 @@ fn parse_tool_choice_env(raw: &str) -> Result<OpenAiToolChoice, String> {
     }
 }
 
-fn echo_tool_definition() -> OpenAiFunctionTool {
-    OpenAiFunctionTool::new(
-        "echo",
-        "Echo input text for connectivity checks.",
-        json!({
-            "type": "object",
-            "properties": {
-                "text": { "type": "string" }
-            },
-            "required": ["text"],
-            "additionalProperties": false
-        }),
-    )
+fn validate_tool_choice(
+    choice: &OpenAiToolChoice,
+    tooling: &ToolingSelection,
+) -> Result<(), String> {
+    match choice {
+        OpenAiToolChoice::Function { name } => {
+            if tooling.contains_tool(name) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "AGENT_LLM_TOOL_CHOICE selects tool `{name}`, but enabled tools are: {}",
+                    tooling.enabled_tool_names().join(", ")
+                ))
+            }
+        }
+        _ => Ok(()),
+    }
 }
 
-fn build_gateway_from_env() -> Result<MultiProviderGateway, String> {
+fn build_gateway_from_env(tooling: &ToolingSelection) -> Result<MultiProviderGateway, String> {
     let provider = std::env::var("AGENT_LLM_PROVIDER").unwrap_or_else(|_| "mock".to_string());
 
     match provider.as_str() {
@@ -292,15 +302,13 @@ fn build_gateway_from_env() -> Result<MultiProviderGateway, String> {
                 std::env::var("AGENT_LLM_NAME").unwrap_or_else(|_| "openai-compatible".to_string());
 
             let mut provider = OpenAiCompatibleProvider::new(name, base_url, api_key, model)?;
-            let tools_env = std::env::var("AGENT_LLM_TOOLS").unwrap_or_default();
-            for tool_name in parse_tools_env(&tools_env)? {
-                if tool_name == "echo" {
-                    provider = provider.with_tool(echo_tool_definition());
-                }
+            for tool in tooling.provider_tools() {
+                provider = provider.with_tool(tool);
             }
 
             if let Ok(raw_choice) = std::env::var("AGENT_LLM_TOOL_CHOICE") {
                 let parsed_choice = parse_tool_choice_env(&raw_choice)?;
+                validate_tool_choice(&parsed_choice, tooling)?;
                 provider = provider.with_tool_choice(parsed_choice);
             }
 
@@ -331,24 +339,71 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
         "approve" => parse_approve_subcommand(&args[1..]),
         "replay" => parse_replay_subcommand(&args[1..]),
         "eval" => parse_eval_subcommand(&args[1..]),
-        flag if flag.starts_with('-') => Err(format!("unsupported option `{flag}`")),
-        _ => {
-            let prompt = args.join(" ");
-            if prompt.trim().is_empty() {
-                return Err("prompt cannot be empty".to_string());
-            }
-            Ok(CliCommand::Run {
-                submission_id: DEFAULT_SUBMISSION_ID.to_string(),
-                prompt,
-                store_file: None,
-            })
-        }
+        _ => parse_shorthand_run(args),
     }
+}
+
+fn parse_tools_list_arg(raw: &str, context: &str) -> Result<Vec<String>, String> {
+    let parsed = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if parsed.is_empty() {
+        return Err(format!(
+            "{context} `--tools` requires a non-empty comma-separated list"
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_shorthand_run(args: &[String]) -> Result<CliCommand, String> {
+    let mut tooling = ToolingCliConfig::default();
+    let mut prompt_start: Option<usize> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--no-tools" => {
+                tooling.no_tools = true;
+            }
+            "--tools" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`--tools` requires a value".to_string());
+                }
+                tooling.tools = Some(parse_tools_list_arg(&args[i], "shorthand run")?);
+            }
+            flag if flag.starts_with('-') => return Err(format!("unsupported option `{flag}`")),
+            _ => {
+                prompt_start = Some(i);
+                break;
+            }
+        }
+        i += 1;
+    }
+
+    let Some(prompt_start) = prompt_start else {
+        return Err("prompt cannot be empty".to_string());
+    };
+
+    let prompt = args[prompt_start..].join(" ");
+    if prompt.trim().is_empty() {
+        return Err("prompt cannot be empty".to_string());
+    }
+    Ok(CliCommand::Run {
+        submission_id: DEFAULT_SUBMISSION_ID.to_string(),
+        prompt,
+        store_file: None,
+        tooling,
+    })
 }
 
 fn parse_run_subcommand(args: &[String]) -> Result<CliCommand, String> {
     let mut submission_id = DEFAULT_SUBMISSION_ID.to_string();
     let mut store_file: Option<PathBuf> = None;
+    let mut tooling = ToolingCliConfig::default();
     let mut prompt_start: Option<usize> = None;
 
     let mut i = 0usize;
@@ -368,6 +423,16 @@ fn parse_run_subcommand(args: &[String]) -> Result<CliCommand, String> {
                     return Err("`run --store-file` requires a value".to_string());
                 }
                 store_file = Some(PathBuf::from(&args[i]));
+            }
+            "--no-tools" => {
+                tooling.no_tools = true;
+            }
+            "--tools" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`run --tools` requires a value".to_string());
+                }
+                tooling.tools = Some(parse_tools_list_arg(&args[i], "`run`")?);
             }
             unknown if unknown.starts_with("--") => {
                 return Err(format!("unknown `run` option `{unknown}`"));
@@ -397,6 +462,7 @@ fn parse_run_subcommand(args: &[String]) -> Result<CliCommand, String> {
         submission_id,
         prompt,
         store_file,
+        tooling,
     })
 }
 
@@ -404,6 +470,7 @@ fn parse_resume_subcommand(args: &[String]) -> Result<CliCommand, String> {
     let mut submission_id = DEFAULT_SUBMISSION_ID.to_string();
     let mut checkpoint_id: Option<String> = None;
     let mut store_file: Option<PathBuf> = None;
+    let mut tooling = ToolingCliConfig::default();
 
     let mut i = 0usize;
     while i < args.len() {
@@ -430,6 +497,16 @@ fn parse_resume_subcommand(args: &[String]) -> Result<CliCommand, String> {
                 }
                 store_file = Some(PathBuf::from(&args[i]));
             }
+            "--no-tools" => {
+                tooling.no_tools = true;
+            }
+            "--tools" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`resume --tools` requires a value".to_string());
+                }
+                tooling.tools = Some(parse_tools_list_arg(&args[i], "`resume`")?);
+            }
             unknown if unknown.starts_with("--") => {
                 return Err(format!("unknown `resume` option `{unknown}`"));
             }
@@ -446,6 +523,7 @@ fn parse_resume_subcommand(args: &[String]) -> Result<CliCommand, String> {
         submission_id,
         checkpoint_id,
         store_file,
+        tooling,
     })
 }
 
@@ -495,6 +573,7 @@ fn parse_eval_subcommand(args: &[String]) -> Result<CliCommand, String> {
     let mut tasks_file: Option<PathBuf> = None;
     let mut store_file: Option<PathBuf> = None;
     let mut store_dir: Option<PathBuf> = None;
+    let mut tooling = ToolingCliConfig::default();
     let mut prompt_start: Option<usize> = None;
 
     let mut i = 0usize;
@@ -536,6 +615,16 @@ fn parse_eval_subcommand(args: &[String]) -> Result<CliCommand, String> {
                 }
                 store_dir = Some(PathBuf::from(&args[i]));
             }
+            "--no-tools" => {
+                tooling.no_tools = true;
+            }
+            "--tools" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`eval --tools` requires a value".to_string());
+                }
+                tooling.tools = Some(parse_tools_list_arg(&args[i], "`eval`")?);
+            }
             unknown if unknown.starts_with("--") => {
                 return Err(format!("unknown `eval` option `{unknown}`"));
             }
@@ -565,6 +654,7 @@ fn parse_eval_subcommand(args: &[String]) -> Result<CliCommand, String> {
         return Ok(CliCommand::EvalBatch {
             tasks_file,
             store_dir,
+            tooling,
         });
     }
 
@@ -589,6 +679,7 @@ fn parse_eval_subcommand(args: &[String]) -> Result<CliCommand, String> {
         submission_id,
         prompt,
         store_file,
+        tooling,
     })
 }
 
@@ -598,6 +689,7 @@ fn parse_approve_subcommand(args: &[String]) -> Result<CliCommand, String> {
     let mut approved: Option<bool> = None;
     let mut reason: Option<String> = None;
     let mut store_file: Option<PathBuf> = None;
+    let mut tooling = ToolingCliConfig::default();
 
     let mut i = 0usize;
     while i < args.len() {
@@ -646,6 +738,16 @@ fn parse_approve_subcommand(args: &[String]) -> Result<CliCommand, String> {
                 }
                 store_file = Some(PathBuf::from(&args[i]));
             }
+            "--no-tools" => {
+                tooling.no_tools = true;
+            }
+            "--tools" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`approve --tools` requires a value".to_string());
+                }
+                tooling.tools = Some(parse_tools_list_arg(&args[i], "`approve`")?);
+            }
             unknown if unknown.starts_with("--") => {
                 return Err(format!("unknown `approve` option `{unknown}`"));
             }
@@ -670,12 +772,13 @@ fn parse_approve_subcommand(args: &[String]) -> Result<CliCommand, String> {
         approved,
         reason,
         store_file,
+        tooling,
     })
 }
 
-fn build_tools() -> ToolRegistry {
+fn build_tools(tooling: &ToolingSelection) -> ToolRegistry {
     let mut tools = ToolRegistry::default();
-    tools.register(EchoTool);
+    tooling.register_local_tools(&mut tools);
     tools
 }
 
@@ -742,6 +845,25 @@ fn execute_parsed_command_with_extensions(
     llm: Option<&dyn LlmGateway>,
     extension_host: Option<&mut ExtensionHost>,
 ) -> Result<CommandExecution, String> {
+    let tooling = match &command {
+        CliCommand::Run { tooling, .. }
+        | CliCommand::Resume { tooling, .. }
+        | CliCommand::Approve { tooling, .. }
+        | CliCommand::EvalSingle { tooling, .. }
+        | CliCommand::EvalBatch { tooling, .. } => resolve_tooling_from_cli(tooling)?,
+        CliCommand::Help | CliCommand::Version | CliCommand::Replay { .. } => {
+            ToolingSelection::empty()
+        }
+    };
+    execute_parsed_command_with_extensions_and_tooling(command, llm, extension_host, &tooling)
+}
+
+fn execute_parsed_command_with_extensions_and_tooling(
+    command: CliCommand,
+    llm: Option<&dyn LlmGateway>,
+    extension_host: Option<&mut ExtensionHost>,
+    tooling: &ToolingSelection,
+) -> Result<CommandExecution, String> {
     let mut default_host = build_extension_host_from_env()?;
     let host = match extension_host {
         Some(host) => host,
@@ -753,17 +875,19 @@ fn execute_parsed_command_with_extensions(
             submission_id,
             prompt,
             store_file,
+            tooling: _,
         } => {
             let llm = llm.ok_or_else(|| "run requires an LLM gateway".to_string())?;
-            execute_run(submission_id, prompt, store_file, llm, host)
+            execute_run(submission_id, prompt, store_file, llm, host, tooling)
         }
         CliCommand::Resume {
             submission_id,
             checkpoint_id,
             store_file,
+            tooling: _,
         } => {
             let llm = llm.ok_or_else(|| "resume requires an LLM gateway".to_string())?;
-            execute_resume(submission_id, checkpoint_id, store_file, llm, host)
+            execute_resume(submission_id, checkpoint_id, store_file, llm, host, tooling)
         }
         CliCommand::Approve {
             submission_id,
@@ -771,6 +895,7 @@ fn execute_parsed_command_with_extensions(
             approved,
             reason,
             store_file,
+            tooling: _,
         } => {
             let llm = llm.ok_or_else(|| "approve requires an LLM gateway".to_string())?;
             execute_approve(
@@ -781,6 +906,7 @@ fn execute_parsed_command_with_extensions(
                 store_file,
                 llm,
                 host,
+                tooling,
             )
         }
         CliCommand::Replay {
@@ -800,6 +926,7 @@ fn execute_run(
     store_file: Option<PathBuf>,
     llm: &dyn LlmGateway,
     extension_host: &mut ExtensionHost,
+    tooling: &ToolingSelection,
 ) -> Result<CommandExecution, String> {
     match store_file {
         Some(path) => {
@@ -814,6 +941,7 @@ fn execute_run(
                 &mut store,
                 extension_host,
                 true,
+                tooling,
             )
         }
         None => {
@@ -827,6 +955,7 @@ fn execute_run(
                 &mut store,
                 extension_host,
                 true,
+                tooling,
             )
         }
     }
@@ -838,10 +967,11 @@ fn execute_turn_with_extensions(
     store: &mut dyn EventStore,
     extension_host: &mut ExtensionHost,
     strict_done_exit: bool,
+    tooling: &ToolingSelection,
 ) -> Result<CommandExecution, String> {
     let mut runtime = AgentRuntime::default();
     let policy = AllowAllPolicy;
-    let tools = build_tools();
+    let tools = build_tools(tooling);
 
     let mut current_op = initial_op;
     let mut all_events = Vec::new();
@@ -925,6 +1055,7 @@ fn execute_resume(
     store_file: PathBuf,
     llm: &dyn LlmGateway,
     extension_host: &mut ExtensionHost,
+    tooling: &ToolingSelection,
 ) -> Result<CommandExecution, String> {
     let mut store = FileEventStore::open(&store_file).map_err(|err| {
         format!(
@@ -942,6 +1073,7 @@ fn execute_resume(
         &mut store,
         extension_host,
         false,
+        tooling,
     )
 }
 
@@ -968,6 +1100,7 @@ fn execute_approve(
     store_file: PathBuf,
     llm: &dyn LlmGateway,
     extension_host: &mut ExtensionHost,
+    tooling: &ToolingSelection,
 ) -> Result<CommandExecution, String> {
     let mut store = FileEventStore::open(&store_file).map_err(|err| {
         format!(
@@ -987,12 +1120,14 @@ fn execute_approve(
         &mut store,
         extension_host,
         false,
+        tooling,
     )
 }
 
 fn execute_eval_command(
     command: CliCommand,
     llm: &dyn LlmGateway,
+    tooling: &ToolingSelection,
 ) -> Result<EvalResultSet, String> {
     match command {
         CliCommand::EvalSingle {
@@ -1000,8 +1135,10 @@ fn execute_eval_command(
             submission_id,
             prompt,
             store_file,
+            tooling: _,
         } => {
-            let result = execute_eval_task(task_id, submission_id, prompt, store_file, llm);
+            let result =
+                execute_eval_task(task_id, submission_id, prompt, store_file, llm, tooling);
             Ok(EvalResultSet {
                 schema_version: EVAL_RESULT_SCHEMA_VERSION,
                 version: VERSION.to_string(),
@@ -1011,6 +1148,7 @@ fn execute_eval_command(
         CliCommand::EvalBatch {
             tasks_file,
             store_dir,
+            tooling: _,
         } => {
             let tasks = load_eval_tasks(&tasks_file)?;
             if let Some(dir) = &store_dir {
@@ -1037,6 +1175,7 @@ fn execute_eval_command(
                     task.prompt,
                     task_store_file,
                     llm,
+                    tooling,
                 );
                 results.push(result);
             }
@@ -1057,6 +1196,7 @@ fn execute_eval_task(
     prompt: String,
     store_file: Option<PathBuf>,
     llm: &dyn LlmGateway,
+    tooling: &ToolingSelection,
 ) -> EvalResult {
     let started = Instant::now();
     let run_metadata = build_eval_run_metadata(submission_id.clone());
@@ -1067,6 +1207,7 @@ fn execute_eval_task(
         store_file,
         llm,
         &mut host,
+        tooling,
     );
     let latency_ms = started.elapsed().as_millis() as u64;
 
@@ -1315,6 +1456,18 @@ fn main() {
         }
     };
 
+    let resolved_tooling = if let Some(tooling_config) = parsed.tooling_config() {
+        Some(match resolve_tooling_from_cli(tooling_config) {
+            Ok(tooling) => tooling,
+            Err(err) => {
+                eprintln!("Tooling configuration error: {err}");
+                std::process::exit(2);
+            }
+        })
+    } else {
+        None
+    };
+
     match parsed {
         CliCommand::Help => {
             print_usage(&program);
@@ -1324,8 +1477,14 @@ fn main() {
             println!("{VERSION}");
             return;
         }
-        CliCommand::Run { .. } | CliCommand::Resume { .. } | CliCommand::Approve { .. } => {
-            let llm = match build_gateway_from_env() {
+        command @ (CliCommand::Run { .. }
+        | CliCommand::Resume { .. }
+        | CliCommand::Approve { .. }) => {
+            let tooling = resolved_tooling
+                .as_ref()
+                .expect("tooling resolved for llm commands");
+
+            let llm = match build_gateway_from_env(&tooling) {
                 Ok(gateway) => gateway,
                 Err(err) => {
                     eprintln!("LLM configuration error: {err}");
@@ -1333,7 +1492,12 @@ fn main() {
                 }
             };
 
-            let execution = match execute_parsed_command(parsed, Some(&llm)) {
+            let execution = match execute_parsed_command_with_extensions_and_tooling(
+                command,
+                Some(&llm),
+                None,
+                tooling,
+            ) {
                 Ok(result) => result,
                 Err(err) => {
                     eprintln!("Command failed: {err}");
@@ -1353,8 +1517,12 @@ fn main() {
                 std::process::exit(execution.exit_code);
             }
         }
-        CliCommand::EvalSingle { .. } | CliCommand::EvalBatch { .. } => {
-            let llm = match build_gateway_from_env() {
+        command @ (CliCommand::EvalSingle { .. } | CliCommand::EvalBatch { .. }) => {
+            let tooling = resolved_tooling
+                .as_ref()
+                .expect("tooling resolved for eval commands");
+
+            let llm = match build_gateway_from_env(&tooling) {
                 Ok(gateway) => gateway,
                 Err(err) => {
                     eprintln!("LLM configuration error: {err}");
@@ -1362,7 +1530,7 @@ fn main() {
                 }
             };
 
-            let result_set = match execute_eval_command(parsed, &llm) {
+            let result_set = match execute_eval_command(command, &llm, tooling) {
                 Ok(result_set) => result_set,
                 Err(err) => {
                     eprintln!("Command failed: {err}");
@@ -1404,12 +1572,13 @@ mod tests {
     use super::{
         CliCommand, EvalResult, EvalResultSet, EvalRunMetadata, EvalTokenUsage,
         execute_eval_command, execute_parsed_command, execute_parsed_command_with_extensions,
-        parse_cli_command, parse_tool_choice_env, parse_tools_env,
+        parse_cli_command, parse_tool_choice_env,
     };
     use crate::extensions::{
         host::ExtensionHost,
         types::{CliExtension, NextAction, TurnContext},
     };
+    use crate::tooling::{ToolingCliConfig, resolve_tooling_from_cli};
     use agent_core::{
         memory::EventStore,
         memory_file::FileEventStore,
@@ -1508,6 +1677,50 @@ mod tests {
         ]))
         .expect("parse eval batch");
         assert!(matches!(eval_batch, CliCommand::EvalBatch { .. }));
+    }
+
+    #[test]
+    fn parses_cli_tool_options_for_llm_commands() {
+        let run = parse_cli_command(&args(&[
+            "run",
+            "--store-file",
+            "/tmp/events.jsonl",
+            "--tools",
+            "echo",
+            "hello",
+        ]))
+        .expect("parse run with tools");
+        match run {
+            CliCommand::Run { tooling, .. } => {
+                assert_eq!(tooling.tools, Some(vec!["echo".to_string()]));
+                assert!(!tooling.no_tools);
+            }
+            _ => panic!("expected run command"),
+        }
+
+        let resume = parse_cli_command(&args(&[
+            "resume",
+            "--store-file",
+            "/tmp/events.jsonl",
+            "--no-tools",
+        ]))
+        .expect("parse resume with no tools");
+        match resume {
+            CliCommand::Resume { tooling, .. } => {
+                assert!(tooling.no_tools);
+                assert_eq!(tooling.tools, None);
+            }
+            _ => panic!("expected resume command"),
+        }
+
+        let shorthand = parse_cli_command(&args(&["--tools", "echo", "hello"]))
+            .expect("parse shorthand with tools");
+        match shorthand {
+            CliCommand::Run { tooling, .. } => {
+                assert_eq!(tooling.tools, Some(vec!["echo".to_string()]));
+            }
+            _ => panic!("expected run command"),
+        }
     }
 
     #[test]
@@ -1760,15 +1973,36 @@ mod tests {
     }
 
     #[test]
-    fn parses_supported_tools_list() {
-        let tools = parse_tools_env(" echo ").expect("parse tools");
-        assert_eq!(tools, vec!["echo"]);
+    fn resolves_default_tooling_with_echo_enabled() {
+        let selection = resolve_tooling_from_cli(&ToolingCliConfig::default()).expect("resolve");
+        assert_eq!(selection.enabled_tool_names(), vec!["echo"]);
+        assert!(selection.contains_tool("echo"));
     }
 
     #[test]
-    fn rejects_unsupported_tool() {
-        let err = parse_tools_env("shell").expect_err("should reject");
-        assert!(err.contains("unsupported tool"));
+    fn rejects_unknown_tool_configuration() {
+        let err = resolve_tooling_from_cli(&ToolingCliConfig {
+            no_tools: false,
+            tools: Some(vec!["missing".to_string()]),
+        })
+        .expect_err("must reject");
+        assert!(err.contains("unsupported tool `missing`"));
+    }
+
+    #[test]
+    fn provider_and_local_tool_assembly_stay_consistent() {
+        let selection = resolve_tooling_from_cli(&ToolingCliConfig {
+            no_tools: false,
+            tools: Some(vec!["echo".to_string()]),
+        })
+        .expect("resolve explicit tools");
+        let provider_tools = selection
+            .provider_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(provider_tools, selection.enabled_tool_names());
     }
 
     #[test]
@@ -1885,7 +2119,9 @@ mod tests {
         ]))
         .expect("parse eval batch command");
 
-        let result_set = execute_eval_command(eval_command, &llm).expect("execute eval batch");
+        let tooling = resolve_tooling_from_cli(&ToolingCliConfig::default()).expect("resolve");
+        let result_set =
+            execute_eval_command(eval_command, &llm, &tooling).expect("execute eval batch");
         assert_eq!(result_set.schema_version, 1);
         assert_eq!(result_set.results.len(), 2);
         assert_eq!(result_set.results[0].task_id, "task-a");
