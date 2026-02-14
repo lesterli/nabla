@@ -6,6 +6,7 @@ use agent_llm::OpenAiFunctionTool;
 pub mod path_sandbox;
 pub mod read;
 pub mod registry;
+pub mod write;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ToolingCliConfig {
@@ -114,10 +115,10 @@ mod tests {
     fn no_tools_plus_explicit_tools_keeps_explicit_selection() {
         let selection = resolve_tooling_from_cli(&ToolingCliConfig {
             no_tools: true,
-            tools: Some(vec!["read".to_string()]),
+            tools: Some(vec!["read".to_string(), "write".to_string()]),
         })
         .expect("resolve");
-        assert_eq!(selection.enabled_tool_names(), vec!["read"]);
+        assert_eq!(selection.enabled_tool_names(), vec!["read", "write"]);
     }
 
     #[test]

@@ -221,7 +221,7 @@ LLM env:
   AGENT_LLM_TOOL_CHOICE (optional: auto|required|none|function:<name>)
 
 Tool options:
-  --tools <list>   Enable specific built-in tools (supported: read)
+  --tools <list>   Enable specific built-in tools (supported: read,write)
   --no-tools       Disable all built-in tools (if combined with --tools, only listed tools are enabled)
 
 Extension env (optional):
@@ -1701,13 +1701,16 @@ mod tests {
             "--store-file",
             "/tmp/events.jsonl",
             "--tools",
-            "read",
+            "read,write",
             "hello",
         ]))
         .expect("parse run with tools");
         match run {
             CliCommand::Run { tooling, .. } => {
-                assert_eq!(tooling.tools, Some(vec!["read".to_string()]));
+                assert_eq!(
+                    tooling.tools,
+                    Some(vec!["read".to_string(), "write".to_string()])
+                );
                 assert!(!tooling.no_tools);
             }
             _ => panic!("expected run command"),
@@ -2012,7 +2015,7 @@ mod tests {
     fn provider_and_local_tool_assembly_stay_consistent() {
         let selection = resolve_tooling_from_cli(&ToolingCliConfig {
             no_tools: false,
-            tools: Some(vec!["read".to_string()]),
+            tools: Some(vec!["read".to_string(), "write".to_string()]),
         })
         .expect("resolve explicit tools");
         let provider_tools = selection
