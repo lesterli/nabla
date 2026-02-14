@@ -2,6 +2,7 @@ use agent_core::tools::ToolRegistry;
 use agent_llm::OpenAiFunctionTool;
 use serde_json::json;
 
+use super::bash::BashTool;
 use super::edit::EditTool;
 use super::read::ReadTool;
 use super::write::WriteTool;
@@ -33,6 +34,10 @@ fn register_write(registry: &mut ToolRegistry) {
 
 fn register_edit(registry: &mut ToolRegistry) {
     registry.register(EditTool::for_current_workspace());
+}
+
+fn register_bash(registry: &mut ToolRegistry) {
+    registry.register(BashTool::for_current_workspace());
 }
 
 fn read_provider_definition() -> OpenAiFunctionTool {
@@ -86,7 +91,24 @@ fn edit_provider_definition() -> OpenAiFunctionTool {
     )
 }
 
-static TOOL_CATALOG: [ToolSpec; 3] = [
+fn bash_provider_definition() -> OpenAiFunctionTool {
+    OpenAiFunctionTool::new(
+        "bash",
+        "Run a shell command in the workspace root and return stdout/stderr plus exit status.",
+        json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "Shell command to execute." },
+                "timeout_ms": { "type": "integer", "minimum": 1, "description": "Optional timeout in milliseconds (max 30000)." },
+                "max_output_bytes": { "type": "integer", "minimum": 1, "description": "Optional stdout/stderr truncation size in bytes." }
+            },
+            "required": ["command"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+static TOOL_CATALOG: [ToolSpec; 4] = [
     ToolSpec {
         name: "read",
         register_local_fn: register_read,
@@ -101,6 +123,11 @@ static TOOL_CATALOG: [ToolSpec; 3] = [
         name: "edit",
         register_local_fn: register_edit,
         provider_definition_fn: Some(edit_provider_definition),
+    },
+    ToolSpec {
+        name: "bash",
+        register_local_fn: register_bash,
+        provider_definition_fn: Some(bash_provider_definition),
     },
 ];
 

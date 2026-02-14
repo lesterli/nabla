@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use agent_core::tools::ToolRegistry;
 use agent_llm::OpenAiFunctionTool;
 
+pub mod bash;
 pub mod edit;
 pub mod path_sandbox;
 pub mod read;
@@ -120,12 +121,13 @@ mod tests {
                 "read".to_string(),
                 "write".to_string(),
                 "edit".to_string(),
+                "bash".to_string(),
             ]),
         })
         .expect("resolve");
         assert_eq!(
             selection.enabled_tool_names(),
-            vec!["read", "write", "edit"]
+            vec!["read", "write", "edit", "bash"]
         );
     }
 

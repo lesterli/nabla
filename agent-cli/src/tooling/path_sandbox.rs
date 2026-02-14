@@ -75,6 +75,10 @@ impl WorkspacePathSandbox {
             .unwrap_or_else(|_| path.display().to_string())
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn parse_candidate<'a>(&self, raw_path: &'a str) -> Result<(&'a str, PathBuf), String> {
         let trimmed = raw_path.trim();
         if trimmed.is_empty() {
