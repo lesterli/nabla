@@ -2,6 +2,7 @@ use agent_core::tools::ToolRegistry;
 use agent_llm::OpenAiFunctionTool;
 use serde_json::json;
 
+use super::edit::EditTool;
 use super::read::ReadTool;
 use super::write::WriteTool;
 
@@ -28,6 +29,10 @@ fn register_read(registry: &mut ToolRegistry) {
 
 fn register_write(registry: &mut ToolRegistry) {
     registry.register(WriteTool::for_current_workspace());
+}
+
+fn register_edit(registry: &mut ToolRegistry) {
+    registry.register(EditTool::for_current_workspace());
 }
 
 fn read_provider_definition() -> OpenAiFunctionTool {
@@ -64,7 +69,24 @@ fn write_provider_definition() -> OpenAiFunctionTool {
     )
 }
 
-static TOOL_CATALOG: [ToolSpec; 2] = [
+fn edit_provider_definition() -> OpenAiFunctionTool {
+    OpenAiFunctionTool::new(
+        "edit",
+        "Edit an existing UTF-8 file by replacing one exact unique text fragment with new text.",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Workspace-relative file path." },
+                "old_text": { "type": "string", "description": "Exact text to replace (must be unique)." },
+                "new_text": { "type": "string", "description": "Replacement text." }
+            },
+            "required": ["path", "old_text", "new_text"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+static TOOL_CATALOG: [ToolSpec; 3] = [
     ToolSpec {
         name: "read",
         register_local_fn: register_read,
@@ -74,6 +96,11 @@ static TOOL_CATALOG: [ToolSpec; 2] = [
         name: "write",
         register_local_fn: register_write,
         provider_definition_fn: Some(write_provider_definition),
+    },
+    ToolSpec {
+        name: "edit",
+        register_local_fn: register_edit,
+        provider_definition_fn: Some(edit_provider_definition),
     },
 ];
 

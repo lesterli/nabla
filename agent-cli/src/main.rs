@@ -221,7 +221,7 @@ LLM env:
   AGENT_LLM_TOOL_CHOICE (optional: auto|required|none|function:<name>)
 
 Tool options:
-  --tools <list>   Enable specific built-in tools (supported: read,write)
+  --tools <list>   Enable specific built-in tools (supported: read,write,edit)
   --no-tools       Disable all built-in tools (if combined with --tools, only listed tools are enabled)
 
 Extension env (optional):
@@ -1701,7 +1701,7 @@ mod tests {
             "--store-file",
             "/tmp/events.jsonl",
             "--tools",
-            "read,write",
+            "read,write,edit",
             "hello",
         ]))
         .expect("parse run with tools");
@@ -1709,7 +1709,11 @@ mod tests {
             CliCommand::Run { tooling, .. } => {
                 assert_eq!(
                     tooling.tools,
-                    Some(vec!["read".to_string(), "write".to_string()])
+                    Some(vec![
+                        "read".to_string(),
+                        "write".to_string(),
+                        "edit".to_string()
+                    ])
                 );
                 assert!(!tooling.no_tools);
             }

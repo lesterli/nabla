@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use agent_core::tools::ToolRegistry;
 use agent_llm::OpenAiFunctionTool;
 
+pub mod edit;
 pub mod path_sandbox;
 pub mod read;
 pub mod registry;
@@ -115,10 +116,17 @@ mod tests {
     fn no_tools_plus_explicit_tools_keeps_explicit_selection() {
         let selection = resolve_tooling_from_cli(&ToolingCliConfig {
             no_tools: true,
-            tools: Some(vec!["read".to_string(), "write".to_string()]),
+            tools: Some(vec![
+                "read".to_string(),
+                "write".to_string(),
+                "edit".to_string(),
+            ]),
         })
         .expect("resolve");
-        assert_eq!(selection.enabled_tool_names(), vec!["read", "write"]);
+        assert_eq!(
+            selection.enabled_tool_names(),
+            vec!["read", "write", "edit"]
+        );
     }
 
     #[test]
