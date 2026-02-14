@@ -3,6 +3,7 @@ use agent_llm::OpenAiFunctionTool;
 use serde_json::json;
 
 use super::read::ReadTool;
+use super::write::WriteTool;
 
 #[derive(Debug)]
 pub struct ToolSpec {
@@ -25,6 +26,10 @@ fn register_read(registry: &mut ToolRegistry) {
     registry.register(ReadTool::for_current_workspace());
 }
 
+fn register_write(registry: &mut ToolRegistry) {
+    registry.register(WriteTool::for_current_workspace());
+}
+
 fn read_provider_definition() -> OpenAiFunctionTool {
     OpenAiFunctionTool::new(
         "read",
@@ -43,11 +48,34 @@ fn read_provider_definition() -> OpenAiFunctionTool {
     )
 }
 
-static TOOL_CATALOG: [ToolSpec; 1] = [ToolSpec {
-    name: "read",
-    register_local_fn: register_read,
-    provider_definition_fn: Some(read_provider_definition),
-}];
+fn write_provider_definition() -> OpenAiFunctionTool {
+    OpenAiFunctionTool::new(
+        "write",
+        "Write UTF-8 text to a file in the current workspace. Creates or overwrites files.",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Workspace-relative file path." },
+                "content": { "type": "string", "description": "Full file content to write." }
+            },
+            "required": ["path", "content"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+static TOOL_CATALOG: [ToolSpec; 2] = [
+    ToolSpec {
+        name: "read",
+        register_local_fn: register_read,
+        provider_definition_fn: Some(read_provider_definition),
+    },
+    ToolSpec {
+        name: "write",
+        register_local_fn: register_write,
+        provider_definition_fn: Some(write_provider_definition),
+    },
+];
 
 const DEFAULT_TOOL_NAMES: [&str; 1] = ["read"];
 
