@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use agent_core::tools::ToolRegistry;
 use agent_llm::OpenAiFunctionTool;
 
+pub mod path_sandbox;
+pub mod read;
 pub mod registry;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -85,7 +87,7 @@ mod tests {
     #[test]
     fn defaults_to_builtin_tools() {
         let selection = resolve_tooling_from_cli(&ToolingCliConfig::default()).expect("resolve");
-        assert_eq!(selection.enabled_tool_names(), vec!["echo"]);
+        assert_eq!(selection.enabled_tool_names(), vec!["read"]);
     }
 
     #[test]
@@ -102,20 +104,20 @@ mod tests {
     fn explicit_tools_override_defaults() {
         let selection = resolve_tooling_from_cli(&ToolingCliConfig {
             no_tools: false,
-            tools: Some(vec!["echo".to_string()]),
+            tools: Some(vec!["read".to_string()]),
         })
         .expect("resolve");
-        assert_eq!(selection.enabled_tool_names(), vec!["echo"]);
+        assert_eq!(selection.enabled_tool_names(), vec!["read"]);
     }
 
     #[test]
     fn no_tools_plus_explicit_tools_keeps_explicit_selection() {
         let selection = resolve_tooling_from_cli(&ToolingCliConfig {
             no_tools: true,
-            tools: Some(vec!["echo".to_string()]),
+            tools: Some(vec!["read".to_string()]),
         })
         .expect("resolve");
-        assert_eq!(selection.enabled_tool_names(), vec!["echo"]);
+        assert_eq!(selection.enabled_tool_names(), vec!["read"]);
     }
 
     #[test]

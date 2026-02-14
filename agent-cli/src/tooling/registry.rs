@@ -1,6 +1,8 @@
-use agent_core::tools::{EchoTool, ToolRegistry};
+use agent_core::tools::ToolRegistry;
 use agent_llm::OpenAiFunctionTool;
 use serde_json::json;
+
+use super::read::ReadTool;
 
 #[derive(Debug)]
 pub struct ToolSpec {
@@ -19,32 +21,35 @@ impl ToolSpec {
     }
 }
 
-fn register_echo(registry: &mut ToolRegistry) {
-    registry.register(EchoTool);
+fn register_read(registry: &mut ToolRegistry) {
+    registry.register(ReadTool::for_current_workspace());
 }
 
-fn echo_provider_definition() -> OpenAiFunctionTool {
+fn read_provider_definition() -> OpenAiFunctionTool {
     OpenAiFunctionTool::new(
-        "echo",
-        "Echo input text for connectivity checks.",
+        "read",
+        "Read a UTF-8 text file from the current workspace. Optional line range and truncation controls are supported.",
         json!({
             "type": "object",
             "properties": {
-                "text": { "type": "string" }
+                "path": { "type": "string", "description": "Workspace-relative file path." },
+                "start_line": { "type": "integer", "minimum": 1 },
+                "end_line": { "type": "integer", "minimum": 1 },
+                "max_bytes": { "type": "integer", "minimum": 1 }
             },
-            "required": ["text"],
+            "required": ["path"],
             "additionalProperties": false
         }),
     )
 }
 
 static TOOL_CATALOG: [ToolSpec; 1] = [ToolSpec {
-    name: "echo",
-    register_local_fn: register_echo,
-    provider_definition_fn: Some(echo_provider_definition),
+    name: "read",
+    register_local_fn: register_read,
+    provider_definition_fn: Some(read_provider_definition),
 }];
 
-const DEFAULT_TOOL_NAMES: [&str; 1] = ["echo"];
+const DEFAULT_TOOL_NAMES: [&str; 1] = ["read"];
 
 pub fn catalog() -> &'static [ToolSpec] {
     &TOOL_CATALOG

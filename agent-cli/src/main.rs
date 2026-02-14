@@ -218,10 +218,10 @@ LLM env:
   AGENT_LLM_API_KEY (required for openai/openai_compatible)
   AGENT_LLM_MODEL (default: gpt-4o-mini)
   AGENT_LLM_NAME (optional provider display name)
-  AGENT_LLM_TOOL_CHOICE (optional: auto|required|none|echo|function:<name>)
+  AGENT_LLM_TOOL_CHOICE (optional: auto|required|none|function:<name>)
 
 Tool options:
-  --tools <list>   Enable specific built-in tools (supported: echo)
+  --tools <list>   Enable specific built-in tools (supported: read)
   --no-tools       Disable all built-in tools (if combined with --tools, only listed tools are enabled)
 
 Extension env (optional):
@@ -242,9 +242,6 @@ fn parse_tool_choice_env(raw: &str) -> Result<OpenAiToolChoice, String> {
         "auto" => Ok(OpenAiToolChoice::Auto),
         "required" => Ok(OpenAiToolChoice::Required),
         "none" => Ok(OpenAiToolChoice::None),
-        "echo" => Ok(OpenAiToolChoice::Function {
-            name: "echo".to_string(),
-        }),
         _ => {
             if let Some(name) = normalized.strip_prefix("function:") {
                 if name.trim().is_empty() {
@@ -258,7 +255,7 @@ fn parse_tool_choice_env(raw: &str) -> Result<OpenAiToolChoice, String> {
                 });
             }
             Err(format!(
-                "unsupported AGENT_LLM_TOOL_CHOICE value `{normalized}` (expected: auto, required, none, echo, function:<name>)"
+                "unsupported AGENT_LLM_TOOL_CHOICE value `{normalized}` (expected: auto, required, none, function:<name>)"
             ))
         }
     }
@@ -1565,6 +1562,7 @@ fn main() {
 mod tests {
     use std::{
         fs,
+        io::Write,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1599,6 +1597,23 @@ mod tests {
         std::env::temp_dir()
             .join("agent-cli-tests")
             .join(format!("{test_name}-{nanos}-{}.jsonl", std::process::id()))
+    }
+
+    fn temp_workspace_file(test_name: &str, content: &str) -> (PathBuf, String) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let relative = PathBuf::from("target")
+            .join("agent-cli-tests")
+            .join(format!("{test_name}-{}-{nanos}.txt", std::process::id()));
+        if let Some(parent) = relative.parent() {
+            fs::create_dir_all(parent).expect("create workspace temp dir");
+        }
+        let mut file = fs::File::create(&relative).expect("create workspace temp file");
+        file.write_all(content.as_bytes())
+            .expect("write workspace temp file");
+        (relative.clone(), relative.to_string_lossy().to_string())
     }
 
     #[test]
@@ -1686,13 +1701,13 @@ mod tests {
             "--store-file",
             "/tmp/events.jsonl",
             "--tools",
-            "echo",
+            "read",
             "hello",
         ]))
         .expect("parse run with tools");
         match run {
             CliCommand::Run { tooling, .. } => {
-                assert_eq!(tooling.tools, Some(vec!["echo".to_string()]));
+                assert_eq!(tooling.tools, Some(vec!["read".to_string()]));
                 assert!(!tooling.no_tools);
             }
             _ => panic!("expected run command"),
@@ -1713,11 +1728,11 @@ mod tests {
             _ => panic!("expected resume command"),
         }
 
-        let shorthand = parse_cli_command(&args(&["--tools", "echo", "hello"]))
+        let shorthand = parse_cli_command(&args(&["--tools", "read", "hello"]))
             .expect("parse shorthand with tools");
         match shorthand {
             CliCommand::Run { tooling, .. } => {
-                assert_eq!(tooling.tools, Some(vec!["echo".to_string()]));
+                assert_eq!(tooling.tools, Some(vec!["read".to_string()]));
             }
             _ => panic!("expected run command"),
         }
@@ -1788,6 +1803,7 @@ mod tests {
     #[test]
     fn approve_true_resumes_pending_call_and_continues_loop() {
         let store_path = temp_store_path("approve-true");
+        let (read_file, read_file_str) = temp_workspace_file("approve-true-read", "approved\n");
         if let Some(parent) = store_path.parent() {
             fs::create_dir_all(parent).expect("create temp dir");
         }
@@ -1807,8 +1823,8 @@ mod tests {
                 EventKind::HumanApprovalRequested {
                     request_id: "approval-7".to_string(),
                     call: ToolCall {
-                        name: "echo".to_string(),
-                        args: json!({ "text": "approved" }),
+                        name: "read".to_string(),
+                        args: json!({ "path": read_file_str }),
                     },
                     reason: "needs human".to_string(),
                 },
@@ -1860,7 +1876,7 @@ mod tests {
             matches!(
                 event.kind,
                 EventKind::ToolExecuted { ref result }
-                    if result.call_name == "echo" && !result.is_error
+                    if result.call_name == "read" && !result.is_error
             )
         }));
         assert!(events.iter().any(|event| {
@@ -1874,6 +1890,7 @@ mod tests {
         }));
 
         fs::remove_file(&store_path).expect("cleanup store file");
+        let _ = fs::remove_file(read_file);
         if let Some(parent) = store_path.parent() {
             let _ = fs::remove_dir(parent);
         }
@@ -1882,6 +1899,7 @@ mod tests {
     #[test]
     fn approve_false_records_denial_without_tool_execution() {
         let store_path = temp_store_path("approve-false");
+        let (read_file, read_file_str) = temp_workspace_file("approve-false-read", "denied\n");
         if let Some(parent) = store_path.parent() {
             fs::create_dir_all(parent).expect("create temp dir");
         }
@@ -1901,8 +1919,8 @@ mod tests {
                 EventKind::HumanApprovalRequested {
                     request_id: "approval-8".to_string(),
                     call: ToolCall {
-                        name: "echo".to_string(),
-                        args: json!({ "text": "should-not-run" }),
+                        name: "read".to_string(),
+                        args: json!({ "path": read_file_str }),
                     },
                     reason: "needs human".to_string(),
                 },
@@ -1967,16 +1985,17 @@ mod tests {
         }));
 
         fs::remove_file(&store_path).expect("cleanup store file");
+        let _ = fs::remove_file(read_file);
         if let Some(parent) = store_path.parent() {
             let _ = fs::remove_dir(parent);
         }
     }
 
     #[test]
-    fn resolves_default_tooling_with_echo_enabled() {
+    fn resolves_default_tooling_with_read_enabled() {
         let selection = resolve_tooling_from_cli(&ToolingCliConfig::default()).expect("resolve");
-        assert_eq!(selection.enabled_tool_names(), vec!["echo"]);
-        assert!(selection.contains_tool("echo"));
+        assert_eq!(selection.enabled_tool_names(), vec!["read"]);
+        assert!(selection.contains_tool("read"));
     }
 
     #[test]
@@ -1993,7 +2012,7 @@ mod tests {
     fn provider_and_local_tool_assembly_stay_consistent() {
         let selection = resolve_tooling_from_cli(&ToolingCliConfig {
             no_tools: false,
-            tools: Some(vec!["echo".to_string()]),
+            tools: Some(vec!["read".to_string()]),
         })
         .expect("resolve explicit tools");
         let provider_tools = selection
@@ -2007,9 +2026,9 @@ mod tests {
 
     #[test]
     fn parses_function_tool_choice() {
-        let choice = parse_tool_choice_env("function:echo").expect("parse tool choice");
+        let choice = parse_tool_choice_env("function:read").expect("parse tool choice");
         match choice {
-            OpenAiToolChoice::Function { name } => assert_eq!(name, "echo"),
+            OpenAiToolChoice::Function { name } => assert_eq!(name, "read"),
             _ => panic!("expected function tool choice"),
         }
     }
@@ -2025,8 +2044,8 @@ mod tests {
                 outcome_or_status: "done".to_string(),
                 stop_facts: None,
                 tool_calls: vec![ToolCall {
-                    name: "echo".to_string(),
-                    args: json!({"text":"hello"}),
+                    name: "read".to_string(),
+                    args: json!({"path":"Cargo.toml"}),
                 }],
                 steps: 1,
                 latency_ms: 12,
@@ -2060,9 +2079,9 @@ mod tests {
       "outcome_or_status": "done",
       "tool_calls": [
         {{
-          "name": "echo",
+          "name": "read",
           "args": {{
-            "text": "hello"
+            "path": "Cargo.toml"
           }}
         }}
       ],
@@ -2103,7 +2122,7 @@ mod tests {
         fs::create_dir_all(&store_dir).expect("create eval store dir");
 
         let tasks_content = r#"{"task_id":"task-a","prompt":"say hello once"}
-{"task_id":"task-b","prompt":"call echo tool with text hi"}"#;
+{"task_id":"task-b","prompt":"call read tool with path Cargo.toml"}"#;
         fs::write(&tasks_path, tasks_content).expect("write tasks file");
 
         let llm =
