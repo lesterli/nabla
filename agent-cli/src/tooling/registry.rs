@@ -4,6 +4,7 @@ use serde_json::json;
 
 use super::bash::BashTool;
 use super::edit::EditTool;
+use super::grep::GrepTool;
 use super::read::ReadTool;
 use super::write::WriteTool;
 
@@ -38,6 +39,10 @@ fn register_edit(registry: &mut ToolRegistry) {
 
 fn register_bash(registry: &mut ToolRegistry) {
     registry.register(BashTool::for_current_workspace());
+}
+
+fn register_grep(registry: &mut ToolRegistry) {
+    registry.register(GrepTool::for_current_workspace());
 }
 
 fn read_provider_definition() -> OpenAiFunctionTool {
@@ -91,6 +96,24 @@ fn edit_provider_definition() -> OpenAiFunctionTool {
     )
 }
 
+fn grep_provider_definition() -> OpenAiFunctionTool {
+    OpenAiFunctionTool::new(
+        "grep",
+        "Search file contents by regex pattern within the workspace. Returns matching file paths, line numbers, and snippets.",
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "Regex pattern to search for." },
+                "path": { "type": "string", "description": "Optional file or directory path to search within (defaults to workspace root)." },
+                "include": { "type": "string", "description": "Optional filename glob (e.g. \"*.rs\") to filter which files are searched." },
+                "max_matches": { "type": "integer", "minimum": 1, "description": "Maximum number of matching lines to return (default 100)." }
+            },
+            "required": ["pattern"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 fn bash_provider_definition() -> OpenAiFunctionTool {
     OpenAiFunctionTool::new(
         "bash",
@@ -108,7 +131,7 @@ fn bash_provider_definition() -> OpenAiFunctionTool {
     )
 }
 
-static TOOL_CATALOG: [ToolSpec; 4] = [
+static TOOL_CATALOG: [ToolSpec; 5] = [
     ToolSpec {
         name: "read",
         register_local_fn: register_read,
@@ -128,6 +151,11 @@ static TOOL_CATALOG: [ToolSpec; 4] = [
         name: "bash",
         register_local_fn: register_bash,
         provider_definition_fn: Some(bash_provider_definition),
+    },
+    ToolSpec {
+        name: "grep",
+        register_local_fn: register_grep,
+        provider_definition_fn: Some(grep_provider_definition),
     },
 ];
 

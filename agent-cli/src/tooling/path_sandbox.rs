@@ -69,6 +69,16 @@ impl WorkspacePathSandbox {
         Ok(candidate)
     }
 
+    /// Resolves a path (file or directory) within the workspace.
+    /// Unlike `resolve_file`, this accepts both files and directories.
+    pub fn resolve_search_path(&self, raw_path: &str) -> Result<PathBuf, String> {
+        let (trimmed, candidate) = self.parse_candidate(raw_path)?;
+        let canonical = fs::canonicalize(&candidate)
+            .map_err(|err| format!("path `{trimmed}` is not accessible: {err}"))?;
+        self.ensure_inside_workspace(trimmed, &canonical)?;
+        Ok(canonical)
+    }
+
     pub fn display_path(&self, path: &Path) -> String {
         path.strip_prefix(&self.root)
             .map(|relative| relative.display().to_string())
