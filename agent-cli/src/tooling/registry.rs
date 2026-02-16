@@ -6,6 +6,7 @@ use super::bash::BashTool;
 use super::edit::EditTool;
 use super::find::FindTool;
 use super::grep::GrepTool;
+use super::ls::LsTool;
 use super::read::ReadTool;
 use super::write::WriteTool;
 
@@ -48,6 +49,10 @@ fn register_grep(registry: &mut ToolRegistry) {
 
 fn register_find(registry: &mut ToolRegistry) {
     registry.register(FindTool::for_current_workspace());
+}
+
+fn register_ls(registry: &mut ToolRegistry) {
+    registry.register(LsTool::for_current_workspace());
 }
 
 fn read_provider_definition() -> OpenAiFunctionTool {
@@ -136,6 +141,22 @@ fn find_provider_definition() -> OpenAiFunctionTool {
     )
 }
 
+fn ls_provider_definition() -> OpenAiFunctionTool {
+    OpenAiFunctionTool::new(
+        "ls",
+        "List directory contents within the workspace. Returns entries with name, type, and size. Supports depth control for recursive listing.",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Directory path to list (defaults to workspace root)." },
+                "depth": { "type": "integer", "minimum": 1, "description": "Recursion depth (default 1, immediate children only)." },
+                "max_entries": { "type": "integer", "minimum": 1, "description": "Maximum entries to return (default 200)." }
+            },
+            "additionalProperties": false
+        }),
+    )
+}
+
 fn bash_provider_definition() -> OpenAiFunctionTool {
     OpenAiFunctionTool::new(
         "bash",
@@ -153,7 +174,7 @@ fn bash_provider_definition() -> OpenAiFunctionTool {
     )
 }
 
-static TOOL_CATALOG: [ToolSpec; 6] = [
+static TOOL_CATALOG: [ToolSpec; 7] = [
     ToolSpec {
         name: "read",
         register_local_fn: register_read,
@@ -183,6 +204,11 @@ static TOOL_CATALOG: [ToolSpec; 6] = [
         name: "find",
         register_local_fn: register_find,
         provider_definition_fn: Some(find_provider_definition),
+    },
+    ToolSpec {
+        name: "ls",
+        register_local_fn: register_ls,
+        provider_definition_fn: Some(ls_provider_definition),
     },
 ];
 
