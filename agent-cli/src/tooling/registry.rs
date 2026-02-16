@@ -4,6 +4,7 @@ use serde_json::json;
 
 use super::bash::BashTool;
 use super::edit::EditTool;
+use super::find::FindTool;
 use super::grep::GrepTool;
 use super::read::ReadTool;
 use super::write::WriteTool;
@@ -43,6 +44,10 @@ fn register_bash(registry: &mut ToolRegistry) {
 
 fn register_grep(registry: &mut ToolRegistry) {
     registry.register(GrepTool::for_current_workspace());
+}
+
+fn register_find(registry: &mut ToolRegistry) {
+    registry.register(FindTool::for_current_workspace());
 }
 
 fn read_provider_definition() -> OpenAiFunctionTool {
@@ -114,6 +119,23 @@ fn grep_provider_definition() -> OpenAiFunctionTool {
     )
 }
 
+fn find_provider_definition() -> OpenAiFunctionTool {
+    OpenAiFunctionTool::new(
+        "find",
+        "Find files and directories by name pattern within the workspace. Supports glob wildcards (* ?) and substring matching.",
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "Glob pattern (e.g. \"*.rs\", \"test_?\") or substring to match against filenames." },
+                "path": { "type": "string", "description": "Optional directory path to search within (defaults to workspace root)." },
+                "max_results": { "type": "integer", "minimum": 1, "description": "Maximum number of entries to return (default 200)." }
+            },
+            "required": ["pattern"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 fn bash_provider_definition() -> OpenAiFunctionTool {
     OpenAiFunctionTool::new(
         "bash",
@@ -131,7 +153,7 @@ fn bash_provider_definition() -> OpenAiFunctionTool {
     )
 }
 
-static TOOL_CATALOG: [ToolSpec; 5] = [
+static TOOL_CATALOG: [ToolSpec; 6] = [
     ToolSpec {
         name: "read",
         register_local_fn: register_read,
@@ -156,6 +178,11 @@ static TOOL_CATALOG: [ToolSpec; 5] = [
         name: "grep",
         register_local_fn: register_grep,
         provider_definition_fn: Some(grep_provider_definition),
+    },
+    ToolSpec {
+        name: "find",
+        register_local_fn: register_find,
+        provider_definition_fn: Some(find_provider_definition),
     },
 ];
 

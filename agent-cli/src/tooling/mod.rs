@@ -5,6 +5,7 @@ use agent_llm::OpenAiFunctionTool;
 
 pub mod bash;
 pub mod edit;
+pub mod find;
 pub mod grep;
 pub mod path_sandbox;
 pub mod read;
