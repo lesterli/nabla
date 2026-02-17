@@ -1,8 +1,4 @@
-use std::{
-    collections::VecDeque,
-    fs,
-    path::PathBuf,
-};
+use std::{collections::VecDeque, fs, path::PathBuf};
 
 use agent_core::tools::{Tool, ToolArgField, ToolArgSchema, ToolArgType};
 use serde_json::{Value, json};
@@ -76,10 +72,10 @@ impl Tool for LsTool {
             ));
         }
 
-        let max_depth = parse_optional_positive_usize(args, "depth")?
-            .unwrap_or(self.default_max_depth);
-        let max_entries = parse_optional_positive_usize(args, "max_entries")?
-            .unwrap_or(self.default_max_entries);
+        let max_depth =
+            parse_optional_positive_usize(args, "depth")?.unwrap_or(self.default_max_depth);
+        let max_entries =
+            parse_optional_positive_usize(args, "max_entries")?.unwrap_or(self.default_max_entries);
         let collect_limit = max_entries + 1;
 
         let mut entries: Vec<Value> = Vec::new();
@@ -116,9 +112,7 @@ impl Tool for LsTool {
 
             // Sort: directories first, then files, alphabetically within each group.
             items.sort_by(|a, b| {
-                let dir_order = |kind: &str| -> u8 {
-                    if kind == "dir" { 0 } else { 1 }
-                };
+                let dir_order = |kind: &str| -> u8 { if kind == "dir" { 0 } else { 1 } };
                 dir_order(a.1)
                     .cmp(&dir_order(b.1))
                     .then_with(|| a.0.cmp(&b.0))
@@ -212,10 +206,7 @@ mod tests {
         assert_eq!(entries.len(), 2);
 
         // Directories should come before files in sort order.
-        assert_eq!(
-            entries[0].get("type").and_then(|v| v.as_str()),
-            Some("dir")
-        );
+        assert_eq!(entries[0].get("type").and_then(|v| v.as_str()), Some("dir"));
         assert_eq!(
             entries[1].get("type").and_then(|v| v.as_str()),
             Some("file")
@@ -232,9 +223,7 @@ mod tests {
         fs::write(root.join("src/lib.rs"), "").expect("write lib");
 
         let tool = LsTool::new(WorkspacePathSandbox::new(root.clone()));
-        let output = tool
-            .run(&json!({ "path": "src" }))
-            .expect("ls output");
+        let output = tool.run(&json!({ "path": "src" })).expect("ls output");
 
         let entries = output.get("entries").and_then(|v| v.as_array()).unwrap();
         assert_eq!(entries.len(), 2);
@@ -285,10 +274,7 @@ mod tests {
 
         let entries = output.get("entries").and_then(|v| v.as_array()).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0].get("size").and_then(|v| v.as_u64()),
-            Some(5)
-        );
+        assert_eq!(entries[0].get("size").and_then(|v| v.as_u64()), Some(5));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -302,9 +288,7 @@ mod tests {
         }
 
         let tool = LsTool::new(WorkspacePathSandbox::new(root.clone()));
-        let output = tool
-            .run(&json!({ "max_entries": 5 }))
-            .expect("ls output");
+        let output = tool.run(&json!({ "max_entries": 5 })).expect("ls output");
 
         let entries = output.get("entries").and_then(|v| v.as_array()).unwrap();
         assert_eq!(entries.len(), 5);

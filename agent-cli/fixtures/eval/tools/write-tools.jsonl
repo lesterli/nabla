@@ -1,0 +1,2 @@
+{"task_id":"rw-write","prompt":"TOOL_EVAL_WRITE_LAYERED: call write tool with path='target/agent-cli-tests/pr27-layered-tooling-write.txt' and content='tooling eval write layered'."}
+{"task_id":"rw-edit","prompt":"TOOL_EVAL_EDIT_LAYERED: call edit tool with path='target/agent-cli-tests/pr27-layered-tooling-edit.txt', old_text='before', new_text='after'."}

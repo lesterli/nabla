@@ -1,0 +1,4 @@
+{"task_id":"ro-read","prompt":"TOOL_EVAL_READ: call read tool with path='Cargo.toml', then summarize in one sentence."}
+{"task_id":"ro-grep","prompt":"TOOL_EVAL_GREP: call grep tool with pattern='fn ' and path='.'."}
+{"task_id":"ro-find","prompt":"TOOL_EVAL_FIND: call find tool with pattern='*.rs' and path='.'."}
+{"task_id":"ro-ls","prompt":"TOOL_EVAL_LS: call ls tool with path='.' and depth=1."}

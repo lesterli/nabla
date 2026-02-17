@@ -102,8 +102,21 @@ Task object fields:
 
 - Reproducible tooling eval fixtures live under:
   - `agent-cli/fixtures/eval/tools/default-four-tools.jsonl`
-- Includes task slices for:
-  - read
-  - write
-  - edit
-  - bash
+  - `agent-cli/fixtures/eval/tools/extended-tools.jsonl`
+  - `agent-cli/fixtures/eval/tools/read-only-tools.jsonl`
+  - `agent-cli/fixtures/eval/tools/write-tools.jsonl`
+  - `agent-cli/fixtures/eval/tools/execute-tools.jsonl`
+- Coverage:
+  - Default four tools baseline: `read`, `write`, `edit`, `bash`
+  - Extended tools baseline: `grep`, `find`, `ls`
+  - Layered task slices:
+    - read-only tasks (`read`, `grep`, `find`, `ls`)
+    - write tasks (`write`, `edit`)
+    - execute tasks (`bash`)
+
+Examples:
+
+```bash
+agent-cli eval --tasks-file agent-cli/fixtures/eval/tools/default-four-tools.jsonl --tools read,write,edit,bash
+agent-cli eval --tasks-file agent-cli/fixtures/eval/tools/extended-tools.jsonl --tools grep,find,ls
+```

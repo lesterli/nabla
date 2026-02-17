@@ -239,7 +239,7 @@ LLM env:
   AGENT_LLM_TOOL_CHOICE (optional: auto|required|none|function:<name>)
 
 Tool options:
-  --tools <list>   Enable specific built-in tools (supported: read,write,edit,bash)
+  --tools <list>   Enable specific built-in tools (supported: read,write,edit,bash,grep,find,ls)
   --no-tools       Disable all built-in tools (if combined with --tools, only listed tools are enabled)
 
 Extension env (optional):
@@ -1713,8 +1713,7 @@ mod tests {
 
     use super::{
         CliCommand, EvalResult, EvalResultSet, EvalRunMetadata, EvalTokenUsage, EvalToolCallStat,
-        EvalToolCallStats,
-        diff_usage_snapshots, execute_eval_command, execute_parsed_command,
+        EvalToolCallStats, diff_usage_snapshots, execute_eval_command, execute_parsed_command,
         execute_parsed_command_with_extensions, parse_cli_command, parse_tool_choice_env,
         token_usage_for_eval,
     };
@@ -1771,6 +1770,25 @@ mod tests {
             .join(name)
     }
 
+    fn json_schema_shape(value: &Value) -> Value {
+        match value {
+            Value::Null => json!("null"),
+            Value::Bool(_) => json!("bool"),
+            Value::Number(_) => json!("number"),
+            Value::String(_) => json!("string"),
+            Value::Array(items) => Value::Array(items.iter().map(json_schema_shape).collect()),
+            Value::Object(map) => {
+                let mut entries = map.iter().collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                let mut shaped = serde_json::Map::new();
+                for (key, value) in entries {
+                    shaped.insert(key.clone(), json_schema_shape(value));
+                }
+                Value::Object(shaped)
+            }
+        }
+    }
+
     #[derive(Debug, Default)]
     struct ToolingEvalFixtureGateway;
 
@@ -1790,6 +1808,23 @@ mod tests {
                 Some(ToolCall {
                     name: "read".to_string(),
                     args: json!({ "path": "Cargo.toml" }),
+                })
+            } else if prompt.contains("TOOL_EVAL_WRITE_LAYERED") {
+                Some(ToolCall {
+                    name: "write".to_string(),
+                    args: json!({
+                        "path": "target/agent-cli-tests/pr27-layered-tooling-write.txt",
+                        "content": "tooling eval write layered"
+                    }),
+                })
+            } else if prompt.contains("TOOL_EVAL_EDIT_LAYERED") {
+                Some(ToolCall {
+                    name: "edit".to_string(),
+                    args: json!({
+                        "path": "target/agent-cli-tests/pr27-layered-tooling-edit.txt",
+                        "old_text": "before",
+                        "new_text": "after"
+                    }),
                 })
             } else if prompt.contains("TOOL_EVAL_WRITE") {
                 Some(ToolCall {
@@ -1812,6 +1847,34 @@ mod tests {
                 Some(ToolCall {
                     name: "bash".to_string(),
                     args: json!({ "command": "printf tooling-eval-bash" }),
+                })
+            } else if prompt.contains("TOOL_EVAL_GREP") {
+                Some(ToolCall {
+                    name: "grep".to_string(),
+                    args: json!({
+                        "pattern": "fn ",
+                        "path": ".",
+                        "include": "*.rs",
+                        "max_matches": 5
+                    }),
+                })
+            } else if prompt.contains("TOOL_EVAL_FIND") {
+                Some(ToolCall {
+                    name: "find".to_string(),
+                    args: json!({
+                        "pattern": "*.rs",
+                        "path": ".",
+                        "max_results": 5
+                    }),
+                })
+            } else if prompt.contains("TOOL_EVAL_LS") {
+                Some(ToolCall {
+                    name: "ls".to_string(),
+                    args: json!({
+                        "path": ".",
+                        "depth": 1,
+                        "max_entries": 20
+                    }),
                 })
             } else {
                 None
@@ -2532,6 +2595,163 @@ mod tests {
             result.error_type.as_deref() == Some("tool_error")
                 && result.tool_call_stats.total_errors >= 1
         }));
+    }
+
+    #[test]
+    fn tooling_extended_fixture_batch_eval_is_machine_readable_and_stats_are_populated() {
+        let fixture = tooling_fixture_path("extended-tools.jsonl");
+        let fixture_str = fixture.to_string_lossy().to_string();
+        let eval_command = parse_cli_command(&args(&[
+            "eval",
+            "--tasks-file",
+            &fixture_str,
+            "--tools",
+            "grep,find,ls",
+        ]))
+        .expect("parse extended fixture command");
+        let tooling = resolve_tooling_from_cli(&ToolingCliConfig {
+            no_tools: false,
+            tools: Some(vec![
+                "grep".to_string(),
+                "find".to_string(),
+                "ls".to_string(),
+            ]),
+        })
+        .expect("resolve tooling");
+
+        let llm = ToolingEvalFixtureGateway;
+        let result_set =
+            execute_eval_command(eval_command, &llm, &tooling).expect("execute extended fixture");
+        assert_eq!(result_set.results.len(), 3);
+
+        for result in &result_set.results {
+            assert_eq!(
+                result.enabled_tools,
+                vec!["grep".to_string(), "find".to_string(), "ls".to_string()]
+            );
+            assert_eq!(result.outcome_or_status, "done");
+            assert_eq!(result.tool_call_stats.total_proposed, 1);
+            assert_eq!(result.tool_call_stats.total_executed, 1);
+            assert_eq!(result.tool_call_stats.total_errors, 0);
+            assert_eq!(result.tool_call_stats.by_tool.len(), 1);
+            let expected_tool = match result.task_id.as_str() {
+                "tool-grep" => "grep",
+                "tool-find" => "find",
+                "tool-ls" => "ls",
+                other => panic!("unexpected task id `{other}`"),
+            };
+            assert_eq!(result.tool_call_stats.by_tool[0].name, expected_tool);
+        }
+
+        let encoded = serde_json::to_string(&result_set).expect("serialize");
+        let decoded: Value = serde_json::from_str(&encoded).expect("decode");
+        assert!(
+            decoded
+                .get("results")
+                .and_then(Value::as_array)
+                .expect("results")
+                .iter()
+                .all(|entry| entry.get("tool_call_stats").is_some())
+        );
+    }
+
+    #[test]
+    fn tooling_layered_fixtures_batch_eval_are_machine_readable() {
+        let edit_file = PathBuf::from("target")
+            .join("agent-cli-tests")
+            .join("pr27-layered-tooling-edit.txt");
+        if let Some(parent) = edit_file.parent() {
+            fs::create_dir_all(parent).expect("create parent dir");
+        }
+        fs::write(&edit_file, "before\n").expect("seed edit target");
+
+        let fixtures = [
+            ("read-only-tools.jsonl", "read,grep,find,ls", 4usize),
+            ("write-tools.jsonl", "write,edit", 2usize),
+            ("execute-tools.jsonl", "bash", 1usize),
+        ];
+        let llm = ToolingEvalFixtureGateway;
+
+        for (name, tool_list, expected_results) in fixtures {
+            let fixture = tooling_fixture_path(name);
+            let fixture_str = fixture.to_string_lossy().to_string();
+            let eval_command = parse_cli_command(&args(&[
+                "eval",
+                "--tasks-file",
+                &fixture_str,
+                "--tools",
+                tool_list,
+            ]))
+            .expect("parse layered fixture command");
+            let tooling = resolve_tooling_from_cli(&ToolingCliConfig {
+                no_tools: false,
+                tools: Some(tool_list.split(',').map(str::to_string).collect()),
+            })
+            .expect("resolve tooling");
+
+            let result_set = execute_eval_command(eval_command, &llm, &tooling)
+                .expect("execute layered fixture eval");
+            assert_eq!(result_set.results.len(), expected_results);
+            assert!(result_set.results.iter().all(|result| {
+                result.outcome_or_status == "done"
+                    && result.tool_call_stats.total_proposed == 1
+                    && result.tool_call_stats.total_executed == 1
+            }));
+
+            let encoded = serde_json::to_string(&result_set).expect("serialize");
+            let decoded: Value = serde_json::from_str(&encoded).expect("decode");
+            assert!(
+                decoded
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .expect("results")
+                    .iter()
+                    .all(|entry| {
+                        entry.get("task_id").is_some() && entry.get("tool_call_stats").is_some()
+                    })
+            );
+        }
+
+        let _ = fs::remove_file(
+            PathBuf::from("target")
+                .join("agent-cli-tests")
+                .join("pr27-layered-tooling-write.txt"),
+        );
+        let _ = fs::remove_file(&edit_file);
+    }
+
+    #[test]
+    fn tooling_fixture_schema_is_stable_across_repeated_runs() {
+        let fixture = tooling_fixture_path("read-only-tools.jsonl");
+        let fixture_str = fixture.to_string_lossy().to_string();
+        let eval_command = parse_cli_command(&args(&[
+            "eval",
+            "--tasks-file",
+            &fixture_str,
+            "--tools",
+            "read,grep,find,ls",
+        ]))
+        .expect("parse eval fixture command");
+        let tooling = resolve_tooling_from_cli(&ToolingCliConfig {
+            no_tools: false,
+            tools: Some(vec![
+                "read".to_string(),
+                "grep".to_string(),
+                "find".to_string(),
+                "ls".to_string(),
+            ]),
+        })
+        .expect("resolve tooling");
+
+        let llm = ToolingEvalFixtureGateway;
+        let first =
+            execute_eval_command(eval_command.clone(), &llm, &tooling).expect("execute first");
+        let second = execute_eval_command(eval_command, &llm, &tooling).expect("execute second");
+
+        let first_shape = json_schema_shape(&serde_json::to_value(first).expect("to value first"));
+        let second_shape =
+            json_schema_shape(&serde_json::to_value(second).expect("to value second"));
+        assert_eq!(first_shape, second_shape);
     }
 
     struct FollowUpOnceExtension {

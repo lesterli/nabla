@@ -1,8 +1,4 @@
-use std::{
-    collections::VecDeque,
-    fs,
-    path::PathBuf,
-};
+use std::{collections::VecDeque, fs, path::PathBuf};
 
 use agent_core::tools::{Tool, ToolArgField, ToolArgSchema, ToolArgType};
 use regex::Regex;
@@ -123,8 +119,8 @@ impl Tool for FindTool {
             ));
         }
 
-        let max_results = parse_optional_positive_usize(args, "max_results")?
-            .unwrap_or(self.default_max_results);
+        let max_results =
+            parse_optional_positive_usize(args, "max_results")?.unwrap_or(self.default_max_results);
         let collect_limit = max_results + 1; // +1 for truncation detection
 
         let mut results: Vec<Value> = Vec::new();
@@ -250,10 +246,7 @@ mod tests {
         for entry in entries {
             let path = entry.get("path").and_then(|v| v.as_str()).unwrap();
             assert!(path.ends_with(".rs"), "unexpected: {path}");
-            assert_eq!(
-                entry.get("type").and_then(|v| v.as_str()),
-                Some("file")
-            );
+            assert_eq!(entry.get("type").and_then(|v| v.as_str()), Some("file"));
         }
 
         let _ = fs::remove_dir_all(&root);
@@ -387,9 +380,7 @@ mod tests {
         fs::write(root.join("src/lib.rs"), "").expect("write lib");
 
         let tool = FindTool::new(WorkspacePathSandbox::new(root.clone()));
-        let output = tool
-            .run(&json!({ "pattern": "src" }))
-            .expect("find output");
+        let output = tool.run(&json!({ "pattern": "src" })).expect("find output");
 
         let entries = output.get("entries").and_then(|v| v.as_array()).unwrap();
         assert!(entries.len() >= 1);

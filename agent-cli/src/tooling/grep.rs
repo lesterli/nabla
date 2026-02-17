@@ -89,8 +89,8 @@ impl Tool for GrepTool {
         };
 
         let include = args.get("include").and_then(Value::as_str);
-        let max_matches = parse_optional_positive_usize(args, "max_matches")?
-            .unwrap_or(self.default_max_matches);
+        let max_matches =
+            parse_optional_positive_usize(args, "max_matches")?.unwrap_or(self.default_max_matches);
 
         let mut matches: Vec<Value> = Vec::new();
         let mut files_searched: u64 = 0;
@@ -164,7 +164,6 @@ impl Tool for GrepTool {
                     }
                 }
             }
-
         }
 
         let truncated = matches.len() > max_matches;
@@ -286,10 +285,16 @@ mod tests {
     fn finds_matches_with_line_numbers() {
         let root = unique_temp_dir("basic");
         fs::create_dir_all(root.join("src")).expect("create src");
-        fs::write(root.join("src/main.rs"), "fn main() {\n    println!(\"hello\");\n}\n")
-            .expect("write main.rs");
-        fs::write(root.join("src/lib.rs"), "pub fn greet() {\n    println!(\"hi\");\n}\n")
-            .expect("write lib.rs");
+        fs::write(
+            root.join("src/main.rs"),
+            "fn main() {\n    println!(\"hello\");\n}\n",
+        )
+        .expect("write main.rs");
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn greet() {\n    println!(\"hi\");\n}\n",
+        )
+        .expect("write lib.rs");
 
         let tool = GrepTool::new(WorkspacePathSandbox::new(root.clone()));
         let output = tool
