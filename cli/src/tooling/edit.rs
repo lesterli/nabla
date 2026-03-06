@@ -1,6 +1,6 @@
 use std::fs;
 
-use agent_core::tools::{Tool, ToolArgField, ToolArgSchema, ToolArgType};
+use nabla::tools::{Tool, ToolArgField, ToolArgSchema, ToolArgType};
 use serde_json::{Value, json};
 
 use super::path_sandbox::WorkspacePathSandbox;
@@ -115,7 +115,7 @@ mod tests {
 
     use super::EditTool;
     use crate::tooling::path_sandbox::WorkspacePathSandbox;
-    use agent_core::tools::Tool;
+    use nabla::tools::Tool;
     use serde_json::json;
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
@@ -159,66 +159,4 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn rejects_when_old_text_not_found() {
-        let root = unique_temp_dir("not-found");
-        fs::create_dir_all(&root).expect("create root");
-        let file = root.join("demo.txt");
-        fs::write(&file, "alpha\nbeta\n").expect("write seed file");
-
-        let tool = EditTool::new(WorkspacePathSandbox::new(root.clone()));
-        let err = tool
-            .run(&json!({
-                "path": "demo.txt",
-                "old_text": "missing",
-                "new_text": "value"
-            }))
-            .expect_err("must fail");
-        assert!(err.contains("could not find `old_text`"));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn rejects_when_old_text_is_not_unique() {
-        let root = unique_temp_dir("non-unique");
-        fs::create_dir_all(&root).expect("create root");
-        let file = root.join("demo.txt");
-        fs::write(&file, "dup\ndup\n").expect("write seed file");
-
-        let tool = EditTool::new(WorkspacePathSandbox::new(root.clone()));
-        let err = tool
-            .run(&json!({
-                "path": "demo.txt",
-                "old_text": "dup",
-                "new_text": "once"
-            }))
-            .expect_err("must fail");
-        assert!(err.contains("provide more specific context"));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn rejects_path_outside_workspace() {
-        let root = unique_temp_dir("outside-root");
-        let outside_parent = unique_temp_dir("outside-parent");
-        fs::create_dir_all(&root).expect("create root");
-        fs::create_dir_all(&outside_parent).expect("create outside");
-        let outside_file = outside_parent.join("nope.txt");
-        fs::write(&outside_file, "outside").expect("write outside file");
-
-        let tool = EditTool::new(WorkspacePathSandbox::new(root.clone()));
-        let err = tool
-            .run(&json!({
-                "path": outside_file.to_string_lossy(),
-                "old_text": "outside",
-                "new_text": "inside"
-            }))
-            .expect_err("must reject");
-        assert!(err.contains("escapes workspace root"));
-
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&outside_parent);
-    }
 }

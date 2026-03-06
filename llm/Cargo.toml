@@ -1,11 +1,11 @@
 [package]
-name = "agent-llm"
+name = "nabla-llm"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-agent-core = { path = "../agent-core" }
+nabla = { path = "../core" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

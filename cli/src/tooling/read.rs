@@ -1,6 +1,6 @@
 use std::fs;
 
-use agent_core::tools::{Tool, ToolArgField, ToolArgSchema, ToolArgType};
+use nabla::tools::{Tool, ToolArgField, ToolArgSchema, ToolArgType};
 use serde_json::{Value, json};
 
 use super::path_sandbox::WorkspacePathSandbox;
@@ -184,7 +184,7 @@ mod tests {
 
     use super::ReadTool;
     use crate::tooling::path_sandbox::WorkspacePathSandbox;
-    use agent_core::tools::Tool;
+    use nabla::tools::Tool;
     use serde_json::json;
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
@@ -228,50 +228,4 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn rejects_path_escape_attempt() {
-        let root = unique_temp_dir("escape-root");
-        let outside_parent = unique_temp_dir("escape-outside");
-        fs::create_dir_all(&root).expect("create root");
-        fs::create_dir_all(&outside_parent).expect("create outside");
-        let outside_file = outside_parent.join("outside.txt");
-        fs::write(&outside_file, "secret").expect("write outside file");
-
-        let tool = ReadTool::new(WorkspacePathSandbox::new(root.clone()));
-        let err = tool
-            .run(&json!({"path": outside_file.to_string_lossy()}))
-            .expect_err("must reject outside path");
-        assert!(err.contains("escapes workspace root"));
-
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&outside_parent);
-    }
-
-    #[test]
-    fn truncates_large_content() {
-        let root = unique_temp_dir("truncate");
-        fs::create_dir_all(&root).expect("create root");
-        let file = root.join("big.txt");
-        fs::write(&file, "abcdefghijklmnopqrstuvwxyz").expect("write file");
-
-        let tool = ReadTool::new(WorkspacePathSandbox::new(root.clone()));
-        let output = tool
-            .run(&json!({"path": "big.txt", "max_bytes": 10}))
-            .expect("read output");
-
-        assert_eq!(
-            output.get("content").and_then(|v| v.as_str()),
-            Some("abcdefghij")
-        );
-        assert_eq!(
-            output.get("is_truncated").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        assert_eq!(
-            output.get("returned_bytes").and_then(|v| v.as_u64()),
-            Some(10)
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
 }

@@ -1,4 +1,0 @@
-{"task_id":"tool-read","prompt":"TOOL_EVAL_READ: call read tool with path='Cargo.toml', then summarize in one sentence."}
-{"task_id":"tool-write","prompt":"TOOL_EVAL_WRITE: call write tool with path='target/agent-cli-tests/pr27-tooling-write.txt' and content='tooling eval write'."}
-{"task_id":"tool-edit","prompt":"TOOL_EVAL_EDIT: call edit tool with path='target/agent-cli-tests/pr27-tooling-edit.txt', old_text='before', new_text='after'."}
-{"task_id":"tool-bash","prompt":"TOOL_EVAL_BASH: call bash tool with command='printf tooling-eval-bash'."}

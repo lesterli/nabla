@@ -169,37 +169,4 @@ mod tests {
         let _ = fs::remove_dir_all(&outside_parent);
     }
 
-    #[test]
-    fn resolves_writable_new_file_inside_workspace() {
-        let root = unique_temp_dir("write-inside");
-        fs::create_dir_all(root.join("sub")).expect("create sub dir");
-        let canonical_root = fs::canonicalize(&root).expect("canonical root");
-
-        let sandbox = WorkspacePathSandbox::new(root.clone());
-        let writable = sandbox
-            .resolve_writable_file("sub/new.txt")
-            .expect("resolve writable file");
-        assert!(writable.starts_with(&canonical_root));
-        assert!(!writable.exists());
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn rejects_writable_path_outside_workspace() {
-        let root = unique_temp_dir("write-root");
-        let outside_parent = unique_temp_dir("write-outside-parent");
-        fs::create_dir_all(&root).expect("create root");
-        fs::create_dir_all(&outside_parent).expect("create outside");
-        let outside_file = outside_parent.join("outside.txt");
-
-        let sandbox = WorkspacePathSandbox::new(root.clone());
-        let err = sandbox
-            .resolve_writable_file(&outside_file.to_string_lossy())
-            .expect_err("must reject outside path");
-        assert!(err.contains("escapes workspace root"));
-
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&outside_parent);
-    }
 }

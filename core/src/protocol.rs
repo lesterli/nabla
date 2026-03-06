@@ -359,7 +359,7 @@ mod tests {
     fn protocol_schema_budget_exceeded_event_json_shape_is_stable() {
         let event = Event::new(
             "submission-42".to_string(),
-            12,
+            13,
             EventKind::BudgetExceeded {
                 budget: BudgetKind::ToolCalls,
                 limit: 3,
@@ -369,7 +369,7 @@ mod tests {
         let expected = r#"{
   "schema_version": 1,
   "submission_id": "submission-42",
-  "index": 12,
+  "index": 13,
   "kind": {
     "kind": "budget_exceeded",
     "budget": "tool_calls",
@@ -385,7 +385,7 @@ mod tests {
     fn protocol_schema_turn_stopped_with_budget_fact_json_shape_is_stable() {
         let event = Event::new(
             "submission-42".to_string(),
-            13,
+            14,
             EventKind::TurnStopped {
                 reason: StopReason::BudgetExceeded,
                 facts: Some(StopFacts {
@@ -407,7 +407,7 @@ mod tests {
         let expected = r#"{
   "schema_version": 1,
   "submission_id": "submission-42",
-  "index": 13,
+  "index": 14,
   "kind": {
     "kind": "turn_stopped",
     "reason": "budget_exceeded",

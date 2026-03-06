@@ -1,5 +1,5 @@
-use agent_core::tools::ToolRegistry;
-use agent_llm::OpenAiFunctionTool;
+use nabla::tools::ToolRegistry;
+use nabla_llm::OpenAiFunctionTool;
 use serde_json::json;
 
 use super::bash::BashTool;

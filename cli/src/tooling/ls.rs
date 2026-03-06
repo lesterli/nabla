@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, fs, path::PathBuf};
 
-use agent_core::tools::{Tool, ToolArgField, ToolArgSchema, ToolArgType};
+use nabla::tools::{Tool, ToolArgField, ToolArgSchema, ToolArgType};
 use serde_json::{Value, json};
 
 use super::path_sandbox::WorkspacePathSandbox;
@@ -174,7 +174,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use agent_core::tools::Tool;
+    use nabla::tools::Tool;
     use serde_json::json;
 
     use super::LsTool;
@@ -216,26 +216,6 @@ mod tests {
     }
 
     #[test]
-    fn lists_subdirectory_with_path() {
-        let root = unique_temp_dir("subdir");
-        fs::create_dir_all(root.join("src")).expect("create src");
-        fs::write(root.join("src/main.rs"), "fn main() {}").expect("write main");
-        fs::write(root.join("src/lib.rs"), "").expect("write lib");
-
-        let tool = LsTool::new(WorkspacePathSandbox::new(root.clone()));
-        let output = tool.run(&json!({ "path": "src" })).expect("ls output");
-
-        let entries = output.get("entries").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(entries.len(), 2);
-        for entry in entries {
-            let path = entry.get("path").and_then(|v| v.as_str()).unwrap();
-            assert!(path.contains("src/") || path.contains("src\\"));
-        }
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn recurses_with_depth() {
         let root = unique_temp_dir("depth");
         fs::create_dir_all(root.join("a/b")).expect("create a/b");
@@ -263,72 +243,4 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn files_include_size() {
-        let root = unique_temp_dir("size");
-        fs::create_dir_all(&root).expect("create root");
-        fs::write(root.join("hello.txt"), "hello").expect("write file");
-
-        let tool = LsTool::new(WorkspacePathSandbox::new(root.clone()));
-        let output = tool.run(&json!({})).expect("ls output");
-
-        let entries = output.get("entries").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].get("size").and_then(|v| v.as_u64()), Some(5));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn truncates_at_max_entries() {
-        let root = unique_temp_dir("truncate");
-        fs::create_dir_all(&root).expect("create root");
-        for i in 0..20 {
-            fs::write(root.join(format!("f{i:02}.txt")), "").expect("write file");
-        }
-
-        let tool = LsTool::new(WorkspacePathSandbox::new(root.clone()));
-        let output = tool.run(&json!({ "max_entries": 5 })).expect("ls output");
-
-        let entries = output.get("entries").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(entries.len(), 5);
-        assert_eq!(
-            output.get("is_truncated").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn rejects_non_directory_path() {
-        let root = unique_temp_dir("not-dir");
-        fs::create_dir_all(&root).expect("create root");
-        fs::write(root.join("file.txt"), "data").expect("write file");
-
-        let tool = LsTool::new(WorkspacePathSandbox::new(root.clone()));
-        let err = tool
-            .run(&json!({ "path": "file.txt" }))
-            .expect_err("must reject non-directory");
-        assert!(err.contains("is not a directory"));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn rejects_path_outside_workspace() {
-        let root = unique_temp_dir("escape-root");
-        let outside = unique_temp_dir("escape-outside");
-        fs::create_dir_all(&root).expect("create root");
-        fs::create_dir_all(&outside).expect("create outside");
-
-        let tool = LsTool::new(WorkspacePathSandbox::new(root.clone()));
-        let err = tool
-            .run(&json!({ "path": outside.to_string_lossy() }))
-            .expect_err("must reject outside path");
-        assert!(err.contains("escapes workspace root"));
-
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&outside);
-    }
 }

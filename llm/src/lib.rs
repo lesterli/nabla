@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Mutex, thread, time::Duration};
 
-use agent_core::{
+use nabla::{
     protocol::{Event, ToolCall},
     runtime::{LlmGateway, LlmOutput, LlmUsageSnapshot},
 };
@@ -485,34 +485,34 @@ fn build_recent_context_message(
 
 fn summarize_event_for_context(event: &Event) -> Option<String> {
     let line = match &event.kind {
-        agent_core::protocol::EventKind::UserInput { input } => {
+        nabla::protocol::EventKind::UserInput { input } => {
             format!(
                 "event#{} user_input: {}",
                 event.index,
                 truncate_text(input, DEFAULT_EVENT_TEXT_MAX_CHARS)
             )
         }
-        agent_core::protocol::EventKind::LlmText { text } => {
+        nabla::protocol::EventKind::LlmText { text } => {
             format!(
                 "event#{} llm_text: {}",
                 event.index,
                 truncate_text(text, DEFAULT_EVENT_TEXT_MAX_CHARS)
             )
         }
-        agent_core::protocol::EventKind::ToolCallProposed { call } => format!(
+        nabla::protocol::EventKind::ToolCallProposed { call } => format!(
             "event#{} tool_call: {} args={}",
             event.index,
             call.name,
             compact_json(&call.args, DEFAULT_EVENT_TEXT_MAX_CHARS)
         ),
-        agent_core::protocol::EventKind::ToolExecuted { result } => format!(
+        nabla::protocol::EventKind::ToolExecuted { result } => format!(
             "event#{} tool_executed: {} is_error={} output={}",
             event.index,
             result.call_name,
             result.is_error,
             compact_json(&result.output, DEFAULT_EVENT_TEXT_MAX_CHARS)
         ),
-        agent_core::protocol::EventKind::HumanApprovalRequested {
+        nabla::protocol::EventKind::HumanApprovalRequested {
             request_id, reason, ..
         } => format!(
             "event#{} approval_requested: request_id={} reason={}",
@@ -520,7 +520,7 @@ fn summarize_event_for_context(event: &Event) -> Option<String> {
             request_id,
             truncate_text(reason, DEFAULT_EVENT_TEXT_MAX_CHARS)
         ),
-        agent_core::protocol::EventKind::HumanApprovalResolved {
+        nabla::protocol::EventKind::HumanApprovalResolved {
             request_id,
             approved,
             reason,
@@ -534,12 +534,12 @@ fn summarize_event_for_context(event: &Event) -> Option<String> {
                 DEFAULT_EVENT_TEXT_MAX_CHARS
             )
         ),
-        agent_core::protocol::EventKind::LlmError { message } => format!(
+        nabla::protocol::EventKind::LlmError { message } => format!(
             "event#{} llm_error: {}",
             event.index,
             truncate_text(message, DEFAULT_EVENT_TEXT_MAX_CHARS)
         ),
-        agent_core::protocol::EventKind::TurnStopped { reason, facts } => {
+        nabla::protocol::EventKind::TurnStopped { reason, facts } => {
             if let Some(facts) = facts {
                 format!(
                     "event#{} turn_stopped: {:?} tool_errors={} pending_approval={}",
@@ -784,7 +784,7 @@ mod tests {
         build_recent_context_message, extract_openai_message_text,
         parse_openai_chat_completions_response,
     };
-    use agent_core::{
+    use nabla::{
         memory::{EventStore, InMemoryEventStore},
         policy::AllowAllPolicy,
         protocol::{Event, EventKind, Op, StopReason, ToolCall},
@@ -960,7 +960,7 @@ mod tests {
                 "sub-ctx".to_string(),
                 2,
                 EventKind::ToolExecuted {
-                    result: agent_core::protocol::ToolResult {
+                    result: nabla::protocol::ToolResult {
                         call_name: "echo".to_string(),
                         output: json!({ "echo": "tool output line" }),
                         is_error: false,
@@ -1005,7 +1005,7 @@ mod tests {
                 "sub-trunc".to_string(),
                 3,
                 EventKind::ToolExecuted {
-                    result: agent_core::protocol::ToolResult {
+                    result: nabla::protocol::ToolResult {
                         call_name: "echo".to_string(),
                         output: json!({ "echo": "newest context should survive" }),
                         is_error: false,

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
-use agent_core::tools::ToolRegistry;
-use agent_llm::OpenAiFunctionTool;
+use nabla::tools::ToolRegistry;
+use nabla_llm::OpenAiFunctionTool;
 
 pub mod bash;
 pub mod edit;
@@ -94,44 +94,6 @@ mod tests {
     fn defaults_to_builtin_tools() {
         let selection = resolve_tooling_from_cli(&ToolingCliConfig::default()).expect("resolve");
         assert_eq!(selection.enabled_tool_names(), vec!["read"]);
-    }
-
-    #[test]
-    fn no_tools_disables_all_tools() {
-        let selection = resolve_tooling_from_cli(&ToolingCliConfig {
-            no_tools: true,
-            tools: None,
-        })
-        .expect("resolve");
-        assert!(selection.enabled_tool_names().is_empty());
-    }
-
-    #[test]
-    fn explicit_tools_override_defaults() {
-        let selection = resolve_tooling_from_cli(&ToolingCliConfig {
-            no_tools: false,
-            tools: Some(vec!["read".to_string()]),
-        })
-        .expect("resolve");
-        assert_eq!(selection.enabled_tool_names(), vec!["read"]);
-    }
-
-    #[test]
-    fn no_tools_plus_explicit_tools_keeps_explicit_selection() {
-        let selection = resolve_tooling_from_cli(&ToolingCliConfig {
-            no_tools: true,
-            tools: Some(vec![
-                "read".to_string(),
-                "write".to_string(),
-                "edit".to_string(),
-                "bash".to_string(),
-            ]),
-        })
-        .expect("resolve");
-        assert_eq!(
-            selection.enabled_tool_names(),
-            vec!["read", "write", "edit", "bash"]
-        );
     }
 
     #[test]

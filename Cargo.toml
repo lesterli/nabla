@@ -1,5 +1,5 @@
 [workspace]
-members = ["agent-core", "agent-llm", "agent-cli"]
+members = ["core", "llm", "cli"]
 resolver = "2"
 
 [workspace.package]

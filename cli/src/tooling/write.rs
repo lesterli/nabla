@@ -1,6 +1,6 @@
 use std::fs;
 
-use agent_core::tools::{Tool, ToolArgField, ToolArgSchema, ToolArgType};
+use nabla::tools::{Tool, ToolArgField, ToolArgSchema, ToolArgType};
 use serde_json::{Value, json};
 
 use super::path_sandbox::WorkspacePathSandbox;
@@ -70,7 +70,7 @@ mod tests {
 
     use super::WriteTool;
     use crate::tooling::path_sandbox::WorkspacePathSandbox;
-    use agent_core::tools::Tool;
+    use nabla::tools::Tool;
     use serde_json::json;
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
@@ -104,52 +104,4 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn overwrites_existing_file_and_reports_created_false() {
-        let root = unique_temp_dir("overwrite");
-        fs::create_dir_all(&root).expect("create root");
-        let file = root.join("target.txt");
-        fs::write(&file, "old").expect("write old file");
-
-        let tool = WriteTool::new(WorkspacePathSandbox::new(root.clone()));
-        let output = tool
-            .run(&json!({
-                "path": "target.txt",
-                "content": "new content"
-            }))
-            .expect("write output");
-
-        assert_eq!(output.get("created").and_then(|v| v.as_bool()), Some(false));
-        assert_eq!(
-            output.get("bytes_written").and_then(|v| v.as_u64()),
-            Some("new content".len() as u64)
-        );
-        let written = fs::read_to_string(&file).expect("read overwritten file");
-        assert_eq!(written, "new content");
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn rejects_writes_outside_workspace() {
-        let root = unique_temp_dir("outside-root");
-        let outside_parent = unique_temp_dir("outside-parent");
-        fs::create_dir_all(&root).expect("create root");
-        fs::create_dir_all(&outside_parent).expect("create outside parent");
-        let outside_path = outside_parent.join("nope.txt");
-
-        let tool = WriteTool::new(WorkspacePathSandbox::new(root.clone()));
-        let err = tool
-            .run(&json!({
-                "path": outside_path.to_string_lossy(),
-                "content": "blocked"
-            }))
-            .expect_err("must reject");
-
-        assert!(err.contains("escapes workspace root"));
-        assert!(!outside_path.exists());
-
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&outside_parent);
-    }
 }

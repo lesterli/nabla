@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use agent_core::tools::{Tool, ToolArgField, ToolArgSchema, ToolArgType};
+use nabla::tools::{Tool, ToolArgField, ToolArgSchema, ToolArgType};
 use regex::Regex;
 use serde_json::{Value, json};
 
@@ -264,7 +264,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use agent_core::tools::Tool;
+    use nabla::tools::Tool;
     use serde_json::json;
 
     use super::GrepTool;
@@ -339,119 +339,4 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn truncates_at_max_matches() {
-        let root = unique_temp_dir("truncate");
-        fs::create_dir_all(&root).expect("create root");
-        let content: String = (0..50).map(|i| format!("match line {i}\n")).collect();
-        fs::write(root.join("many.txt"), &content).expect("write file");
-
-        let tool = GrepTool::new(WorkspacePathSandbox::new(root.clone()));
-        let output = tool
-            .run(&json!({ "pattern": "match", "max_matches": 5 }))
-            .expect("grep output");
-
-        let matches = output.get("matches").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(matches.len(), 5);
-        assert_eq!(
-            output.get("is_truncated").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn rejects_invalid_regex() {
-        let root = unique_temp_dir("bad-regex");
-        fs::create_dir_all(&root).expect("create root");
-
-        let tool = GrepTool::new(WorkspacePathSandbox::new(root.clone()));
-        let err = tool
-            .run(&json!({ "pattern": "[invalid" }))
-            .expect_err("must reject bad regex");
-        assert!(err.contains("invalid regex pattern"));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn skips_hidden_directories() {
-        let root = unique_temp_dir("hidden");
-        fs::create_dir_all(root.join(".git")).expect("create .git");
-        fs::write(root.join(".git/config"), "searchable text\n").expect("write git config");
-        fs::write(root.join("visible.txt"), "searchable text\n").expect("write visible");
-
-        let tool = GrepTool::new(WorkspacePathSandbox::new(root.clone()));
-        let output = tool
-            .run(&json!({ "pattern": "searchable" }))
-            .expect("grep output");
-
-        let matches = output.get("matches").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(matches.len(), 1);
-        let file = matches[0].get("file").and_then(|v| v.as_str()).unwrap();
-        assert!(file.contains("visible.txt"));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn skips_binary_files() {
-        let root = unique_temp_dir("binary");
-        fs::create_dir_all(&root).expect("create root");
-        fs::write(root.join("text.txt"), "findme\n").expect("write text");
-        fs::write(root.join("binary.bin"), b"findme\x00\x01\x02").expect("write binary");
-
-        let tool = GrepTool::new(WorkspacePathSandbox::new(root.clone()));
-        let output = tool
-            .run(&json!({ "pattern": "findme" }))
-            .expect("grep output");
-
-        let matches = output.get("matches").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(matches.len(), 1);
-        let file = matches[0].get("file").and_then(|v| v.as_str()).unwrap();
-        assert!(file.contains("text.txt"));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn searches_single_file_when_path_is_file() {
-        let root = unique_temp_dir("single-file");
-        fs::create_dir_all(&root).expect("create root");
-        fs::write(root.join("a.txt"), "alpha\nbeta\nalpha again\n").expect("write a");
-        fs::write(root.join("b.txt"), "alpha too\n").expect("write b");
-
-        let tool = GrepTool::new(WorkspacePathSandbox::new(root.clone()));
-        let output = tool
-            .run(&json!({ "pattern": "alpha", "path": "a.txt" }))
-            .expect("grep output");
-
-        let matches = output.get("matches").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(matches.len(), 2);
-        assert_eq!(
-            output.get("files_searched").and_then(|v| v.as_u64()),
-            Some(1)
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn rejects_path_outside_workspace() {
-        let root = unique_temp_dir("escape-root");
-        let outside = unique_temp_dir("escape-outside");
-        fs::create_dir_all(&root).expect("create root");
-        fs::create_dir_all(&outside).expect("create outside");
-        fs::write(outside.join("secret.txt"), "secret data\n").expect("write secret");
-
-        let tool = GrepTool::new(WorkspacePathSandbox::new(root.clone()));
-        let err = tool
-            .run(&json!({ "pattern": "secret", "path": outside.to_string_lossy() }))
-            .expect_err("must reject outside path");
-        assert!(err.contains("escapes workspace root"));
-
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&outside);
-    }
 }

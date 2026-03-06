@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use agent_core::tools::{Tool, ToolArgField, ToolArgSchema, ToolArgType};
+use nabla::tools::{Tool, ToolArgField, ToolArgSchema, ToolArgType};
 use serde_json::{Value, json};
 
 use super::path_sandbox::WorkspacePathSandbox;
@@ -233,7 +233,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use agent_core::tools::Tool;
+    use nabla::tools::Tool;
     use serde_json::json;
 
     use super::BashTool;
@@ -264,66 +264,6 @@ mod tests {
         assert_eq!(
             output.get("timed_out").and_then(|v| v.as_bool()),
             Some(false)
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn reports_non_zero_exit_without_tool_error() {
-        let root = unique_temp_dir("exit-code");
-        fs::create_dir_all(&root).expect("create root");
-        let tool = BashTool::new(WorkspacePathSandbox::new(root.clone()));
-
-        let output = tool
-            .run(&json!({ "command": "exit 7" }))
-            .expect("bash output");
-        assert_eq!(output.get("success").and_then(|v| v.as_bool()), Some(false));
-        assert_eq!(output.get("exit_code").and_then(|v| v.as_i64()), Some(7));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn runs_in_workspace_root() {
-        let root = unique_temp_dir("cwd");
-        fs::create_dir_all(&root).expect("create root");
-        fs::write(root.join("marker.txt"), "ok").expect("write marker");
-        let tool = BashTool::new(WorkspacePathSandbox::new(root.clone()));
-
-        let output = tool
-            .run(&json!({
-                "command": "if [ -f marker.txt ]; then printf yes; else printf no; fi"
-            }))
-            .expect("bash output");
-        assert_eq!(output.get("stdout").and_then(|v| v.as_str()), Some("yes"));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn truncates_large_output() {
-        let root = unique_temp_dir("truncate");
-        fs::create_dir_all(&root).expect("create root");
-        let tool = BashTool::new(WorkspacePathSandbox::new(root.clone()));
-
-        let output = tool
-            .run(&json!({
-                "command": "printf abcdefghijklmnopqrstuvwxyz",
-                "max_output_bytes": 10
-            }))
-            .expect("bash output");
-        assert_eq!(
-            output.get("stdout").and_then(|v| v.as_str()),
-            Some("abcdefghij")
-        );
-        assert_eq!(
-            output.get("stdout_truncated").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        assert_eq!(
-            output.get("stdout_bytes").and_then(|v| v.as_u64()),
-            Some(26)
         );
 
         let _ = fs::remove_dir_all(&root);

@@ -3,35 +3,6 @@
 version = 4
 
 [[package]]
-name = "agent-cli"
-version = "0.1.0"
-dependencies = [
- "agent-core",
- "agent-llm",
- "regex",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "agent-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "agent-llm"
-version = "0.1.0"
-dependencies = [
- "agent-core",
- "reqwest",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -468,6 +439,35 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nabla"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nabla-cli"
+version = "0.1.0"
+dependencies = [
+ "nabla",
+ "nabla-llm",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nabla-llm"
+version = "0.1.0"
+dependencies = [
+ "nabla",
+ "reqwest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

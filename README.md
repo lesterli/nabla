@@ -1,6 +1,6 @@
-# agent-rs
+# Nabla
 
-A Pi-style coding agent in Rust
+A simple AI4Science agent
 
 ## LLM Provider Setup
 
@@ -34,3 +34,32 @@ Expected additional events in output when tool-calling is triggered:
 - `tool_call_proposed`
 - `policy_evaluated`
 - `tool_executed`
+
+## PDE Workflow Mode
+
+`agent-cli` now supports a PDE-oriented research workflow that drives the agent through:
+
+1. `understand`
+2. `improve`
+3. `verify`
+4. `reproduce`
+
+Run it with a persistent event store:
+
+```bash
+cargo run -p agent-cli -- run \
+  --workflow pde \
+  --submission-id pde-exp-1 \
+  --store-file /tmp/pde-exp-1.jsonl \
+  "Improve the PDE neural-operator baseline and leave a reproducible report."
+```
+
+The CLI orchestrates the workflow on top of the existing runtime and emits workflow events such as:
+- `workflow_started`
+- `workflow_phase_started`
+- `workflow_phase_completed`
+- `workflow_completed`
+
+Internally, the workflow logic now lives in `agent-orchestrator` rather than in
+the CLI adapter, which is the first step toward a general AI4Science agent
+substrate.

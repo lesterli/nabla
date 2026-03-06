@@ -1,4 +1,4 @@
-use agent_core::protocol::{Event, StopFacts, StopReason};
+use nabla::protocol::{Event, StopFacts, StopReason};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NextAction {

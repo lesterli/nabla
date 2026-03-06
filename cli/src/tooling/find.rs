@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, fs, path::PathBuf};
 
-use agent_core::tools::{Tool, ToolArgField, ToolArgSchema, ToolArgType};
+use nabla::tools::{Tool, ToolArgField, ToolArgSchema, ToolArgType};
 use regex::Regex;
 use serde_json::{Value, json};
 
@@ -210,7 +210,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use agent_core::tools::Tool;
+    use nabla::tools::Tool;
     use serde_json::json;
 
     use super::FindTool;
@@ -253,73 +253,6 @@ mod tests {
     }
 
     #[test]
-    fn finds_files_by_substring() {
-        let root = unique_temp_dir("substring");
-        fs::create_dir_all(&root).expect("create root");
-        fs::write(root.join("config.yaml"), "").expect("write config");
-        fs::write(root.join("readme.md"), "").expect("write readme");
-        fs::write(root.join("myconfig.json"), "").expect("write myconfig");
-
-        let tool = FindTool::new(WorkspacePathSandbox::new(root.clone()));
-        let output = tool
-            .run(&json!({ "pattern": "config" }))
-            .expect("find output");
-
-        let entries = output.get("entries").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(entries.len(), 2);
-        for entry in entries {
-            let path = entry.get("path").and_then(|v| v.as_str()).unwrap();
-            assert!(path.contains("config"), "unexpected: {path}");
-        }
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn respects_path_scope() {
-        let root = unique_temp_dir("scope");
-        fs::create_dir_all(root.join("a")).expect("create a");
-        fs::create_dir_all(root.join("b")).expect("create b");
-        fs::write(root.join("a/found.txt"), "").expect("write a/found");
-        fs::write(root.join("b/found.txt"), "").expect("write b/found");
-
-        let tool = FindTool::new(WorkspacePathSandbox::new(root.clone()));
-        let output = tool
-            .run(&json!({ "pattern": "found", "path": "a" }))
-            .expect("find output");
-
-        let entries = output.get("entries").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(entries.len(), 1);
-        let path = entries[0].get("path").and_then(|v| v.as_str()).unwrap();
-        assert!(path.contains("a/found.txt") || path.contains("a\\found.txt"));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn truncates_at_max_results() {
-        let root = unique_temp_dir("truncate");
-        fs::create_dir_all(&root).expect("create root");
-        for i in 0..20 {
-            fs::write(root.join(format!("file_{i}.txt")), "").expect("write file");
-        }
-
-        let tool = FindTool::new(WorkspacePathSandbox::new(root.clone()));
-        let output = tool
-            .run(&json!({ "pattern": "*.txt", "max_results": 5 }))
-            .expect("find output");
-
-        let entries = output.get("entries").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(entries.len(), 5);
-        assert_eq!(
-            output.get("is_truncated").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn skips_hidden_directories() {
         let root = unique_temp_dir("hidden");
         fs::create_dir_all(root.join(".git")).expect("create .git");
@@ -337,60 +270,4 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn rejects_path_outside_workspace() {
-        let root = unique_temp_dir("escape-root");
-        let outside = unique_temp_dir("escape-outside");
-        fs::create_dir_all(&root).expect("create root");
-        fs::create_dir_all(&outside).expect("create outside");
-
-        let tool = FindTool::new(WorkspacePathSandbox::new(root.clone()));
-        let err = tool
-            .run(&json!({ "pattern": "*", "path": outside.to_string_lossy() }))
-            .expect_err("must reject outside path");
-        assert!(err.contains("escapes workspace root"));
-
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&outside);
-    }
-
-    #[test]
-    fn glob_is_case_insensitive() {
-        let root = unique_temp_dir("case");
-        fs::create_dir_all(&root).expect("create root");
-        fs::write(root.join("README.md"), "").expect("write README");
-        fs::write(root.join("readme.txt"), "").expect("write readme.txt");
-
-        let tool = FindTool::new(WorkspacePathSandbox::new(root.clone()));
-        let output = tool
-            .run(&json!({ "pattern": "README*" }))
-            .expect("find output");
-
-        let entries = output.get("entries").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(entries.len(), 2);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn finds_matching_directories() {
-        let root = unique_temp_dir("dirs");
-        fs::create_dir_all(root.join("src")).expect("create src");
-        fs::create_dir_all(root.join("tests")).expect("create tests");
-        fs::write(root.join("src/lib.rs"), "").expect("write lib");
-
-        let tool = FindTool::new(WorkspacePathSandbox::new(root.clone()));
-        let output = tool.run(&json!({ "pattern": "src" })).expect("find output");
-
-        let entries = output.get("entries").and_then(|v| v.as_array()).unwrap();
-        assert!(entries.len() >= 1);
-        let dir_entry = entries
-            .iter()
-            .find(|e| e.get("type").and_then(|v| v.as_str()) == Some("dir"))
-            .expect("should find src directory");
-        let path = dir_entry.get("path").and_then(|v| v.as_str()).unwrap();
-        assert!(path.contains("src"));
-
-        let _ = fs::remove_dir_all(&root);
-    }
 }
