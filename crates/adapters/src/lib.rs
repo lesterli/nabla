@@ -2,7 +2,13 @@ use anyhow::Result;
 use nabla_contracts::{
     PaperRecord, ProjectBrief, ScreeningDecision, ScreeningLabel, TopicCandidate,
 };
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
+use std::process::{Command, Stdio};
+use tempfile::NamedTempFile;
 
 pub trait AgentAdapter {
     fn name(&self) -> &'static str;
@@ -13,6 +19,105 @@ pub trait AgentAdapter {
         papers: &[PaperRecord],
         decisions: &[ScreeningDecision],
     ) -> Result<Vec<TopicCandidate>>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum LocalCliProvider {
+    Codex,
+}
+
+pub struct LocalCliAdapter {
+    provider: LocalCliProvider,
+}
+
+impl LocalCliAdapter {
+    pub fn codex() -> Self {
+        Self {
+            provider: LocalCliProvider::Codex,
+        }
+    }
+
+    fn run_with_schema<T: DeserializeOwned>(&self, prompt: &str, schema: serde_json::Value) -> Result<T> {
+        match self.provider {
+            LocalCliProvider::Codex => self.run_codex(prompt, schema),
+        }
+    }
+
+    fn run_codex<T: DeserializeOwned>(&self, prompt: &str, schema: serde_json::Value) -> Result<T> {
+        let mut schema_file = NamedTempFile::new()?;
+        serde_json::to_writer_pretty(schema_file.as_file_mut(), &schema)?;
+        schema_file.as_file_mut().flush()?;
+
+        let output_file = NamedTempFile::new()?;
+        let output_path = output_file.into_temp_path();
+
+        let mut child = Command::new("codex")
+            .args([
+                "exec",
+                "--skip-git-repo-check",
+                "--sandbox",
+                "read-only",
+                "--color",
+                "never",
+                "--output-schema",
+            ])
+            .arg(schema_file.path())
+            .arg("--output-last-message")
+            .arg(&output_path)
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        {
+            let mut stdin = child.stdin.take().expect("stdin was configured as piped");
+            stdin.write_all(prompt.as_bytes())?;
+            // stdin drops here, closing the pipe so codex sees EOF
+        }
+
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "codex exec failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
+        let response_text = std::fs::read_to_string(&output_path)?;
+        let parsed = serde_json::from_str::<T>(&response_text)
+            .map_err(|err| anyhow::anyhow!("parse codex JSON output: {err}; body={response_text}"))?;
+        Ok(parsed)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ScreeningResponse {
+    items: Vec<ScreeningItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScreeningItem {
+    paper_id: String,
+    label: String,
+    rationale: String,
+    tags: Vec<String>,
+    confidence: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TopicResponse {
+    items: Vec<TopicItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TopicItem {
+    title: String,
+    why_now: String,
+    scope: String,
+    representative_paper_ids: Vec<String>,
+    entry_risk: String,
+    fallback_scope: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -169,6 +274,215 @@ impl AgentAdapter for MockAgentAdapter {
     }
 }
 
+impl AgentAdapter for LocalCliAdapter {
+    fn name(&self) -> &'static str {
+        match self.provider {
+            LocalCliProvider::Codex => "codex",
+        }
+    }
+
+    fn screen(&self, brief: &ProjectBrief, papers: &[PaperRecord]) -> Result<Vec<ScreeningDecision>> {
+        let papers_payload: Vec<_> = papers
+            .iter()
+            .map(|paper| {
+                json!({
+                    "paper_id": paper.paper_id.as_key(),
+                    "title": paper.title,
+                    "year": paper.year,
+                    "abstract_text": paper.abstract_text,
+                })
+            })
+            .collect();
+        let brief_payload = json!({
+            "goal": brief.goal,
+            "constraints": brief.constraints,
+            "keywords": brief.keywords,
+        });
+        let prompt = format!(
+            "You are screening papers for a research topic selection workflow.\n\
+Project brief:\n{}\n\
+Papers:\n{}\n\
+For every paper, assign exactly one label from include/maybe/exclude. Keep rationale concise and use at most two tags.",
+            serde_json::to_string_pretty(&brief_payload)?,
+            serde_json::to_string_pretty(&papers_payload)?
+        );
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "paper_id": { "type": "string" },
+                            "label": { "type": "string", "enum": ["include", "maybe", "exclude"] },
+                            "rationale": { "type": "string" },
+                            "tags": { "type": "array", "items": { "type": "string" } },
+                            "confidence": { "type": ["number", "null"] }
+                        },
+                        "required": ["paper_id", "label", "rationale", "tags", "confidence"]
+                    }
+                }
+            },
+            "required": ["items"]
+        });
+
+        let response: ScreeningResponse = self.run_with_schema(&prompt, schema)?;
+        let paper_ids: BTreeMap<String, _> = papers
+            .iter()
+            .map(|paper| (paper.paper_id.as_key(), paper.paper_id.clone()))
+            .collect();
+
+        response
+            .items
+            .into_iter()
+            .map(|item| {
+                let label = match item.label.as_str() {
+                    "include" => ScreeningLabel::Include,
+                    "maybe" => ScreeningLabel::Maybe,
+                    "exclude" => ScreeningLabel::Exclude,
+                    other => return Err(anyhow::anyhow!("unknown screening label: {other}")),
+                };
+                let paper_id = paper_ids
+                    .get(&item.paper_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("screening response referenced unknown paper_id {}", item.paper_id))?;
+                Ok(ScreeningDecision {
+                    project_id: brief.id.clone(),
+                    paper_id,
+                    label,
+                    rationale: item.rationale,
+                    tags: item.tags,
+                    confidence: item.confidence,
+                })
+            })
+            .collect()
+    }
+
+    fn propose(
+        &self,
+        brief: &ProjectBrief,
+        papers: &[PaperRecord],
+        decisions: &[ScreeningDecision],
+    ) -> Result<Vec<TopicCandidate>> {
+        let paper_map: BTreeMap<String, _> = papers
+            .iter()
+            .map(|paper| {
+                (
+                    paper.paper_id.as_key(),
+                    json!({
+                        "paper_id": paper.paper_id.as_key(),
+                        "title": paper.title,
+                        "year": paper.year,
+                        "abstract_text": paper.abstract_text,
+                    }),
+                )
+            })
+            .collect();
+        let decisions_payload: Vec<_> = decisions
+            .iter()
+            .map(|decision| {
+                json!({
+                    "paper_id": decision.paper_id.as_key(),
+                    "label": match decision.label {
+                        ScreeningLabel::Include => "include",
+                        ScreeningLabel::Maybe => "maybe",
+                        ScreeningLabel::Exclude => "exclude",
+                    },
+                    "rationale": decision.rationale,
+                    "tags": decision.tags,
+                    "confidence": decision.confidence,
+                })
+            })
+            .collect();
+        let brief_payload = json!({
+            "goal": brief.goal,
+            "constraints": brief.constraints,
+            "keywords": brief.keywords,
+        });
+        let prompt = format!(
+            "You are proposing candidate research directions from screened papers.\n\
+Project brief:\n{}\n\
+Papers:\n{}\n\
+Screening decisions:\n{}\n\
+Generate 2 to 3 candidate topic directions. Only use paper_ids from the provided papers.",
+            serde_json::to_string_pretty(&brief_payload)?,
+            serde_json::to_string_pretty(&paper_map.values().collect::<Vec<_>>())?,
+            serde_json::to_string_pretty(&decisions_payload)?,
+        );
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 3,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "title": { "type": "string" },
+                            "why_now": { "type": "string" },
+                            "scope": { "type": "string" },
+                            "representative_paper_ids": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "entry_risk": { "type": "string" },
+                            "fallback_scope": { "type": "string" }
+                        },
+                        "required": [
+                            "title",
+                            "why_now",
+                            "scope",
+                            "representative_paper_ids",
+                            "entry_risk",
+                            "fallback_scope"
+                        ]
+                    }
+                }
+            },
+            "required": ["items"]
+        });
+        let response: TopicResponse = self.run_with_schema(&prompt, schema)?;
+        let paper_ids: BTreeMap<String, _> = papers
+            .iter()
+            .map(|paper| (paper.paper_id.as_key(), paper.paper_id.clone()))
+            .collect();
+
+        response
+            .items
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let representative_paper_ids = item
+                    .representative_paper_ids
+                    .into_iter()
+                    .map(|paper_id| {
+                        paper_ids
+                            .get(&paper_id)
+                            .cloned()
+                            .ok_or_else(|| anyhow::anyhow!("topic response referenced unknown paper_id {paper_id}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(TopicCandidate {
+                    id: format!("topic-{}", index + 1),
+                    project_id: brief.id.clone(),
+                    title: item.title,
+                    why_now: item.why_now,
+                    scope: item.scope,
+                    representative_paper_ids,
+                    entry_risk: item.entry_risk,
+                    fallback_scope: item.fallback_scope,
+                })
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AgentAdapter, MockAgentAdapter};
@@ -241,4 +555,3 @@ mod tests {
         assert!(!topics.is_empty(), "should produce fallback topics even when all excluded");
     }
 }
-

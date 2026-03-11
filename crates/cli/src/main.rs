@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use nabla_adapters::MockAgentAdapter;
+use nabla_adapters::{AgentAdapter, LocalCliAdapter, MockAgentAdapter};
 use nabla_contracts::ProjectBrief;
 use nabla_sources::{ArxivSource, CompositeCollector, OpenAlexSource};
 use nabla_storage::SqliteStorage;
@@ -25,6 +25,9 @@ struct Args {
 
     #[arg(long, default_value_t = 10)]
     arxiv_limit: usize,
+
+    #[arg(long, default_value = "codex")]
+    adapter: String,
 }
 
 fn main() -> Result<()> {
@@ -35,8 +38,12 @@ fn main() -> Result<()> {
         Box::new(ArxivSource::new(args.arxiv_limit)),
     ]);
     let storage = SqliteStorage::open(&args.db, &args.artifacts_dir)?;
-    let adapter = MockAgentAdapter;
-    let workflow = TopicWorkflow::new(&collector, &adapter, &storage);
+    let adapter_box: Box<dyn AgentAdapter> = match args.adapter.as_str() {
+        "codex" => Box::new(LocalCliAdapter::codex()),
+        "mock" => Box::new(MockAgentAdapter),
+        other => anyhow::bail!("unsupported adapter: {other}"),
+    };
+    let workflow = TopicWorkflow::new(&collector, adapter_box.as_ref(), &storage);
     let output = workflow.run(&brief)?;
 
     println!("Run completed");
@@ -57,4 +64,3 @@ fn read_brief(path: &Path) -> Result<ProjectBrief> {
     let brief = serde_json::from_str(&text).with_context(|| format!("parse brief json {}", path.display()))?;
     Ok(brief)
 }
-

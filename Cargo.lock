@@ -738,6 +738,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "nabla-contracts",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
