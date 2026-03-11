@@ -1,0 +1,17 @@
+{
+  "id": "pde-topic-scan",
+  "goal": "Find promising directions around neural operators for PDE research",
+  "constraints": [
+    "Prefer recent papers",
+    "Focus on methods with clear evaluation setups"
+  ],
+  "keywords": [
+    "neural operator",
+    "PDE",
+    "scientific machine learning"
+  ],
+  "date_range": {
+    "start": "2022-01-01",
+    "end": null
+  }
+}

@@ -1,0 +1,17 @@
+[package]
+name = "nabla-workflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+nabla-adapters = { path = "../adapters" }
+nabla-contracts = { path = "../contracts" }
+nabla-sources = { path = "../sources" }
+nabla-storage = { path = "../storage" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
