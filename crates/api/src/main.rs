@@ -14,8 +14,17 @@ use nabla_storage::SqliteStorage;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
+use tracing::info;
 
 type AppState = Arc<Mutex<TopicAgentService>>;
+type ApiResult<T> = Result<T, (StatusCode, String)>;
+
+fn err(e: impl std::fmt::Display) -> (StatusCode, String) {
+    let msg = e.to_string();
+    tracing::error!("{msg}");
+    (StatusCode::INTERNAL_SERVER_ERROR, msg)
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "nabla-server", about = "Topic-agent HTTP server")]
@@ -40,6 +49,13 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "nabla_api=info,tower_http=info".parse().unwrap()),
+        )
+        .init();
+
     let args = Args::parse();
 
     let storage = SqliteStorage::open(&args.db, &args.artifacts_dir)?;
@@ -54,6 +70,7 @@ fn main() -> Result<()> {
         other => anyhow::bail!("unsupported adapter: {other}"),
     };
 
+    info!(adapter = args.adapter, db = args.db, "starting nabla-server");
     let service = Arc::new(Mutex::new(TopicAgentService::new(storage, collector, adapter)));
 
     let cors = CorsLayer::new()
@@ -70,15 +87,13 @@ fn main() -> Result<()> {
         .route("/api/projects/{id}/screening", put(update_screening))
         .route("/api/projects/{id}/topics", get(list_topics))
         .route("/api/projects/{id}/rerun", post(rerun_propose))
+        .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(service);
 
     let addr = format!("0.0.0.0:{}", args.port);
-    println!("nabla-server listening on {addr}");
+    info!("listening on {addr}");
 
-    // Build runtime manually so blocking resources (SqliteStorage) drop
-    // *after* the runtime shuts down, avoiding the "cannot drop runtime
-    // in async context" panic on Ctrl+C.
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -90,62 +105,64 @@ fn main() -> Result<()> {
 async fn create_run(
     State(svc): State<AppState>,
     Json(brief): Json<ProjectBrief>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> ApiResult<Json<serde_json::Value>> {
+    info!(project_id = brief.id, "POST /api/runs — creating run");
     let output = tokio::task::spawn_blocking(move || {
         let svc = svc.lock().unwrap();
         svc.create_run(&brief)
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(err)?
+    .map_err(err)?;
 
+    info!(
+        run_id = output.run_manifest.run_id,
+        topics = output.topics.len(),
+        screening = output.screening.len(),
+        "run completed"
+    );
     Ok(Json(serde_json::to_value(output).unwrap()))
 }
 
 async fn get_run(
     State(svc): State<AppState>,
     Path(run_id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> ApiResult<Json<serde_json::Value>> {
     let svc = svc.lock().unwrap();
-    let manifest = svc
-        .get_run(&run_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let manifest = svc.get_run(&run_id).map_err(err)?;
     match manifest {
         Some(m) => Ok(Json(serde_json::to_value(m).unwrap())),
-        None => Err((StatusCode::NOT_FOUND, "run not found".into())),
+        None => Err((StatusCode::NOT_FOUND, format!("run {run_id} not found"))),
     }
 }
 
 async fn list_runs(
     State(svc): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> ApiResult<Json<serde_json::Value>> {
     let svc = svc.lock().unwrap();
-    let runs = svc
-        .list_runs(&id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let runs = svc.list_runs(&id).map_err(err)?;
+    info!(project_id = id, count = runs.len(), "list_runs");
     Ok(Json(serde_json::to_value(runs).unwrap()))
 }
 
 async fn list_papers(
     State(svc): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> ApiResult<Json<serde_json::Value>> {
     let svc = svc.lock().unwrap();
-    let papers = svc
-        .list_project_papers(&id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let papers = svc.list_project_papers(&id).map_err(err)?;
+    info!(project_id = id, count = papers.len(), "list_papers");
     Ok(Json(serde_json::to_value(papers).unwrap()))
 }
 
 async fn list_screening(
     State(svc): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> ApiResult<Json<serde_json::Value>> {
     let svc = svc.lock().unwrap();
-    let decisions = svc
-        .list_project_screening(&id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let decisions = svc.list_project_screening(&id).map_err(err)?;
+    info!(project_id = id, count = decisions.len(), "list_screening");
     Ok(Json(serde_json::to_value(decisions).unwrap()))
 }
 
@@ -156,13 +173,13 @@ struct ScreeningUpdate {
 
 async fn update_screening(
     State(svc): State<AppState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     Json(body): Json<ScreeningUpdate>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> ApiResult<StatusCode> {
+    info!(project_id = id, count = body.decisions.len(), "update_screening");
     let svc = svc.lock().unwrap();
     for decision in body.decisions {
-        svc.update_screening_decision(decision)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        svc.update_screening_decision(decision).map_err(err)?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -170,25 +187,26 @@ async fn update_screening(
 async fn list_topics(
     State(svc): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> ApiResult<Json<serde_json::Value>> {
     let svc = svc.lock().unwrap();
-    let topics = svc
-        .list_project_topics(&id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let topics = svc.list_project_topics(&id).map_err(err)?;
+    info!(project_id = id, count = topics.len(), "list_topics");
     Ok(Json(serde_json::to_value(topics).unwrap()))
 }
 
 async fn rerun_propose(
     State(svc): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> ApiResult<Json<serde_json::Value>> {
+    info!(project_id = id, "POST rerun_propose");
     let output = tokio::task::spawn_blocking(move || {
         let svc = svc.lock().unwrap();
         svc.rerun_propose(&id)
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(err)?
+    .map_err(err)?;
 
+    info!(topics = output.topics.len(), "rerun completed");
     Ok(Json(serde_json::to_value(output).unwrap()))
 }
