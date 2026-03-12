@@ -3,6 +3,7 @@ use nabla_adapters::AgentAdapter;
 use nabla_contracts::{Phase, ProjectBrief, RunManifest, RunStatus, ScreeningDecision, TopicCandidate};
 use nabla_sources::PaperCollector;
 use nabla_storage::SqliteStorage;
+use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct TopicWorkflow<'a> {
@@ -11,6 +12,7 @@ pub struct TopicWorkflow<'a> {
     storage: &'a SqliteStorage,
 }
 
+#[derive(Serialize)]
 pub struct WorkflowOutput {
     pub run_manifest: RunManifest,
     pub artifact_dir: std::path::PathBuf,

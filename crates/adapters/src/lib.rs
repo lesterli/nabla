@@ -10,7 +10,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use tempfile::NamedTempFile;
 
-pub trait AgentAdapter {
+pub trait AgentAdapter: Send + Sync {
     fn name(&self) -> &'static str;
     fn screen(&self, brief: &ProjectBrief, papers: &[PaperRecord]) -> Result<Vec<ScreeningDecision>>;
     fn propose(
@@ -368,6 +368,146 @@ fn topic_schema() -> Value {
     })
 }
 
+/// Keyword-based test adapter for local development without LLM calls.
+pub struct TestAdapter;
+
+impl AgentAdapter for TestAdapter {
+    fn name(&self) -> &'static str {
+        "test"
+    }
+
+    fn screen(&self, brief: &ProjectBrief, papers: &[PaperRecord]) -> Result<Vec<ScreeningDecision>> {
+        let keywords: Vec<String> = brief
+            .keywords
+            .iter()
+            .map(|keyword| keyword.trim().to_lowercase())
+            .collect();
+        Ok(papers
+            .iter()
+            .map(|paper| {
+                let haystack = format!(
+                    "{} {}",
+                    paper.title.to_lowercase(),
+                    paper.abstract_text.clone().unwrap_or_default().to_lowercase()
+                );
+                let score = keywords
+                    .iter()
+                    .filter(|keyword| haystack.contains(keyword.as_str()))
+                    .count();
+                let (label, confidence, rationale) = match score {
+                    0 => (
+                        ScreeningLabel::Exclude,
+                        Some(0.25),
+                        "No project keyword overlap found in title or abstract.".to_string(),
+                    ),
+                    1 => (
+                        ScreeningLabel::Maybe,
+                        Some(0.55),
+                        "One project keyword matched; worth manual inspection.".to_string(),
+                    ),
+                    _ => (
+                        ScreeningLabel::Include,
+                        Some(0.85),
+                        "Multiple project keywords matched; likely relevant to the topic.".to_string(),
+                    ),
+                };
+                let mut tags = Vec::new();
+                for keyword in &keywords {
+                    if haystack.contains(keyword) {
+                        tags.push(keyword.clone());
+                    }
+                    if tags.len() == 2 {
+                        break;
+                    }
+                }
+                if tags.is_empty() {
+                    tags.push("background".into());
+                }
+
+                ScreeningDecision {
+                    project_id: brief.id.clone(),
+                    paper_id: paper.paper_id.clone(),
+                    label,
+                    rationale,
+                    tags,
+                    confidence,
+                }
+            })
+            .collect())
+    }
+
+    fn propose(
+        &self,
+        brief: &ProjectBrief,
+        papers: &[PaperRecord],
+        decisions: &[ScreeningDecision],
+    ) -> Result<Vec<TopicCandidate>> {
+        let paper_map: std::collections::BTreeMap<String, &PaperRecord> =
+            papers.iter().map(|paper| (paper.paper_id.as_key(), paper)).collect();
+        let mut grouped: std::collections::BTreeMap<String, Vec<&ScreeningDecision>> = std::collections::BTreeMap::new();
+        for decision in decisions.iter().filter(|decision| decision.label != ScreeningLabel::Exclude) {
+            let key = decision
+                .tags
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "background".to_string());
+            grouped.entry(key).or_default().push(decision);
+        }
+        if grouped.is_empty() {
+            grouped.insert("background".into(), decisions.iter().take(3).collect());
+        }
+
+        Ok(grouped
+            .into_iter()
+            .take(3)
+            .enumerate()
+            .map(|(index, (tag, grouped_decisions))| {
+                let representative_paper_ids: Vec<_> = grouped_decisions
+                    .iter()
+                    .take(3)
+                    .map(|decision| decision.paper_id.clone())
+                    .collect();
+                let paper_titles: std::collections::BTreeSet<_> = grouped_decisions
+                    .iter()
+                    .filter_map(|decision| {
+                        paper_map
+                            .get(&decision.paper_id.as_key())
+                            .map(|paper| paper.title.clone())
+                    })
+                    .collect();
+                let scope = if paper_titles.is_empty() {
+                    "Build a bounded reading list around the topic tag and compare the cited methods."
+                        .to_string()
+                } else {
+                    format!(
+                        "Start from {} and compare the methods and evaluation settings they use.",
+                        paper_titles.into_iter().take(2).collect::<Vec<_>>().join("; ")
+                    )
+                };
+
+                TopicCandidate {
+                    id: format!("topic-{}", index + 1),
+                    project_id: brief.id.clone(),
+                    title: format!("{} focus: {}", brief.goal, tag),
+                    why_now: format!(
+                        "This direction clusters papers matching '{}' and gives a focused entry point.",
+                        tag
+                    ),
+                    scope,
+                    representative_paper_ids,
+                    entry_risk:
+                        "The cluster may still contain broad or mixed papers and needs human review."
+                            .to_string(),
+                    fallback_scope: format!(
+                        "Limit the next reading pass to papers tagged '{}' and recent related variants.",
+                        tag
+                    ),
+                }
+            })
+            .collect())
+    }
+}
+
 fn parse_screening_label(value: &str) -> Result<ScreeningLabel> {
     match value {
         "include" => Ok(ScreeningLabel::Include),
@@ -406,149 +546,9 @@ fn parse_structured_response<T: DeserializeOwned>(body: &str) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use super::{parse_structured_response, AgentAdapter};
-    use nabla_contracts::{PaperId, PaperRecord, ProjectBrief, ScreeningDecision, ScreeningLabel, TopicCandidate};
+    use super::{parse_structured_response, TestAdapter, AgentAdapter};
+    use nabla_contracts::{PaperId, PaperRecord, ProjectBrief, ScreeningLabel};
     use serde::Deserialize;
-    use std::collections::{BTreeMap, BTreeSet};
-
-    struct TestAdapter;
-
-    impl AgentAdapter for TestAdapter {
-        fn name(&self) -> &'static str {
-            "test"
-        }
-
-        fn screen(&self, brief: &ProjectBrief, papers: &[PaperRecord]) -> Result<Vec<ScreeningDecision>> {
-            let keywords: Vec<String> = brief
-                .keywords
-                .iter()
-                .map(|keyword| keyword.trim().to_lowercase())
-                .collect();
-            Ok(papers
-                .iter()
-                .map(|paper| {
-                    let haystack = format!(
-                        "{} {}",
-                        paper.title.to_lowercase(),
-                        paper.abstract_text.clone().unwrap_or_default().to_lowercase()
-                    );
-                    let score = keywords
-                        .iter()
-                        .filter(|keyword| haystack.contains(keyword.as_str()))
-                        .count();
-                    let (label, confidence, rationale) = match score {
-                        0 => (
-                            ScreeningLabel::Exclude,
-                            Some(0.25),
-                            "No project keyword overlap found in title or abstract.".to_string(),
-                        ),
-                        1 => (
-                            ScreeningLabel::Maybe,
-                            Some(0.55),
-                            "One project keyword matched; worth manual inspection.".to_string(),
-                        ),
-                        _ => (
-                            ScreeningLabel::Include,
-                            Some(0.85),
-                            "Multiple project keywords matched; likely relevant to the topic.".to_string(),
-                        ),
-                    };
-                    let mut tags = Vec::new();
-                    for keyword in &keywords {
-                        if haystack.contains(keyword) {
-                            tags.push(keyword.clone());
-                        }
-                        if tags.len() == 2 {
-                            break;
-                        }
-                    }
-                    if tags.is_empty() {
-                        tags.push("background".into());
-                    }
-
-                    ScreeningDecision {
-                        project_id: brief.id.clone(),
-                        paper_id: paper.paper_id.clone(),
-                        label,
-                        rationale,
-                        tags,
-                        confidence,
-                    }
-                })
-                .collect())
-        }
-
-        fn propose(
-            &self,
-            brief: &ProjectBrief,
-            papers: &[PaperRecord],
-            decisions: &[ScreeningDecision],
-        ) -> Result<Vec<TopicCandidate>> {
-            let paper_map: BTreeMap<String, &PaperRecord> =
-                papers.iter().map(|paper| (paper.paper_id.as_key(), paper)).collect();
-            let mut grouped: BTreeMap<String, Vec<&ScreeningDecision>> = BTreeMap::new();
-            for decision in decisions.iter().filter(|decision| decision.label != ScreeningLabel::Exclude) {
-                let key = decision
-                    .tags
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "background".to_string());
-                grouped.entry(key).or_default().push(decision);
-            }
-            if grouped.is_empty() {
-                grouped.insert("background".into(), decisions.iter().take(3).collect());
-            }
-
-            Ok(grouped
-                .into_iter()
-                .take(3)
-                .enumerate()
-                .map(|(index, (tag, grouped_decisions))| {
-                    let representative_paper_ids: Vec<_> = grouped_decisions
-                        .iter()
-                        .take(3)
-                        .map(|decision| decision.paper_id.clone())
-                        .collect();
-                    let paper_titles: BTreeSet<_> = grouped_decisions
-                        .iter()
-                        .filter_map(|decision| {
-                            paper_map
-                                .get(&decision.paper_id.as_key())
-                                .map(|paper| paper.title.clone())
-                        })
-                        .collect();
-                    let scope = if paper_titles.is_empty() {
-                        "Build a bounded reading list around the topic tag and compare the cited methods."
-                            .to_string()
-                    } else {
-                        format!(
-                            "Start from {} and compare the methods and evaluation settings they use.",
-                            paper_titles.into_iter().take(2).collect::<Vec<_>>().join("; ")
-                        )
-                    };
-
-                    TopicCandidate {
-                        id: format!("topic-{}", index + 1),
-                        project_id: brief.id.clone(),
-                        title: format!("{} focus: {}", brief.goal, tag),
-                        why_now: format!(
-                            "This direction clusters papers matching '{}' and gives a focused entry point.",
-                            tag
-                        ),
-                        scope,
-                        representative_paper_ids,
-                        entry_risk:
-                            "The cluster may still contain broad or mixed papers and needs human review."
-                                .to_string(),
-                        fallback_scope: format!(
-                            "Limit the next reading pass to papers tagged '{}' and recent related variants.",
-                            tag
-                        ),
-                    }
-                })
-                .collect())
-        }
-    }
 
     fn make_brief() -> ProjectBrief {
         ProjectBrief {

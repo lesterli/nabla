@@ -1,18 +1,24 @@
 [package]
-name = "nabla-workflow"
+name = "nabla-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "nabla-server"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
+axum = "0.8"
+clap = { version = "4.5", features = ["derive"] }
 nabla-adapters = { path = "../adapters" }
 nabla-contracts = { path = "../contracts" }
+nabla-service = { path = "../service" }
 nabla-sources = { path = "../sources" }
 nabla-storage = { path = "../storage" }
+nabla-workflow = { path = "../workflow" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-[dev-dependencies]
-tempfile = "3"
-
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }

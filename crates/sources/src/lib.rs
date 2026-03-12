@@ -7,11 +7,11 @@ use serde::Deserialize;
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 
-pub trait PaperCollector {
+pub trait PaperCollector: Send + Sync {
     fn collect(&self, brief: &ProjectBrief) -> Result<Vec<PaperRecord>>;
 }
 
-pub trait PaperSource {
+pub trait PaperSource: Send + Sync {
     fn fetch(&self, brief: &ProjectBrief) -> Result<Vec<PaperRecord>>;
 }
 
