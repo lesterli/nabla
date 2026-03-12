@@ -343,6 +343,46 @@ impl SqliteStorage {
         }
     }
 
+    pub fn get_project(&self, project_id: &str) -> Result<Option<ProjectBrief>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, goal, constraints_json, keywords_json, date_range_json
+             FROM projects WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        match rows.next() {
+            Some(Ok((id, goal, constraints_json, keywords_json, date_range_json))) => {
+                Ok(Some(ProjectBrief {
+                    id,
+                    goal,
+                    constraints: serde_json::from_str(&constraints_json)
+                        .context("deserialize constraints_json")?,
+                    keywords: serde_json::from_str(&keywords_json)
+                        .context("deserialize keywords_json")?,
+                    date_range: date_range_json
+                        .and_then(|json| serde_json::from_str(&json).ok()),
+                }))
+            }
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    pub fn delete_topic_candidates(&self, project_id: &str) -> Result<usize> {
+        let count = self.conn.execute(
+            "DELETE FROM topic_candidates WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        Ok(count)
+    }
+
     pub fn artifact_root(&self) -> &Path {
         &self.artifact_root
     }
@@ -575,6 +615,74 @@ mod tests {
         assert_eq!(run.unwrap().phase, Phase::Done);
 
         assert!(storage.get_run_manifest("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn get_project_round_trip() {
+        let temp = TempDir::new().unwrap();
+        let storage =
+            SqliteStorage::open(temp.path().join("runs.db"), temp.path().join("artifacts"))
+                .unwrap();
+
+        assert!(storage.get_project("nonexistent").unwrap().is_none());
+
+        let project = ProjectBrief {
+            id: "p1".into(),
+            goal: "test goal".into(),
+            constraints: vec!["recent".into()],
+            keywords: vec!["ml".into(), "nlp".into()],
+            date_range: None,
+        };
+        storage.upsert_project(&project).unwrap();
+
+        let loaded = storage.get_project("p1").unwrap().unwrap();
+        assert_eq!(loaded, project);
+    }
+
+    #[test]
+    fn delete_topic_candidates_clears_project() {
+        let temp = TempDir::new().unwrap();
+        let storage =
+            SqliteStorage::open(temp.path().join("runs.db"), temp.path().join("artifacts"))
+                .unwrap();
+
+        let project = ProjectBrief {
+            id: "p1".into(),
+            goal: "test".into(),
+            constraints: vec![],
+            keywords: vec![],
+            date_range: None,
+        };
+        storage.upsert_project(&project).unwrap();
+        storage
+            .persist_topic_candidates(&[
+                TopicCandidate {
+                    id: "t1".into(),
+                    project_id: "p1".into(),
+                    title: "Topic 1".into(),
+                    why_now: "w".into(),
+                    scope: "s".into(),
+                    representative_paper_ids: vec![],
+                    entry_risk: "r".into(),
+                    fallback_scope: "f".into(),
+                },
+                TopicCandidate {
+                    id: "t2".into(),
+                    project_id: "p1".into(),
+                    title: "Topic 2".into(),
+                    why_now: "w".into(),
+                    scope: "s".into(),
+                    representative_paper_ids: vec![],
+                    entry_risk: "r".into(),
+                    fallback_scope: "f".into(),
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(storage.list_topic_candidates("p1").unwrap().len(), 2);
+        let deleted = storage.delete_topic_candidates("p1").unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(storage.list_topic_candidates("p1").unwrap().len(), 0);
     }
 }
 

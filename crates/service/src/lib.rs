@@ -1,7 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use nabla_adapters::AgentAdapter;
 use nabla_contracts::{
-    PaperRecord, ProjectBrief, RunManifest, ScreeningDecision, TopicCandidate,
+    PaperRecord, Phase, ProjectBrief, RunManifest, RunStatus, ScreeningDecision, TopicCandidate,
 };
 use nabla_sources::PaperCollector;
 use nabla_storage::SqliteStorage;
@@ -74,6 +74,58 @@ impl TopicAgentService {
     /// Root path for all artifacts.
     pub fn artifact_root(&self) -> &Path {
         self.storage.artifact_root()
+    }
+
+    /// Update a single screening decision (label change from the UI).
+    pub fn update_screening_decision(&self, decision: ScreeningDecision) -> Result<()> {
+        self.storage.persist_screening_decisions(&[decision])
+    }
+
+    /// Re-run the propose phase with current screening decisions.
+    /// Deletes old topics, calls adapter.propose(), persists new ones,
+    /// and creates a new RunManifest.
+    pub fn rerun_propose(&self, project_id: &str) -> Result<WorkflowOutput> {
+        let brief = self
+            .storage
+            .get_project(project_id)?
+            .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        let papers = self.storage.list_papers(project_id)?;
+        let decisions = self.storage.list_screening_decisions(project_id)?;
+
+        let topics = self
+            .adapter
+            .propose(&brief, &papers, &decisions)
+            .context("rerun propose")?;
+
+        self.storage.delete_topic_candidates(project_id)?;
+        self.storage.persist_topic_candidates(&topics)?;
+
+        let run_id = format!(
+            "run-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        );
+        let manifest = RunManifest {
+            run_id,
+            project_id: project_id.to_string(),
+            phase: Phase::Done,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_secs()
+                .to_string(),
+            status: RunStatus::Completed,
+        };
+        self.storage.upsert_run_manifest(&manifest)?;
+
+        Ok(WorkflowOutput {
+            run_manifest: manifest,
+            artifact_dir: self.storage.artifact_dir(&"rerun"),
+            screening: decisions,
+            topics,
+        })
     }
 
     /// Access the underlying storage (for advanced use by adapters).
@@ -188,5 +240,34 @@ mod tests {
         let topics = svc.list_project_topics("proj-1").unwrap();
         assert_eq!(topics.len(), 1);
         assert_eq!(topics[0].title, "Stub Topic");
+    }
+
+    #[test]
+    fn update_screening_and_rerun_propose() {
+        let temp = TempDir::new().unwrap();
+        let svc = make_service(&temp);
+        let brief = ProjectBrief {
+            id: "proj-2".into(),
+            goal: "test goal".into(),
+            constraints: vec![],
+            keywords: vec!["ml".into()],
+            date_range: None,
+        };
+
+        let output = svc.create_run(&brief).unwrap();
+        assert_eq!(output.topics.len(), 1);
+
+        // update a screening decision
+        let mut decision = svc.list_project_screening("proj-2").unwrap().remove(0);
+        decision.label = ScreeningLabel::Exclude;
+        svc.update_screening_decision(decision).unwrap();
+
+        let updated = svc.list_project_screening("proj-2").unwrap();
+        assert_eq!(updated[0].label, ScreeningLabel::Exclude);
+
+        // rerun propose
+        let rerun_output = svc.rerun_propose("proj-2").unwrap();
+        assert_eq!(rerun_output.topics.len(), 1);
+        assert_eq!(rerun_output.topics[0].title, "Stub Topic");
     }
 }
