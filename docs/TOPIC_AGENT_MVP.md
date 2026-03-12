@@ -253,30 +253,59 @@ Why this shape:
 - easy to inspect and debug,
 - and naturally compatible with a future Tauri desktop app.
 
-## 6. Suggested Repository Structure
-
-After cleanup, the repository should be shaped like this:
+## 6. Repository Structure
 
 ```text
 nabla/
   apps/
-    web/              # React + Vite workspace UI
+    web/              # React + Vite workspace UI (M2)
   crates/
-    workflow/         # topic-selection workflow
-    sources/          # retrieval, normalization, dedup
-    storage/          # SQLite + artifact storage
     contracts/        # shared schemas and DTOs
+    sources/          # retrieval, normalization, dedup
+    storage/          # SQLite + artifact storage + query layer
     adapters/         # LLM interaction layer (codex, claude-code)
+    workflow/         # fixed pipeline orchestration
+    service/          # TopicAgentService — application service layer
+    api/              # axum HTTP adapter (M2)
+    cli/              # CLI entry point
   docs/
     TOPIC_AGENT_MVP.md
+    TOPIC_AGENT_M1_PLAN.md
+    TOPIC_AGENT_M2_PLAN.md
 ```
+
+### Architecture
+
+```
+┌──────────┐  ┌──────────┐  ┌──────────┐
+│   CLI    │  │   axum   │  │  Tauri   │  ← thin transport adapters
+│  (M1/2)  │  │   (M2)   │  │  (M3)    │
+└────┬─────┘  └────┬─────┘  └────┬─────┘
+     │             │              │
+     └─────────────┼──────────────┘
+                   ▼
+     ┌───────────────────────────┐
+     │    TopicAgentService      │  ← owns everything
+     ├───────────────────────────┤
+     │  create_run()             │
+     │  get_run()                │
+     │  list_runs()              │
+     │  list_project_papers()    │
+     │  list_project_screening() │
+     │  list_project_topics()    │
+     └───┬────────┬────────┬─────┘
+         │        │        │
+     storage  collector  adapter
+```
+
+The `service` crate owns storage, paper collector, and agent adapter. Transport
+layers (CLI, HTTP, Tauri) are thin adapters that construct the service and
+delegate to it. No business logic exists outside the service and workflow
+layers.
 
 The `adapters` crate owns all LLM interaction. The `workflow` crate calls
 adapters through a trait and never invokes CLI tools directly. This ensures
 the workflow logic stays independent of any specific LLM provider.
-
-This structure is intentionally narrow. It should map directly to the MVP
-workflow before the product grows into a broader system.
 
 ## 7. Implementation Order
 
@@ -299,21 +328,24 @@ remains Web-first and desktop-ready.
 
 ## 8. Milestones And Acceptance
 
-### Milestone 1: End-to-End Single Project
+### Milestone 1: End-to-End Single Project — COMPLETED
 
 - create one project brief
 - collect one candidate paper set
 - review one screening result set
 - generate one topic brief
 - run the entire workflow from the CLI
+- extract `TopicAgentService` as the application service layer
 
-### Milestone 2: Better Reviewability
+### Milestone 2: Local Service + Web UI — IN PROGRESS
 
-- edit screening decisions
-- rerun from the same project brief
-- inspect saved outputs
-- export results
-- complete one run from the Web UI
+- wrap `TopicAgentService` with axum as a localhost HTTP API
+- build a minimal React + Vite frontend
+- edit screening decisions from the UI
+- rerun propose phase after editing
+- complete one full run from the browser
+
+See `docs/TOPIC_AGENT_M2_PLAN.md` for the detailed implementation plan.
 
 ### Milestone 3: Desktop Packaging
 

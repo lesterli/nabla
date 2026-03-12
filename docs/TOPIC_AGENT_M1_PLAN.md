@@ -1,5 +1,7 @@
 # Topic Agent Milestone 1 Plan
 
+**Status: COMPLETED**
+
 This document turns the MVP spec into an implementation plan for Milestone 1.
 
 Milestone 1 target:
@@ -230,3 +232,18 @@ Milestone 1 is done when:
 4. the proposal step produces 2 to 3 topic directions tied to paper records,
 5. the run leaves behind inspectable persisted outputs,
 6. and the entire workflow can be rerun from the CLI without changing code.
+
+All six conditions are met.
+
+## 9. Post-M1: Service Layer Extraction
+
+At the end of M1, a `TopicAgentService` application service was extracted into
+`crates/service/`. This decouples domain operations from transport:
+
+- the CLI now calls the service instead of wiring workflow components directly,
+- the same service will be wrapped by axum (M2) and Tauri commands (M3),
+- storage gained query methods (`list_papers`, `list_screening_decisions`,
+  `list_topic_candidates`, `get_run_manifest`, `list_run_manifests`) to support
+  read-back through the service.
+
+This prepares the codebase for M2 without changing the M1 contract or behavior.
