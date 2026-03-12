@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use nabla_adapters::{AgentAdapter, LocalCliAdapter, MockAgentAdapter};
+use nabla_adapters::{AgentAdapter, LocalCliAdapter};
 use nabla_contracts::ProjectBrief;
 use nabla_sources::{ArxivSource, CompositeCollector, OpenAlexSource};
 use nabla_storage::SqliteStorage;
@@ -40,7 +40,7 @@ fn main() -> Result<()> {
     let storage = SqliteStorage::open(&args.db, &args.artifacts_dir)?;
     let adapter_box: Box<dyn AgentAdapter> = match args.adapter.as_str() {
         "codex" => Box::new(LocalCliAdapter::codex()),
-        "mock" => Box::new(MockAgentAdapter),
+        "claude" => Box::new(LocalCliAdapter::claude()),
         other => anyhow::bail!("unsupported adapter: {other}"),
     };
     let workflow = TopicWorkflow::new(&collector, adapter_box.as_ref(), &storage);

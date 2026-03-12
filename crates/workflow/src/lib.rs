@@ -139,11 +139,58 @@ fn generate_run_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::TopicWorkflow;
-    use nabla_adapters::MockAgentAdapter;
-    use nabla_contracts::{PaperId, PaperRecord, ProjectBrief};
+    use anyhow::Result;
+    use nabla_adapters::AgentAdapter;
+    use nabla_contracts::{
+        PaperId, PaperRecord, ProjectBrief, ScreeningDecision, ScreeningLabel, TopicCandidate,
+    };
     use nabla_sources::StaticCollector;
     use nabla_storage::SqliteStorage;
     use tempfile::TempDir;
+
+    struct TestAdapter;
+
+    impl AgentAdapter for TestAdapter {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        fn screen(
+            &self,
+            brief: &ProjectBrief,
+            papers: &[PaperRecord],
+        ) -> Result<Vec<ScreeningDecision>> {
+            Ok(papers
+                .iter()
+                .map(|paper| ScreeningDecision {
+                    project_id: brief.id.clone(),
+                    paper_id: paper.paper_id.clone(),
+                    label: ScreeningLabel::Include,
+                    rationale: "Included by test adapter".into(),
+                    tags: vec!["test".into()],
+                    confidence: Some(1.0),
+                })
+                .collect())
+        }
+
+        fn propose(
+            &self,
+            brief: &ProjectBrief,
+            papers: &[PaperRecord],
+            _decisions: &[ScreeningDecision],
+        ) -> Result<Vec<TopicCandidate>> {
+            Ok(vec![TopicCandidate {
+                id: "topic-1".into(),
+                project_id: brief.id.clone(),
+                title: "Test topic".into(),
+                why_now: "Test rationale".into(),
+                scope: "Test scope".into(),
+                representative_paper_ids: papers.iter().take(1).map(|paper| paper.paper_id.clone()).collect(),
+                entry_risk: "Test risk".into(),
+                fallback_scope: "Test fallback scope".into(),
+            }])
+        }
+    }
 
     #[test]
     fn runs_end_to_end_with_static_collector() {
@@ -158,7 +205,7 @@ mod tests {
             source_url: None,
             source_name: "fixture".into(),
         }]);
-        let adapter = MockAgentAdapter;
+        let adapter = TestAdapter;
         let brief = ProjectBrief {
             id: "proj-1".into(),
             goal: "neural operator topic selection".into(),
