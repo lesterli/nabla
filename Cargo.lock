@@ -751,9 +751,9 @@ dependencies = [
  "clap",
  "nabla-adapters",
  "nabla-contracts",
+ "nabla-service",
  "nabla-sources",
  "nabla-storage",
- "nabla-workflow",
  "serde_json",
 ]
 
@@ -763,6 +763,19 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "nabla-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nabla-adapters",
+ "nabla-contracts",
+ "nabla-sources",
+ "nabla-storage",
+ "nabla-workflow",
+ "tempfile",
 ]
 
 [[package]]

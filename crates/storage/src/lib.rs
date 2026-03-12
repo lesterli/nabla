@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use nabla_contracts::{PaperRecord, ProjectBrief, RunManifest, ScreeningDecision, TopicCandidate};
+use nabla_contracts::{
+    PaperId, PaperRecord, Phase, ProjectBrief, RunManifest, RunStatus, ScreeningDecision,
+    ScreeningLabel, TopicCandidate,
+};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::fs;
@@ -169,6 +172,181 @@ impl SqliteStorage {
         Ok(())
     }
 
+    // ── query methods ──────────────────────────────────────────────
+
+    pub fn get_run_manifest(&self, run_id: &str) -> Result<Option<RunManifest>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT run_id, project_id, phase, created_at, status
+             FROM run_manifests WHERE run_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![run_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        match rows.next() {
+            Some(Ok((run_id, project_id, phase, created_at, status))) => Ok(Some(RunManifest {
+                run_id,
+                project_id,
+                phase: parse_phase(&phase)?,
+                created_at,
+                status: parse_run_status(&status)?,
+            })),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_run_manifests(&self, project_id: &str) -> Result<Vec<RunManifest>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT run_id, project_id, phase, created_at, status
+             FROM run_manifests WHERE project_id = ?1
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (run_id, project_id, phase, created_at, status) = row?;
+            Ok(RunManifest {
+                run_id,
+                project_id,
+                phase: parse_phase(&phase)?,
+                created_at,
+                status: parse_run_status(&status)?,
+            })
+        })
+        .collect()
+    }
+
+    pub fn list_papers(&self, project_id: &str) -> Result<Vec<PaperRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT paper_id_json, title, authors_json, year, abstract_text, source_url, source_name
+             FROM papers WHERE project_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (paper_id_json, title, authors_json, year, abstract_text, source_url, source_name) =
+                row?;
+            Ok(PaperRecord {
+                paper_id: serde_json::from_str(&paper_id_json)
+                    .context("deserialize paper_id_json")?,
+                title,
+                authors: serde_json::from_str(&authors_json)
+                    .context("deserialize authors_json")?,
+                year: year.map(|y| y as u16),
+                abstract_text,
+                source_url,
+                source_name,
+            })
+        })
+        .collect()
+    }
+
+    pub fn list_screening_decisions(&self, project_id: &str) -> Result<Vec<ScreeningDecision>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT project_id, paper_id, label, rationale, tags_json, confidence
+             FROM screening_decisions WHERE project_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<f64>>(5)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (project_id, paper_id_key, label_str, rationale, tags_json, confidence) = row?;
+            Ok(ScreeningDecision {
+                project_id,
+                paper_id: self.resolve_paper_id(&paper_id_key)?,
+                label: parse_screening_label(&label_str)?,
+                rationale,
+                tags: serde_json::from_str(&tags_json).context("deserialize tags_json")?,
+                confidence: confidence.map(|c| c as f32),
+            })
+        })
+        .collect()
+    }
+
+    pub fn list_topic_candidates(&self, project_id: &str) -> Result<Vec<TopicCandidate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, title, why_now, scope, representative_paper_ids_json, entry_risk, fallback_scope
+             FROM topic_candidates WHERE project_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, project_id, title, why_now, scope, rep_ids_json, entry_risk, fallback_scope) =
+                row?;
+            Ok(TopicCandidate {
+                id,
+                project_id,
+                title,
+                why_now,
+                scope,
+                representative_paper_ids: serde_json::from_str(&rep_ids_json)
+                    .context("deserialize representative_paper_ids_json")?,
+                entry_risk,
+                fallback_scope,
+            })
+        })
+        .collect()
+    }
+
+    /// Look up the full PaperId JSON for a paper_id key stored in screening/topic tables.
+    fn resolve_paper_id(&self, paper_id_key: &str) -> Result<PaperId> {
+        let mut stmt = self.conn.prepare(
+            "SELECT paper_id_json FROM papers WHERE paper_id = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![paper_id_key], |row| {
+            row.get::<_, String>(0)
+        })?;
+        match rows.next() {
+            Some(Ok(json)) => {
+                serde_json::from_str(&json).context("deserialize paper_id from papers table")
+            }
+            _ => parse_paper_id_from_key(paper_id_key),
+        }
+    }
+
+    pub fn artifact_root(&self) -> &Path {
+        &self.artifact_root
+    }
+
     fn migrate(&self) -> Result<()> {
         self.conn.execute_batch(
             "
@@ -227,10 +405,54 @@ impl SqliteStorage {
     }
 }
 
+fn parse_phase(s: &str) -> Result<Phase> {
+    match s {
+        "frame" => Ok(Phase::Frame),
+        "collect" => Ok(Phase::Collect),
+        "screen" => Ok(Phase::Screen),
+        "propose" => Ok(Phase::Propose),
+        "done" => Ok(Phase::Done),
+        other => Err(anyhow::anyhow!("unknown phase: {other}")),
+    }
+}
+
+fn parse_run_status(s: &str) -> Result<RunStatus> {
+    match s {
+        "pending" => Ok(RunStatus::Pending),
+        "running" => Ok(RunStatus::Running),
+        "completed" => Ok(RunStatus::Completed),
+        "failed" => Ok(RunStatus::Failed),
+        other => Err(anyhow::anyhow!("unknown run status: {other}")),
+    }
+}
+
+fn parse_screening_label(s: &str) -> Result<ScreeningLabel> {
+    match s {
+        "Include" => Ok(ScreeningLabel::Include),
+        "Maybe" => Ok(ScreeningLabel::Maybe),
+        "Exclude" => Ok(ScreeningLabel::Exclude),
+        other => Err(anyhow::anyhow!("unknown screening label: {other}")),
+    }
+}
+
+fn parse_paper_id_from_key(key: &str) -> Result<PaperId> {
+    if let Some(value) = key.strip_prefix("doi:") {
+        Ok(PaperId::Doi(value.to_string()))
+    } else if let Some(value) = key.strip_prefix("arxiv:") {
+        Ok(PaperId::Arxiv(value.to_string()))
+    } else if let Some(value) = key.strip_prefix("openalex:") {
+        Ok(PaperId::OpenAlex(value.to_string()))
+    } else if let Some(value) = key.strip_prefix("derived:") {
+        Ok(PaperId::DerivedHash(value.to_string()))
+    } else {
+        Err(anyhow::anyhow!("unrecognized paper_id key format: {key}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::SqliteStorage;
-    use nabla_contracts::{PaperId, PaperRecord, Phase, ProjectBrief, RunManifest, RunStatus};
+    use nabla_contracts::{PaperId, PaperRecord, Phase, ProjectBrief, RunManifest, RunStatus, ScreeningDecision, ScreeningLabel, TopicCandidate};
     use tempfile::TempDir;
 
     #[test]
@@ -272,6 +494,87 @@ mod tests {
             .unwrap();
         let path = storage.write_text_artifact("r1", "notes.txt", "ok").unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn query_round_trips() {
+        let temp = TempDir::new().unwrap();
+        let storage =
+            SqliteStorage::open(temp.path().join("runs.db"), temp.path().join("artifacts"))
+                .unwrap();
+        let project = ProjectBrief {
+            id: "p1".into(),
+            goal: "test".into(),
+            constraints: vec![],
+            keywords: vec!["ml".into()],
+            date_range: None,
+        };
+        storage.upsert_project(&project).unwrap();
+
+        let paper = PaperRecord {
+            paper_id: PaperId::Arxiv("2401.00001".into()),
+            title: "Test Paper".into(),
+            authors: vec!["Alice".into()],
+            year: Some(2024),
+            abstract_text: Some("Abstract".into()),
+            source_url: None,
+            source_name: "arxiv".into(),
+        };
+        storage.persist_papers("p1", &[paper.clone()]).unwrap();
+
+        let decision = ScreeningDecision {
+            project_id: "p1".into(),
+            paper_id: PaperId::Arxiv("2401.00001".into()),
+            label: ScreeningLabel::Include,
+            rationale: "Relevant".into(),
+            tags: vec!["ml".into()],
+            confidence: Some(0.9),
+        };
+        storage.persist_screening_decisions(&[decision]).unwrap();
+
+        let topic = TopicCandidate {
+            id: "topic-1".into(),
+            project_id: "p1".into(),
+            title: "Test Topic".into(),
+            why_now: "Trending".into(),
+            scope: "Narrow".into(),
+            representative_paper_ids: vec![PaperId::Arxiv("2401.00001".into())],
+            entry_risk: "Low".into(),
+            fallback_scope: "Broader".into(),
+        };
+        storage.persist_topic_candidates(&[topic]).unwrap();
+
+        let manifest = RunManifest {
+            run_id: "run-1".into(),
+            project_id: "p1".into(),
+            phase: Phase::Done,
+            created_at: "100".into(),
+            status: RunStatus::Completed,
+        };
+        storage.upsert_run_manifest(&manifest).unwrap();
+
+        // query back
+        let papers = storage.list_papers("p1").unwrap();
+        assert_eq!(papers.len(), 1);
+        assert_eq!(papers[0].title, "Test Paper");
+
+        let decisions = storage.list_screening_decisions("p1").unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].label, ScreeningLabel::Include);
+
+        let topics = storage.list_topic_candidates("p1").unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].title, "Test Topic");
+
+        let runs = storage.list_run_manifests("p1").unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, RunStatus::Completed);
+
+        let run = storage.get_run_manifest("run-1").unwrap();
+        assert!(run.is_some());
+        assert_eq!(run.unwrap().phase, Phase::Done);
+
+        assert!(storage.get_run_manifest("nonexistent").unwrap().is_none());
     }
 }
 

@@ -2,14 +2,14 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use nabla_adapters::{AgentAdapter, LocalCliAdapter};
 use nabla_contracts::ProjectBrief;
+use nabla_service::TopicAgentService;
 use nabla_sources::{ArxivSource, CompositeCollector, OpenAlexSource};
 use nabla_storage::SqliteStorage;
-use nabla_workflow::TopicWorkflow;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
-#[command(name = "nabla", about = "Topic-agent Milestone 1 CLI")]
+#[command(name = "nabla", about = "Topic-agent CLI")]
 struct Args {
     #[arg(long)]
     brief: PathBuf,
@@ -33,18 +33,20 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     let brief = read_brief(&args.brief)?;
-    let collector = CompositeCollector::new(vec![
+
+    let storage = SqliteStorage::open(&args.db, &args.artifacts_dir)?;
+    let collector = Box::new(CompositeCollector::new(vec![
         Box::new(OpenAlexSource::new(args.openalex_limit)),
         Box::new(ArxivSource::new(args.arxiv_limit)),
-    ]);
-    let storage = SqliteStorage::open(&args.db, &args.artifacts_dir)?;
-    let adapter_box: Box<dyn AgentAdapter> = match args.adapter.as_str() {
+    ]));
+    let adapter: Box<dyn AgentAdapter> = match args.adapter.as_str() {
         "codex" => Box::new(LocalCliAdapter::codex()),
         "claude" => Box::new(LocalCliAdapter::claude()),
         other => anyhow::bail!("unsupported adapter: {other}"),
     };
-    let workflow = TopicWorkflow::new(&collector, adapter_box.as_ref(), &storage);
-    let output = workflow.run(&brief)?;
+
+    let service = TopicAgentService::new(storage, collector, adapter);
+    let output = service.create_run(&brief)?;
 
     println!("Run completed");
     println!("project_id: {}", brief.id);
@@ -60,7 +62,9 @@ fn main() -> Result<()> {
 }
 
 fn read_brief(path: &Path) -> Result<ProjectBrief> {
-    let text = fs::read_to_string(path).with_context(|| format!("read brief file {}", path.display()))?;
-    let brief = serde_json::from_str(&text).with_context(|| format!("parse brief json {}", path.display()))?;
+    let text =
+        fs::read_to_string(path).with_context(|| format!("read brief file {}", path.display()))?;
+    let brief = serde_json::from_str(&text)
+        .with_context(|| format!("parse brief json {}", path.display()))?;
     Ok(brief)
 }
