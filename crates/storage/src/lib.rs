@@ -130,7 +130,7 @@ impl SqliteStorage {
                 "INSERT INTO topic_candidates
                  (id, project_id, title, why_now, scope, representative_paper_ids_json, entry_risk, fallback_scope)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT(id) DO UPDATE SET
+                 ON CONFLICT(project_id, id) DO UPDATE SET
                    title=excluded.title,
                    why_now=excluded.why_now,
                    scope=excluded.scope,
@@ -388,6 +388,37 @@ impl SqliteStorage {
     }
 
     fn migrate(&self) -> Result<()> {
+        // Migrate topic_candidates from old schema (id PRIMARY KEY) to
+        // composite key (project_id, id). Safe to run repeatedly because
+        // the old table won't exist after first migration.
+        let has_old_pk: bool = self
+            .conn
+            .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='topic_candidates'")
+            .ok()
+            .and_then(|mut stmt| {
+                stmt.query_row([], |row| row.get::<_, String>(0)).ok()
+            })
+            .map(|sql| sql.contains("id TEXT PRIMARY KEY"))
+            .unwrap_or(false);
+        if has_old_pk {
+            self.conn.execute_batch(
+                "ALTER TABLE topic_candidates RENAME TO _topic_candidates_old;
+                 CREATE TABLE topic_candidates (
+                     id TEXT NOT NULL,
+                     project_id TEXT NOT NULL,
+                     title TEXT NOT NULL,
+                     why_now TEXT NOT NULL,
+                     scope TEXT NOT NULL,
+                     representative_paper_ids_json TEXT NOT NULL,
+                     entry_risk TEXT NOT NULL,
+                     fallback_scope TEXT NOT NULL,
+                     PRIMARY KEY (project_id, id)
+                 );
+                 INSERT INTO topic_candidates SELECT * FROM _topic_candidates_old;
+                 DROP TABLE _topic_candidates_old;",
+            )?;
+        }
+
         self.conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS projects (
@@ -422,14 +453,15 @@ impl SqliteStorage {
             );
 
             CREATE TABLE IF NOT EXISTS topic_candidates (
-                id TEXT PRIMARY KEY,
+                id TEXT NOT NULL,
                 project_id TEXT NOT NULL,
                 title TEXT NOT NULL,
                 why_now TEXT NOT NULL,
                 scope TEXT NOT NULL,
                 representative_paper_ids_json TEXT NOT NULL,
                 entry_risk TEXT NOT NULL,
-                fallback_scope TEXT NOT NULL
+                fallback_scope TEXT NOT NULL,
+                PRIMARY KEY (project_id, id)
             );
 
             CREATE TABLE IF NOT EXISTS run_manifests (
