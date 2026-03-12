@@ -39,8 +39,7 @@ struct Args {
     adapter: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
 
     let storage = SqliteStorage::open(&args.db, &args.artifacts_dir)?;
@@ -76,9 +75,16 @@ async fn main() -> Result<()> {
 
     let addr = format!("0.0.0.0:{}", args.port);
     println!("nabla-server listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+
+    // Build runtime manually so blocking resources (SqliteStorage) drop
+    // *after* the runtime shuts down, avoiding the "cannot drop runtime
+    // in async context" panic on Ctrl+C.
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        axum::serve(listener, app).await?;
+        Ok(())
+    })
 }
 
 async fn create_run(
