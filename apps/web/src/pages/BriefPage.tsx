@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
-import { createRun, getRun } from "../api";
-import type { ProjectBrief, RunManifest } from "../types";
+import { createRun, getRun, listTopics } from "../api";
+import type { ProjectBrief, RunManifest, TopicCandidate } from "../types";
 
 function slugify(text: string): string {
   return text
@@ -22,24 +22,28 @@ export default function BriefPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [goal, setGoal] = useState("");
-  const [constraints, setConstraints] = useState<string[]>([""]);
-  const [keywords, setKeywords] = useState<string[]>([""]);
-  const [quickMode, setQuickMode] = useState(
-    () => localStorage.getItem("nabla_quick_mode") === "1",
+  const [manualScreening, setManualScreening] = useState(
+    () => localStorage.getItem("nabla_manual_screening") === "1",
   );
   const [activeRunId, setActiveRunId] = useState(
     () => localStorage.getItem("nabla_run_id") ?? "",
   );
+  const [completedProjectId, setCompletedProjectId] = useState(
+    () => localStorage.getItem("nabla_completed_project") ?? "",
+  );
 
   const isRunning = !!activeRunId;
+  const isCompleted = !!completedProjectId;
 
   const mutation = useMutation({
     mutationFn: (brief: ProjectBrief) => createRun(brief),
     onSuccess: (manifest, brief) => {
       localStorage.setItem("nabla_project_id", brief.id);
       localStorage.setItem("nabla_run_id", manifest.run_id);
-      localStorage.setItem("nabla_quick_mode", quickMode ? "1" : "0");
+      localStorage.setItem("nabla_manual_screening", manualScreening ? "1" : "0");
       setActiveRunId(manifest.run_id);
+      setCompletedProjectId("");
+      localStorage.removeItem("nabla_completed_project");
       queryClient.setQueryData(["run", manifest.run_id], manifest);
     },
   });
@@ -60,12 +64,25 @@ export default function BriefPage() {
     if (activeRun.status === "completed") {
       localStorage.removeItem("nabla_run_id");
       setActiveRunId("");
-      navigate(quickMode ? "/topics" : "/screening");
+      if (manualScreening) {
+        navigate("/screening");
+      } else {
+        // Show inline topic summary
+        const pid = localStorage.getItem("nabla_project_id") ?? "";
+        setCompletedProjectId(pid);
+        localStorage.setItem("nabla_completed_project", pid);
+      }
     }
     if (activeRun.status === "failed") {
       localStorage.removeItem("nabla_run_id");
     }
-  }, [activeRun, navigate, quickMode]);
+  }, [activeRun, navigate, manualScreening]);
+
+  const { data: completedTopics } = useQuery({
+    queryKey: ["topics", completedProjectId],
+    queryFn: () => listTopics(completedProjectId),
+    enabled: !!completedProjectId,
+  });
 
   const phaseIndex = useMemo(() => {
     if (!activeRun) return -1;
@@ -78,11 +95,12 @@ export default function BriefPage() {
 
   function submit(e: React.FormEvent) {
     e.preventDefault();
+    const words = goal.trim().split(/\s+/).filter(Boolean);
     const brief: ProjectBrief = {
       id: slugify(goal) || "project",
       goal,
-      constraints: constraints.filter(Boolean),
-      keywords: keywords.filter(Boolean),
+      constraints: [],
+      keywords: words,
       date_range: null,
     };
     mutation.mutate(brief);
@@ -97,100 +115,39 @@ export default function BriefPage() {
         <input
           className="mt-1 block w-full rounded border border-gray-300 px-3 py-2 text-sm"
           value={goal}
-          onChange={(e) => setGoal(e.target.value)}
+          onChange={(e) => {
+            setGoal(e.target.value);
+            if (completedProjectId) {
+              setCompletedProjectId("");
+              localStorage.removeItem("nabla_completed_project");
+            }
+          }}
           placeholder="e.g. neural operator methods for PDE discovery"
           required
         />
       </label>
 
-      <fieldset className="space-y-2">
-        <legend className="text-sm font-medium">Constraints</legend>
-        {constraints.map((c, i) => (
-          <div key={i} className="flex gap-2">
-            <input
-              className="block w-full rounded border border-gray-300 px-3 py-2 text-sm"
-              value={c}
-              onChange={(e) => {
-                const next = [...constraints];
-                next[i] = e.target.value;
-                setConstraints(next);
-              }}
-              placeholder="e.g. focus on recent papers"
-            />
-            {constraints.length > 1 && (
-              <button
-                type="button"
-                className="text-red-500 text-sm"
-                onClick={() => setConstraints(constraints.filter((_, j) => j !== i))}
-              >
-                remove
-              </button>
-            )}
-          </div>
-        ))}
-        <button
-          type="button"
-          className="text-sm text-blue-600"
-          onClick={() => setConstraints([...constraints, ""])}
-        >
-          + add constraint
-        </button>
-      </fieldset>
-
-      <fieldset className="space-y-2">
-        <legend className="text-sm font-medium">Keywords</legend>
-        {keywords.map((k, i) => (
-          <div key={i} className="flex gap-2">
-            <input
-              className="block w-full rounded border border-gray-300 px-3 py-2 text-sm"
-              value={k}
-              onChange={(e) => {
-                const next = [...keywords];
-                next[i] = e.target.value;
-                setKeywords(next);
-              }}
-              placeholder="e.g. neural operator"
-              required={i === 0}
-            />
-            {keywords.length > 1 && (
-              <button
-                type="button"
-                className="text-red-500 text-sm"
-                onClick={() => setKeywords(keywords.filter((_, j) => j !== i))}
-              >
-                remove
-              </button>
-            )}
-          </div>
-        ))}
-        <button
-          type="button"
-          className="text-sm text-blue-600"
-          onClick={() => setKeywords([...keywords, ""])}
-        >
-          + add keyword
-        </button>
-      </fieldset>
+      {/* Constraints and Keywords fields hidden for simplicity — keywords auto-extracted from goal */}
 
       <label className="flex items-start gap-3 rounded border border-gray-200 bg-gray-50 px-3 py-3 text-sm">
         <input
           type="checkbox"
           className="mt-0.5"
-          checked={quickMode}
+          checked={manualScreening}
           onChange={(e) => {
-            setQuickMode(e.target.checked);
-            localStorage.setItem("nabla_quick_mode", e.target.checked ? "1" : "0");
+            setManualScreening(e.target.checked);
+            localStorage.setItem("nabla_manual_screening", e.target.checked ? "1" : "0");
           }}
         />
         <span>
-          <span className="block font-medium text-gray-900">Quick mode</span>
+          <span className="block font-medium text-gray-900">Manual screening</span>
           <span className="text-gray-600">
-            Skip screening and jump straight to topic recommendations.
+            Review and edit paper screening before generating topics.
           </span>
         </span>
       </label>
 
-      {!isRunning && (
+      {!isRunning && !isCompleted && (
         <button
           type="submit"
           disabled={mutation.isPending}
@@ -224,27 +181,7 @@ export default function BriefPage() {
             </div>
           </div>
 
-          <div className="flex gap-1">
-            {PHASES.map((phase, index) => {
-              const state = stepState(activeRun, index, phaseIndex);
-              return (
-                <div key={phase.key} className="flex-1 space-y-1">
-                  <div
-                    className={`h-1.5 rounded-full ${
-                      state === "done"
-                        ? "bg-green-500"
-                        : state === "current"
-                          ? "bg-blue-500 animate-pulse"
-                          : "bg-gray-200"
-                    }`}
-                  />
-                  <p className={`text-xs ${state === "upcoming" ? "text-gray-400" : "text-gray-600"}`}>
-                    {phase.label}
-                  </p>
-                </div>
-              );
-            })}
-          </div>
+          <ProgressBar phaseIndex={phaseIndex} />
 
           {activeRun.status === "failed" && (
             <button
@@ -260,17 +197,72 @@ export default function BriefPage() {
           )}
         </div>
       )}
+
+      {isCompleted && (
+        <div className="rounded-lg border border-gray-200 bg-white p-4 space-y-4">
+          <div className="flex items-center gap-3">
+            <div className="h-8 w-8 rounded-full bg-green-100 flex items-center justify-center text-green-600 text-sm font-bold shrink-0">&#10003;</div>
+            <p className="text-sm font-medium text-gray-900">Completed</p>
+          </div>
+          <ProgressBar phaseIndex={PHASES.length} />
+        </div>
+      )}
+      {completedTopics && completedTopics.length > 0 && (
+        <div className="space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-gray-900">
+              Topic Candidates ({completedTopics.length})
+            </h2>
+            <button
+              type="button"
+              onClick={() => navigate("/topics")}
+              className="text-sm text-blue-600 hover:underline"
+            >
+              View details
+            </button>
+          </div>
+          {completedTopics.map((topic) => (
+            <TopicSummaryCard key={topic.id} topic={topic} />
+          ))}
+        </div>
+      )}
     </form>
   );
 }
 
-function stepState(
-  run: RunManifest,
-  index: number,
-  currentIndex: number,
-): "done" | "current" | "upcoming" {
-  if (run.status === "completed" || run.phase === "done") return "done";
-  if (index < currentIndex) return "done";
-  if (index === currentIndex) return "current";
-  return "upcoming";
+function ProgressBar({ phaseIndex }: { phaseIndex: number }) {
+  return (
+    <div className="flex gap-1">
+      {PHASES.map((phase, index) => {
+        const done = index < phaseIndex;
+        const current = index === phaseIndex;
+        return (
+          <div key={phase.key} className="flex-1 space-y-1">
+            <div
+              className={`h-1.5 rounded-full ${
+                done
+                  ? "bg-green-500"
+                  : current
+                    ? "bg-blue-500 animate-pulse"
+                    : "bg-gray-200"
+              }`}
+            />
+            <p className={`text-xs ${!done && !current ? "text-gray-400" : "text-gray-600"}`}>
+              {phase.label}
+            </p>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
+
+function TopicSummaryCard({ topic }: { topic: TopicCandidate }) {
+  return (
+    <div className="rounded border border-gray-200 bg-white px-4 py-3 space-y-1">
+      <p className="text-sm font-medium text-gray-900">{topic.title}</p>
+      <p className="text-xs text-gray-500 line-clamp-2">{topic.why_now}</p>
+    </div>
+  );
+}
+
