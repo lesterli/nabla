@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use nabla_adapters::{AgentAdapter, LocalCliAdapter};
+use nabla_adapters::{AgentAdapter, ApiAdapter, LocalCliAdapter};
 use nabla_contracts::{ProjectBrief, ScreeningDecision};
 use nabla_service::TopicAgentService;
 use nabla_sources::{ArxivSource, CompositeCollector, OpenAlexSource};
@@ -27,6 +27,9 @@ struct ServerConfig {
     openalex_limit: usize,
     arxiv_limit: usize,
     adapter: String,
+    api_key: Option<String>,
+    model: Option<String>,
+    base_url: Option<String>,
 }
 
 fn err(e: impl std::fmt::Display) -> (StatusCode, String) {
@@ -46,12 +49,28 @@ where
         .map_err(err)
 }
 
-fn build_adapter(name: &str) -> Result<Box<dyn AgentAdapter>> {
-    match name {
+fn build_adapter(config: &ServerConfig) -> Result<Box<dyn AgentAdapter>> {
+    match config.adapter.as_str() {
         "codex" => Ok(Box::new(LocalCliAdapter::codex())),
         "claude" => Ok(Box::new(LocalCliAdapter::claude())),
         "test" => Ok(Box::new(nabla_adapters::TestAdapter)),
-        other => anyhow::bail!("unsupported adapter: {other}"),
+        "anthropic" => {
+            let api_key = config
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .ok_or_else(|| anyhow::anyhow!("anthropic adapter requires --api-key or ANTHROPIC_API_KEY env"))?;
+            Ok(Box::new(ApiAdapter::anthropic(api_key, config.model.clone(), config.base_url.clone())))
+        }
+        "openai" => {
+            let api_key = config
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                .ok_or_else(|| anyhow::anyhow!("openai adapter requires --api-key or OPENAI_API_KEY env"))?;
+            Ok(Box::new(ApiAdapter::openai(api_key, config.model.clone(), config.base_url.clone())))
+        }
+        other => anyhow::bail!("unsupported adapter: {other} (options: test, codex, claude, anthropic, openai)"),
     }
 }
 
@@ -61,7 +80,7 @@ fn build_service(config: &ServerConfig) -> Result<TopicAgentService> {
         Box::new(OpenAlexSource::new(config.openalex_limit)),
         Box::new(ArxivSource::new(config.arxiv_limit)),
     ]));
-    let adapter = build_adapter(&config.adapter)?;
+    let adapter = build_adapter(config)?;
     Ok(TopicAgentService::new(storage, collector, adapter))
 }
 
@@ -77,14 +96,26 @@ struct Args {
     #[arg(long, default_value = ".nabla/artifacts")]
     artifacts_dir: String,
 
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 5)]
     openalex_limit: usize,
 
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 5)]
     arxiv_limit: usize,
 
     #[arg(long, default_value = "test")]
     adapter: String,
+
+    /// API key for anthropic/openai adapters (overrides env vars)
+    #[arg(long)]
+    api_key: Option<String>,
+
+    /// Model name for anthropic/openai adapters
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Base URL for API adapters (overrides default endpoints)
+    #[arg(long)]
+    base_url: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -108,6 +139,9 @@ fn main() -> Result<()> {
         openalex_limit: args.openalex_limit,
         arxiv_limit: args.arxiv_limit,
         adapter: args.adapter,
+        api_key: args.api_key,
+        model: args.model,
+        base_url: args.base_url,
     });
     let _ = build_service(&config)?;
 
@@ -161,7 +195,7 @@ async fn create_run(
         Ok(service) => {
             if let Err(error) = service.execute_submitted_run(&background_brief, &background_run_id)
             {
-                tracing::error!(run_id = background_run_id, error = %error, "background run failed");
+                tracing::error!(run_id = background_run_id, error = format!("{error:#}"), "background run failed");
             }
         }
         Err(error) => {

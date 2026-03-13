@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use tempfile::NamedTempFile;
+use tracing::info;
 
 pub trait AgentAdapter: Send + Sync {
     fn name(&self) -> &'static str;
@@ -138,9 +139,10 @@ struct ScreeningResponse {
 
 #[derive(Debug, Deserialize)]
 struct ScreeningItem {
-    paper_id: String,
+    index: usize,
     label: String,
     rationale: String,
+    #[serde(default)]
     tags: Vec<String>,
     confidence: Option<f32>,
 }
@@ -155,7 +157,8 @@ struct TopicItem {
     title: String,
     why_now: String,
     scope: String,
-    representative_paper_ids: Vec<String>,
+    #[serde(default)]
+    representative_paper_indices: Vec<usize>,
     entry_risk: String,
     fallback_scope: String,
 }
@@ -173,58 +176,9 @@ impl AgentAdapter for LocalCliAdapter {
         brief: &ProjectBrief,
         papers: &[PaperRecord],
     ) -> Result<Vec<ScreeningDecision>> {
-        let papers_payload: Vec<_> = papers
-            .iter()
-            .map(|paper| {
-                json!({
-                    "paper_id": paper.paper_id.as_key(),
-                    "title": paper.title,
-                    "year": paper.year,
-                    "abstract_text": paper.abstract_text,
-                })
-            })
-            .collect();
-        let brief_payload = json!({
-            "goal": brief.goal,
-            "constraints": brief.constraints,
-            "keywords": brief.keywords,
-        });
-        let prompt = format!(
-            "You are screening papers for a research topic selection workflow.\n\
-Project brief:\n{}\n\
-Papers:\n{}\n\
-For every paper, assign exactly one label from include/maybe/exclude. Keep rationale concise and use at most two tags.",
-            serde_json::to_string_pretty(&brief_payload)?,
-            serde_json::to_string_pretty(&papers_payload)?
-        );
-
-        let response: ScreeningResponse = self.run_with_schema(&prompt, screening_schema())?;
-        let paper_ids: BTreeMap<String, _> = papers
-            .iter()
-            .map(|paper| (paper.paper_id.as_key(), paper.paper_id.clone()))
-            .collect();
-
-        response
-            .items
-            .into_iter()
-            .map(|item| {
-                let label = parse_screening_label(&item.label)?;
-                let paper_id = paper_ids.get(&item.paper_id).cloned().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "screening response referenced unknown paper_id {}",
-                        item.paper_id
-                    )
-                })?;
-                Ok(ScreeningDecision {
-                    project_id: brief.id.clone(),
-                    paper_id,
-                    label,
-                    rationale: item.rationale,
-                    tags: item.tags,
-                    confidence: item.confidence,
-                })
-            })
-            .collect()
+        let (prompt, schema) = build_screening_request(brief, papers)?;
+        let response: ScreeningResponse = self.run_with_schema(&prompt, schema)?;
+        resolve_screening_response(response, brief, papers)
     }
 
     fn propose(
@@ -233,85 +187,349 @@ For every paper, assign exactly one label from include/maybe/exclude. Keep ratio
         papers: &[PaperRecord],
         decisions: &[ScreeningDecision],
     ) -> Result<Vec<TopicCandidate>> {
-        let paper_map: BTreeMap<String, _> = papers
-            .iter()
-            .map(|paper| {
-                (
-                    paper.paper_id.as_key(),
-                    json!({
-                        "paper_id": paper.paper_id.as_key(),
-                        "title": paper.title,
-                        "year": paper.year,
-                        "abstract_text": paper.abstract_text,
-                    }),
-                )
-            })
-            .collect();
-        let decisions_payload: Vec<_> = decisions
-            .iter()
-            .map(|decision| {
-                json!({
-                    "paper_id": decision.paper_id.as_key(),
-                    "label": match decision.label {
-                        ScreeningLabel::Include => "include",
-                        ScreeningLabel::Maybe => "maybe",
-                        ScreeningLabel::Exclude => "exclude",
-                    },
-                    "rationale": decision.rationale,
-                    "tags": decision.tags,
-                    "confidence": decision.confidence,
-                })
-            })
-            .collect();
-        let brief_payload = json!({
-            "goal": brief.goal,
-            "constraints": brief.constraints,
-            "keywords": brief.keywords,
+        let (prompt, schema) = build_propose_request(brief, papers, decisions)?;
+        let response: TopicResponse = self.run_with_schema(&prompt, schema)?;
+        resolve_propose_response(response, brief, papers)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ApiAdapter — Claude API (tool_use) / OpenAI API (response_format.json_schema)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+pub enum ApiProvider {
+    Anthropic,
+    OpenAi,
+}
+
+pub struct ApiAdapter {
+    client: reqwest::blocking::Client,
+    provider: ApiProvider,
+    api_key: String,
+    model: String,
+    base_url: String,
+}
+
+impl ApiAdapter {
+    pub fn anthropic(api_key: String, model: Option<String>, base_url: Option<String>) -> Self {
+        Self {
+            client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .build()
+                .expect("build reqwest client"),
+            provider: ApiProvider::Anthropic,
+            api_key,
+            model: model.unwrap_or_else(|| "claude-sonnet-4-6".into()),
+            base_url: base_url.unwrap_or_else(|| "https://api.anthropic.com/v1".into()),
+        }
+    }
+
+    pub fn openai(api_key: String, model: Option<String>, base_url: Option<String>) -> Self {
+        Self {
+            client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .build()
+                .expect("build reqwest client"),
+            provider: ApiProvider::OpenAi,
+            api_key,
+            model: model.unwrap_or_else(|| "gpt-4o".into()),
+            base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
+        }
+    }
+
+    fn run_with_schema<T: DeserializeOwned>(&self, prompt: &str, schema: Value) -> Result<T> {
+        info!(provider = ?self.provider, model = self.model, "API call");
+        match self.provider {
+            ApiProvider::Anthropic => self.run_anthropic(prompt, schema),
+            ApiProvider::OpenAi => self.run_openai(prompt, schema),
+        }
+    }
+
+    fn run_anthropic<T: DeserializeOwned>(&self, prompt: &str, schema: Value) -> Result<T> {
+        let body = json!({
+            "model": self.model,
+            "max_tokens": 4096,
+            "messages": [{ "role": "user", "content": prompt }],
+            "tools": [{
+                "name": "structured_output",
+                "description": "Return the structured result",
+                "input_schema": schema,
+            }],
+            "tool_choice": { "type": "tool", "name": "structured_output" },
         });
-        let prompt = format!(
-            "You are proposing candidate research directions from screened papers.\n\
+
+        let resp = self
+            .client
+            .post(format!("{}/messages", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()?;
+
+        let status = resp.status();
+        let resp_body: Value = resp.json()?;
+
+        if !status.is_success() {
+            let msg = resp_body["error"]["message"]
+                .as_str()
+                .unwrap_or("unknown error");
+            anyhow::bail!("Anthropic API {status}: {msg}");
+        }
+
+        // Extract tool_use content block → input field
+        let content = resp_body["content"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing content array in response"))?;
+
+        let tool_block = content
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .ok_or_else(|| anyhow::anyhow!("no tool_use block in response"))?;
+
+        let input = &tool_block["input"];
+        serde_json::from_value(input.clone())
+            .map_err(|e| anyhow::anyhow!("parse tool_use input: {e}"))
+    }
+
+    fn run_openai<T: DeserializeOwned>(&self, prompt: &str, schema: Value) -> Result<T> {
+        // Use tools/function calling — more universally supported than
+        // response_format.json_schema across OpenAI-compatible providers
+        // (MiniMax, DeepSeek, vLLM, Ollama, etc.)
+        let body = json!({
+            "model": self.model,
+            "messages": [{ "role": "user", "content": prompt }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "structured_output",
+                    "description": "Return the structured result",
+                    "parameters": schema,
+                },
+            }],
+            "tool_choice": { "type": "function", "function": { "name": "structured_output" } },
+        });
+
+        let resp = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()?;
+
+        let status = resp.status();
+        let resp_body: Value = resp.json()?;
+
+        if !status.is_success() {
+            let msg = resp_body["error"]["message"]
+                .as_str()
+                .unwrap_or("unknown error");
+            anyhow::bail!("OpenAI API {status}: {msg}");
+        }
+
+        // Extract tool_calls[0].function.arguments (JSON string) → parse
+        let arguments_str = resp_body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no tool_calls in OpenAI response: {}",
+                    serde_json::to_string_pretty(&resp_body).unwrap_or_default()
+                )
+            })?;
+
+        serde_json::from_str(arguments_str)
+            .map_err(|e| anyhow::anyhow!("parse OpenAI tool arguments: {e}; body={arguments_str}"))
+    }
+}
+
+impl AgentAdapter for ApiAdapter {
+    fn name(&self) -> &'static str {
+        match self.provider {
+            ApiProvider::Anthropic => "anthropic",
+            ApiProvider::OpenAi => "openai",
+        }
+    }
+
+    fn screen(
+        &self,
+        brief: &ProjectBrief,
+        papers: &[PaperRecord],
+    ) -> Result<Vec<ScreeningDecision>> {
+        let (prompt, schema) = build_screening_request(brief, papers)?;
+        let response: ScreeningResponse = self.run_with_schema(&prompt, schema)?;
+        resolve_screening_response(response, brief, papers)
+    }
+
+    fn propose(
+        &self,
+        brief: &ProjectBrief,
+        papers: &[PaperRecord],
+        decisions: &[ScreeningDecision],
+    ) -> Result<Vec<TopicCandidate>> {
+        let (prompt, schema) = build_propose_request(brief, papers, decisions)?;
+        let response: TopicResponse = self.run_with_schema(&prompt, schema)?;
+        resolve_propose_response(response, brief, papers)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared prompt construction and response resolution
+// ---------------------------------------------------------------------------
+
+fn build_screening_request(
+    brief: &ProjectBrief,
+    papers: &[PaperRecord],
+) -> Result<(String, Value)> {
+    let papers_payload: Vec<_> = papers
+        .iter()
+        .enumerate()
+        .map(|(i, paper)| {
+            json!({
+                "index": i,
+                "title": paper.title,
+                "year": paper.year,
+                "abstract_text": paper.abstract_text,
+            })
+        })
+        .collect();
+    let brief_payload = json!({
+        "goal": brief.goal,
+        "constraints": brief.constraints,
+        "keywords": brief.keywords,
+    });
+    let prompt = format!(
+        "You are screening papers for a research topic selection workflow.\n\
+Project brief:\n{}\n\
+Papers:\n{}\n\
+Return exactly one item per paper. Each item MUST include the paper's index, a label (include/maybe/exclude), a concise rationale, and up to two tags.",
+        serde_json::to_string_pretty(&brief_payload)?,
+        serde_json::to_string_pretty(&papers_payload)?
+    );
+    Ok((prompt, screening_schema()))
+}
+
+fn resolve_screening_response(
+    response: ScreeningResponse,
+    brief: &ProjectBrief,
+    papers: &[PaperRecord],
+) -> Result<Vec<ScreeningDecision>> {
+    anyhow::ensure!(
+        response.items.len() == papers.len(),
+        "expected {} screening items but got {}",
+        papers.len(),
+        response.items.len()
+    );
+
+    response
+        .items
+        .into_iter()
+        .map(|item| {
+            anyhow::ensure!(
+                item.index < papers.len(),
+                "screening index {} out of range (0..{})",
+                item.index,
+                papers.len()
+            );
+            let label = parse_screening_label(&item.label)?;
+            Ok(ScreeningDecision {
+                project_id: brief.id.clone(),
+                paper_id: papers[item.index].paper_id.clone(),
+                label,
+                rationale: item.rationale,
+                tags: item.tags,
+                confidence: item.confidence,
+            })
+        })
+        .collect()
+}
+
+fn build_propose_request(
+    brief: &ProjectBrief,
+    papers: &[PaperRecord],
+    decisions: &[ScreeningDecision],
+) -> Result<(String, Value)> {
+    // Build an index map from paper_id → index for decisions
+    let id_to_index: BTreeMap<String, usize> = papers
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.paper_id.as_key(), i))
+        .collect();
+
+    let papers_payload: Vec<_> = papers
+        .iter()
+        .enumerate()
+        .map(|(i, paper)| {
+            json!({
+                "index": i,
+                "title": paper.title,
+                "year": paper.year,
+                "abstract_text": paper.abstract_text,
+            })
+        })
+        .collect();
+    let decisions_payload: Vec<_> = decisions
+        .iter()
+        .map(|decision| {
+            json!({
+                "paper_index": id_to_index.get(&decision.paper_id.as_key()),
+                "label": match decision.label {
+                    ScreeningLabel::Include => "include",
+                    ScreeningLabel::Maybe => "maybe",
+                    ScreeningLabel::Exclude => "exclude",
+                },
+                "rationale": decision.rationale,
+                "tags": decision.tags,
+            })
+        })
+        .collect();
+    let brief_payload = json!({
+        "goal": brief.goal,
+        "constraints": brief.constraints,
+        "keywords": brief.keywords,
+    });
+    let prompt = format!(
+        "You are proposing candidate research directions from screened papers.\n\
 Project brief:\n{}\n\
 Papers:\n{}\n\
 Screening decisions:\n{}\n\
-Generate 2 to 3 candidate topic directions. Only use paper_ids from the provided papers.",
-            serde_json::to_string_pretty(&brief_payload)?,
-            serde_json::to_string_pretty(&paper_map.values().collect::<Vec<_>>())?,
-            serde_json::to_string_pretty(&decisions_payload)?,
-        );
+Generate 2 to 3 candidate topic directions. Reference papers by their index in representative_paper_indices.",
+        serde_json::to_string_pretty(&brief_payload)?,
+        serde_json::to_string_pretty(&papers_payload)?,
+        serde_json::to_string_pretty(&decisions_payload)?,
+    );
+    Ok((prompt, topic_schema()))
+}
 
-        let response: TopicResponse = self.run_with_schema(&prompt, topic_schema())?;
-        let paper_ids: BTreeMap<String, _> = papers
-            .iter()
-            .map(|paper| (paper.paper_id.as_key(), paper.paper_id.clone()))
-            .collect();
-
-        response
-            .items
-            .into_iter()
-            .enumerate()
-            .map(|(index, item)| {
-                let representative_paper_ids = item
-                    .representative_paper_ids
-                    .into_iter()
-                    .map(|paper_id| {
-                        paper_ids.get(&paper_id).cloned().ok_or_else(|| {
-                            anyhow::anyhow!("topic response referenced unknown paper_id {paper_id}")
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(TopicCandidate {
-                    id: format!("topic-{}", index + 1),
-                    project_id: brief.id.clone(),
-                    title: item.title,
-                    why_now: item.why_now,
-                    scope: item.scope,
-                    representative_paper_ids,
-                    entry_risk: item.entry_risk,
-                    fallback_scope: item.fallback_scope,
-                })
+fn resolve_propose_response(
+    response: TopicResponse,
+    brief: &ProjectBrief,
+    papers: &[PaperRecord],
+) -> Result<Vec<TopicCandidate>> {
+    response
+        .items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            // Resolve indices to paper_ids, skip out-of-range
+            let representative_paper_ids: Vec<_> = item
+                .representative_paper_indices
+                .into_iter()
+                .filter_map(|i| papers.get(i).map(|p| p.paper_id.clone()))
+                .collect();
+            Ok(TopicCandidate {
+                id: format!("topic-{}", index + 1),
+                project_id: brief.id.clone(),
+                title: item.title,
+                why_now: item.why_now,
+                scope: item.scope,
+                representative_paper_ids,
+                entry_risk: item.entry_risk,
+                fallback_scope: item.fallback_scope,
             })
-            .collect()
-    }
+        })
+        .collect()
 }
 
 fn screening_schema() -> Value {
@@ -325,13 +543,13 @@ fn screening_schema() -> Value {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "paper_id": { "type": "string" },
+                        "index": { "type": "integer" },
                         "label": { "type": "string", "enum": ["include", "maybe", "exclude"] },
                         "rationale": { "type": "string" },
                         "tags": { "type": "array", "items": { "type": "string" } },
                         "confidence": { "type": ["number", "null"] }
                     },
-                    "required": ["paper_id", "label", "rationale", "tags", "confidence"]
+                    "required": ["index", "label", "rationale", "tags", "confidence"]
                 }
             }
         },
@@ -355,9 +573,9 @@ fn topic_schema() -> Value {
                         "title": { "type": "string" },
                         "why_now": { "type": "string" },
                         "scope": { "type": "string" },
-                        "representative_paper_ids": {
+                        "representative_paper_indices": {
                             "type": "array",
-                            "items": { "type": "string" }
+                            "items": { "type": "integer" }
                         },
                         "entry_risk": { "type": "string" },
                         "fallback_scope": { "type": "string" }
@@ -366,7 +584,7 @@ fn topic_schema() -> Value {
                         "title",
                         "why_now",
                         "scope",
-                        "representative_paper_ids",
+                        "representative_paper_indices",
                         "entry_risk",
                         "fallback_scope"
                     ]
