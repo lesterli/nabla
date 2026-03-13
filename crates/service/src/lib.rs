@@ -7,6 +7,7 @@ use nabla_sources::PaperCollector;
 use nabla_storage::SqliteStorage;
 use nabla_workflow::{TopicWorkflow, WorkflowOutput};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Application service for the topic-agent workflow.
 ///
@@ -39,6 +40,34 @@ impl TopicAgentService {
             &self.storage,
         );
         workflow.run(brief)
+    }
+
+    /// Persist an initial pending run manifest so UI clients can poll progress.
+    pub fn submit_run(&self, brief: &ProjectBrief) -> Result<RunManifest> {
+        let manifest = RunManifest {
+            run_id: generate_run_id(),
+            project_id: brief.id.clone(),
+            phase: Phase::Frame,
+            created_at: current_timestamp(),
+            status: RunStatus::Pending,
+        };
+        self.storage.upsert_project(brief)?;
+        self.storage.upsert_run_manifest(&manifest)?;
+        Ok(manifest)
+    }
+
+    /// Execute a previously submitted run in the background.
+    pub fn execute_submitted_run(
+        &self,
+        brief: &ProjectBrief,
+        run_id: &str,
+    ) -> Result<WorkflowOutput> {
+        let workflow = TopicWorkflow::new(
+            self.collector.as_ref(),
+            self.adapter.as_ref(),
+            &self.storage,
+        );
+        workflow.run_with_id(brief, run_id.to_string())
     }
 
     /// Fetch a single run manifest by ID.
@@ -134,6 +163,22 @@ impl TopicAgentService {
     }
 }
 
+fn current_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs()
+        .to_string()
+}
+
+fn generate_run_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos();
+    format!("run-{nanos}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::TopicAgentService;
@@ -191,11 +236,9 @@ mod tests {
     }
 
     fn make_service(temp: &TempDir) -> TopicAgentService {
-        let storage = SqliteStorage::open(
-            temp.path().join("runs.db"),
-            temp.path().join("artifacts"),
-        )
-        .unwrap();
+        let storage =
+            SqliteStorage::open(temp.path().join("runs.db"), temp.path().join("artifacts"))
+                .unwrap();
         let collector = Box::new(StaticCollector::new(vec![PaperRecord {
             paper_id: PaperId::DerivedHash("p1".into()),
             title: "Test Paper".into(),

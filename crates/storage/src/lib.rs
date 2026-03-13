@@ -7,6 +7,7 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub struct SqliteStorage {
     conn: Connection,
@@ -16,12 +17,16 @@ pub struct SqliteStorage {
 impl SqliteStorage {
     pub fn open(db_path: impl AsRef<Path>, artifact_root: impl AsRef<Path>) -> Result<Self> {
         if let Some(parent) = db_path.as_ref().parent() {
-            fs::create_dir_all(parent).with_context(|| format!("create db dir {}", parent.display()))?;
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create db dir {}", parent.display()))?;
         }
         fs::create_dir_all(artifact_root.as_ref())
             .with_context(|| format!("create artifact dir {}", artifact_root.as_ref().display()))?;
         let conn = Connection::open(db_path.as_ref())
             .with_context(|| format!("open sqlite db {}", db_path.as_ref().display()))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .context("set sqlite busy_timeout")?;
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let storage = Self {
             conn,
             artifact_root: artifact_root.as_ref().to_path_buf(),
@@ -34,7 +39,12 @@ impl SqliteStorage {
         self.artifact_root.join(run_id)
     }
 
-    pub fn write_json_artifact<T: Serialize>(&self, run_id: &str, name: &str, value: &T) -> Result<PathBuf> {
+    pub fn write_json_artifact<T: Serialize>(
+        &self,
+        run_id: &str,
+        name: &str,
+        value: &T,
+    ) -> Result<PathBuf> {
         let path = self.artifact_dir(run_id).join(name);
         fs::create_dir_all(path.parent().expect("artifact file has parent"))
             .with_context(|| format!("create artifact parent for {}", path.display()))?;
@@ -252,8 +262,7 @@ impl SqliteStorage {
                 paper_id: serde_json::from_str(&paper_id_json)
                     .context("deserialize paper_id_json")?,
                 title,
-                authors: serde_json::from_str(&authors_json)
-                    .context("deserialize authors_json")?,
+                authors: serde_json::from_str(&authors_json).context("deserialize authors_json")?,
                 year: year.map(|y| y as u16),
                 abstract_text,
                 source_url,
@@ -329,12 +338,10 @@ impl SqliteStorage {
 
     /// Look up the full PaperId JSON for a paper_id key stored in screening/topic tables.
     fn resolve_paper_id(&self, paper_id_key: &str) -> Result<PaperId> {
-        let mut stmt = self.conn.prepare(
-            "SELECT paper_id_json FROM papers WHERE paper_id = ?1 LIMIT 1",
-        )?;
-        let mut rows = stmt.query_map(params![paper_id_key], |row| {
-            row.get::<_, String>(0)
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT paper_id_json FROM papers WHERE paper_id = ?1 LIMIT 1")?;
+        let mut rows = stmt.query_map(params![paper_id_key], |row| row.get::<_, String>(0))?;
         match rows.next() {
             Some(Ok(json)) => {
                 serde_json::from_str(&json).context("deserialize paper_id from papers table")
@@ -366,8 +373,7 @@ impl SqliteStorage {
                         .context("deserialize constraints_json")?,
                     keywords: serde_json::from_str(&keywords_json)
                         .context("deserialize keywords_json")?,
-                    date_range: date_range_json
-                        .and_then(|json| serde_json::from_str(&json).ok()),
+                    date_range: date_range_json.and_then(|json| serde_json::from_str(&json).ok()),
                 }))
             }
             Some(Err(e)) => Err(e.into()),
@@ -395,9 +401,7 @@ impl SqliteStorage {
             .conn
             .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='topic_candidates'")
             .ok()
-            .and_then(|mut stmt| {
-                stmt.query_row([], |row| row.get::<_, String>(0)).ok()
-            })
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, String>(0)).ok())
             .map(|sql| sql.contains("id TEXT PRIMARY KEY"))
             .unwrap_or(false);
         if has_old_pk {
@@ -524,7 +528,10 @@ fn parse_paper_id_from_key(key: &str) -> Result<PaperId> {
 #[cfg(test)]
 mod tests {
     use super::SqliteStorage;
-    use nabla_contracts::{PaperId, PaperRecord, Phase, ProjectBrief, RunManifest, RunStatus, ScreeningDecision, ScreeningLabel, TopicCandidate};
+    use nabla_contracts::{
+        PaperId, PaperRecord, Phase, ProjectBrief, RunManifest, RunStatus, ScreeningDecision,
+        ScreeningLabel, TopicCandidate,
+    };
     use tempfile::TempDir;
 
     #[test]
@@ -564,7 +571,9 @@ mod tests {
                 status: RunStatus::Running,
             })
             .unwrap();
-        let path = storage.write_text_artifact("r1", "notes.txt", "ok").unwrap();
+        let path = storage
+            .write_text_artifact("r1", "notes.txt", "ok")
+            .unwrap();
         assert!(path.exists());
     }
 
@@ -717,4 +726,3 @@ mod tests {
         assert_eq!(storage.list_topic_candidates("p1").unwrap().len(), 0);
     }
 }
-

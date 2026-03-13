@@ -12,18 +12,57 @@ use nabla_service::TopicAgentService;
 use nabla_sources::{ArxivSource, CompositeCollector, OpenAlexSource};
 use nabla_storage::SqliteStorage;
 use serde::Deserialize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
-type AppState = Arc<Mutex<TopicAgentService>>;
+type AppState = Arc<ServerConfig>;
 type ApiResult<T> = Result<T, (StatusCode, String)>;
+
+#[derive(Debug, Clone)]
+struct ServerConfig {
+    db: String,
+    artifacts_dir: String,
+    openalex_limit: usize,
+    arxiv_limit: usize,
+    adapter: String,
+}
 
 fn err(e: impl std::fmt::Display) -> (StatusCode, String) {
     let msg = e.to_string();
     tracing::error!("{msg}");
     (StatusCode::INTERNAL_SERVER_ERROR, msg)
+}
+
+async fn run_blocking<T, F>(f: F) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(err)?
+        .map_err(err)
+}
+
+fn build_adapter(name: &str) -> Result<Box<dyn AgentAdapter>> {
+    match name {
+        "codex" => Ok(Box::new(LocalCliAdapter::codex())),
+        "claude" => Ok(Box::new(LocalCliAdapter::claude())),
+        "test" => Ok(Box::new(nabla_adapters::TestAdapter)),
+        other => anyhow::bail!("unsupported adapter: {other}"),
+    }
+}
+
+fn build_service(config: &ServerConfig) -> Result<TopicAgentService> {
+    let storage = SqliteStorage::open(&config.db, &config.artifacts_dir)?;
+    let collector = Box::new(CompositeCollector::new(vec![
+        Box::new(OpenAlexSource::new(config.openalex_limit)),
+        Box::new(ArxivSource::new(config.arxiv_limit)),
+    ]));
+    let adapter = build_adapter(&config.adapter)?;
+    Ok(TopicAgentService::new(storage, collector, adapter))
 }
 
 #[derive(Debug, Parser)]
@@ -58,20 +97,19 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let storage = SqliteStorage::open(&args.db, &args.artifacts_dir)?;
-    let collector = Box::new(CompositeCollector::new(vec![
-        Box::new(OpenAlexSource::new(args.openalex_limit)),
-        Box::new(ArxivSource::new(args.arxiv_limit)),
-    ]));
-    let adapter: Box<dyn AgentAdapter> = match args.adapter.as_str() {
-        "codex" => Box::new(LocalCliAdapter::codex()),
-        "claude" => Box::new(LocalCliAdapter::claude()),
-        "test" => Box::new(nabla_adapters::TestAdapter),
-        other => anyhow::bail!("unsupported adapter: {other}"),
-    };
-
-    info!(adapter = args.adapter, db = args.db, "starting nabla-server");
-    let service = Arc::new(Mutex::new(TopicAgentService::new(storage, collector, adapter)));
+    info!(
+        adapter = args.adapter,
+        db = args.db,
+        "starting nabla-server"
+    );
+    let config = Arc::new(ServerConfig {
+        db: args.db,
+        artifacts_dir: args.artifacts_dir,
+        openalex_limit: args.openalex_limit,
+        arxiv_limit: args.arxiv_limit,
+        adapter: args.adapter,
+    });
+    let _ = build_service(&config)?;
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -89,7 +127,7 @@ fn main() -> Result<()> {
         .route("/api/projects/{id}/rerun", post(rerun_propose))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
-        .with_state(service);
+        .with_state(config);
 
     let addr = format!("0.0.0.0:{}", args.port);
     info!("listening on {addr}");
@@ -103,33 +141,48 @@ fn main() -> Result<()> {
 }
 
 async fn create_run(
-    State(svc): State<AppState>,
+    State(config): State<AppState>,
     Json(brief): Json<ProjectBrief>,
 ) -> ApiResult<Json<serde_json::Value>> {
     info!(project_id = brief.id, "POST /api/runs — creating run");
-    let output = tokio::task::spawn_blocking(move || {
-        let svc = svc.lock().unwrap();
-        svc.create_run(&brief)
+    let submit_config = Arc::clone(&config);
+    let submit_brief = brief.clone();
+    let manifest = run_blocking(move || {
+        let service = build_service(&submit_config)?;
+        service.submit_run(&submit_brief)
     })
-    .await
-    .map_err(err)?
-    .map_err(err)?;
+    .await?;
+    let run_id = manifest.run_id.clone();
+    let background_config = Arc::clone(&config);
+    let background_brief = brief;
+    let background_run_id = run_id.clone();
 
-    info!(
-        run_id = output.run_manifest.run_id,
-        topics = output.topics.len(),
-        screening = output.screening.len(),
-        "run completed"
-    );
-    Ok(Json(serde_json::to_value(output).unwrap()))
+    tokio::task::spawn_blocking(move || match build_service(&background_config) {
+        Ok(service) => {
+            if let Err(error) = service.execute_submitted_run(&background_brief, &background_run_id)
+            {
+                tracing::error!(run_id = background_run_id, error = %error, "background run failed");
+            }
+        }
+        Err(error) => {
+            tracing::error!(run_id = background_run_id, error = %error, "failed to build service for background run");
+        }
+    });
+
+    info!(run_id, "run submitted");
+    Ok(Json(serde_json::to_value(manifest).unwrap()))
 }
 
 async fn get_run(
-    State(svc): State<AppState>,
+    State(config): State<AppState>,
     Path(run_id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let svc = svc.lock().unwrap();
-    let manifest = svc.get_run(&run_id).map_err(err)?;
+    let run_id_for_query = run_id.clone();
+    let manifest = run_blocking(move || {
+        let service = build_service(&config)?;
+        service.get_run(&run_id_for_query)
+    })
+    .await?;
     match manifest {
         Some(m) => Ok(Json(serde_json::to_value(m).unwrap())),
         None => Err((StatusCode::NOT_FOUND, format!("run {run_id} not found"))),
@@ -137,31 +190,43 @@ async fn get_run(
 }
 
 async fn list_runs(
-    State(svc): State<AppState>,
+    State(config): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let svc = svc.lock().unwrap();
-    let runs = svc.list_runs(&id).map_err(err)?;
+    let project_id_for_query = id.clone();
+    let runs = run_blocking(move || {
+        let service = build_service(&config)?;
+        service.list_runs(&project_id_for_query)
+    })
+    .await?;
     info!(project_id = id, count = runs.len(), "list_runs");
     Ok(Json(serde_json::to_value(runs).unwrap()))
 }
 
 async fn list_papers(
-    State(svc): State<AppState>,
+    State(config): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let svc = svc.lock().unwrap();
-    let papers = svc.list_project_papers(&id).map_err(err)?;
+    let project_id_for_query = id.clone();
+    let papers = run_blocking(move || {
+        let service = build_service(&config)?;
+        service.list_project_papers(&project_id_for_query)
+    })
+    .await?;
     info!(project_id = id, count = papers.len(), "list_papers");
     Ok(Json(serde_json::to_value(papers).unwrap()))
 }
 
 async fn list_screening(
-    State(svc): State<AppState>,
+    State(config): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let svc = svc.lock().unwrap();
-    let decisions = svc.list_project_screening(&id).map_err(err)?;
+    let project_id_for_query = id.clone();
+    let decisions = run_blocking(move || {
+        let service = build_service(&config)?;
+        service.list_project_screening(&project_id_for_query)
+    })
+    .await?;
     info!(project_id = id, count = decisions.len(), "list_screening");
     Ok(Json(serde_json::to_value(decisions).unwrap()))
 }
@@ -172,40 +237,50 @@ struct ScreeningUpdate {
 }
 
 async fn update_screening(
-    State(svc): State<AppState>,
+    State(config): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<ScreeningUpdate>,
 ) -> ApiResult<StatusCode> {
-    info!(project_id = id, count = body.decisions.len(), "update_screening");
-    let svc = svc.lock().unwrap();
-    for decision in body.decisions {
-        svc.update_screening_decision(decision).map_err(err)?;
-    }
+    info!(
+        project_id = id,
+        count = body.decisions.len(),
+        "update_screening"
+    );
+    run_blocking(move || {
+        let service = build_service(&config)?;
+        for decision in body.decisions {
+            service.update_screening_decision(decision)?;
+        }
+        Ok(())
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_topics(
-    State(svc): State<AppState>,
+    State(config): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let svc = svc.lock().unwrap();
-    let topics = svc.list_project_topics(&id).map_err(err)?;
+    let project_id_for_query = id.clone();
+    let topics = run_blocking(move || {
+        let service = build_service(&config)?;
+        service.list_project_topics(&project_id_for_query)
+    })
+    .await?;
     info!(project_id = id, count = topics.len(), "list_topics");
     Ok(Json(serde_json::to_value(topics).unwrap()))
 }
 
 async fn rerun_propose(
-    State(svc): State<AppState>,
+    State(config): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     info!(project_id = id, "POST rerun_propose");
-    let output = tokio::task::spawn_blocking(move || {
-        let svc = svc.lock().unwrap();
-        svc.rerun_propose(&id)
+    let output = run_blocking(move || {
+        let service = build_service(&config)?;
+        service.rerun_propose(&id)
     })
-    .await
-    .map_err(err)?
-    .map_err(err)?;
+    .await?;
 
     info!(topics = output.topics.len(), "rerun completed");
     Ok(Json(serde_json::to_value(output).unwrap()))

@@ -2,7 +2,6 @@ import { NavLink, Outlet } from "react-router-dom";
 
 const tabs = [
   { to: "/", label: "Brief" },
-  { to: "/papers", label: "Papers" },
   { to: "/screening", label: "Screening" },
   { to: "/topics", label: "Topics" },
 ];

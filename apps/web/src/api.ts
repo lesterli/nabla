@@ -17,7 +17,7 @@ async function json<T>(res: Response): Promise<T> {
   return res.json();
 }
 
-export async function createRun(brief: ProjectBrief): Promise<WorkflowOutput> {
+export async function createRun(brief: ProjectBrief): Promise<RunManifest> {
   const res = await fetch(`${BASE}/runs`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

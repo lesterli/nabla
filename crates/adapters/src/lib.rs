@@ -12,7 +12,11 @@ use tempfile::NamedTempFile;
 
 pub trait AgentAdapter: Send + Sync {
     fn name(&self) -> &'static str;
-    fn screen(&self, brief: &ProjectBrief, papers: &[PaperRecord]) -> Result<Vec<ScreeningDecision>>;
+    fn screen(
+        &self,
+        brief: &ProjectBrief,
+        papers: &[PaperRecord],
+    ) -> Result<Vec<ScreeningDecision>>;
     fn propose(
         &self,
         brief: &ProjectBrief,
@@ -164,7 +168,11 @@ impl AgentAdapter for LocalCliAdapter {
         }
     }
 
-    fn screen(&self, brief: &ProjectBrief, papers: &[PaperRecord]) -> Result<Vec<ScreeningDecision>> {
+    fn screen(
+        &self,
+        brief: &ProjectBrief,
+        papers: &[PaperRecord],
+    ) -> Result<Vec<ScreeningDecision>> {
         let papers_payload: Vec<_> = papers
             .iter()
             .map(|paper| {
@@ -201,10 +209,12 @@ For every paper, assign exactly one label from include/maybe/exclude. Keep ratio
             .into_iter()
             .map(|item| {
                 let label = parse_screening_label(&item.label)?;
-                let paper_id = paper_ids
-                    .get(&item.paper_id)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("screening response referenced unknown paper_id {}", item.paper_id))?;
+                let paper_id = paper_ids.get(&item.paper_id).cloned().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "screening response referenced unknown paper_id {}",
+                        item.paper_id
+                    )
+                })?;
                 Ok(ScreeningDecision {
                     project_id: brief.id.clone(),
                     paper_id,
@@ -284,10 +294,9 @@ Generate 2 to 3 candidate topic directions. Only use paper_ids from the provided
                     .representative_paper_ids
                     .into_iter()
                     .map(|paper_id| {
-                        paper_ids
-                            .get(&paper_id)
-                            .cloned()
-                            .ok_or_else(|| anyhow::anyhow!("topic response referenced unknown paper_id {paper_id}"))
+                        paper_ids.get(&paper_id).cloned().ok_or_else(|| {
+                            anyhow::anyhow!("topic response referenced unknown paper_id {paper_id}")
+                        })
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(TopicCandidate {
@@ -376,7 +385,11 @@ impl AgentAdapter for TestAdapter {
         "test"
     }
 
-    fn screen(&self, brief: &ProjectBrief, papers: &[PaperRecord]) -> Result<Vec<ScreeningDecision>> {
+    fn screen(
+        &self,
+        brief: &ProjectBrief,
+        papers: &[PaperRecord],
+    ) -> Result<Vec<ScreeningDecision>> {
         let keywords: Vec<String> = brief
             .keywords
             .iter()
@@ -388,7 +401,11 @@ impl AgentAdapter for TestAdapter {
                 let haystack = format!(
                     "{} {}",
                     paper.title.to_lowercase(),
-                    paper.abstract_text.clone().unwrap_or_default().to_lowercase()
+                    paper
+                        .abstract_text
+                        .clone()
+                        .unwrap_or_default()
+                        .to_lowercase()
                 );
                 let score = keywords
                     .iter()
@@ -408,7 +425,8 @@ impl AgentAdapter for TestAdapter {
                     _ => (
                         ScreeningLabel::Include,
                         Some(0.85),
-                        "Multiple project keywords matched; likely relevant to the topic.".to_string(),
+                        "Multiple project keywords matched; likely relevant to the topic."
+                            .to_string(),
                     ),
                 };
                 let mut tags = Vec::new();
@@ -442,10 +460,16 @@ impl AgentAdapter for TestAdapter {
         papers: &[PaperRecord],
         decisions: &[ScreeningDecision],
     ) -> Result<Vec<TopicCandidate>> {
-        let paper_map: std::collections::BTreeMap<String, &PaperRecord> =
-            papers.iter().map(|paper| (paper.paper_id.as_key(), paper)).collect();
-        let mut grouped: std::collections::BTreeMap<String, Vec<&ScreeningDecision>> = std::collections::BTreeMap::new();
-        for decision in decisions.iter().filter(|decision| decision.label != ScreeningLabel::Exclude) {
+        let paper_map: std::collections::BTreeMap<String, &PaperRecord> = papers
+            .iter()
+            .map(|paper| (paper.paper_id.as_key(), paper))
+            .collect();
+        let mut grouped: std::collections::BTreeMap<String, Vec<&ScreeningDecision>> =
+            std::collections::BTreeMap::new();
+        for decision in decisions
+            .iter()
+            .filter(|decision| decision.label != ScreeningLabel::Exclude)
+        {
             let key = decision
                 .tags
                 .first()
@@ -522,8 +546,8 @@ fn parse_structured_response<T: DeserializeOwned>(body: &str) -> Result<T> {
         return Ok(parsed);
     }
 
-    let envelope: Value =
-        serde_json::from_str(body).map_err(|err| anyhow::anyhow!("parse CLI JSON envelope: {err}; body={body}"))?;
+    let envelope: Value = serde_json::from_str(body)
+        .map_err(|err| anyhow::anyhow!("parse CLI JSON envelope: {err}; body={body}"))?;
 
     for key in ["structured_output", "result", "text", "content"] {
         if let Some(value) = envelope.get(key) {
@@ -545,8 +569,7 @@ fn parse_structured_response<T: DeserializeOwned>(body: &str) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Result;
-    use super::{parse_structured_response, TestAdapter, AgentAdapter};
+    use super::{parse_structured_response, AgentAdapter, TestAdapter};
     use nabla_contracts::{PaperId, PaperRecord, ProjectBrief, ScreeningLabel};
     use serde::Deserialize;
 
@@ -625,7 +648,12 @@ mod tests {
 
         let body = r#"{"type":"result","result":"{\"answer\":\"ok\"}"}"#;
         let parsed: Payload = parse_structured_response(body).unwrap();
-        assert_eq!(parsed, Payload { answer: "ok".into() });
+        assert_eq!(
+            parsed,
+            Payload {
+                answer: "ok".into()
+            }
+        );
     }
 
     #[test]

@@ -74,7 +74,12 @@ impl PaperSource for OpenAlexSource {
                     .doi
                     .as_ref()
                     .map(|doi| PaperId::Doi(doi.trim_start_matches("https://doi.org/").to_string()))
-                    .or_else(|| work.id.rsplit('/').next().map(|id| PaperId::OpenAlex(id.to_string())))
+                    .or_else(|| {
+                        work.id
+                            .rsplit('/')
+                            .next()
+                            .map(|id| PaperId::OpenAlex(id.to_string()))
+                    })
                     .unwrap_or_else(|| derived_paper_id(&work.display_name, work.publication_year)),
                 title: work.display_name,
                 authors: work
@@ -83,8 +88,12 @@ impl PaperSource for OpenAlexSource {
                     .filter_map(|auth| auth.author.map(|author| author.display_name))
                     .collect(),
                 year: work.publication_year.map(|year| year as u16),
-                abstract_text: work.abstract_inverted_index.map(|index| rebuild_inverted_index(index)),
-                source_url: work.primary_location.and_then(|location| location.landing_page_url),
+                abstract_text: work
+                    .abstract_inverted_index
+                    .map(|index| rebuild_inverted_index(index)),
+                source_url: work
+                    .primary_location
+                    .and_then(|location| location.landing_page_url),
                 source_name: "openalex".to_string(),
             })
             .collect())
@@ -220,7 +229,10 @@ fn parse_arxiv_feed(xml: &str) -> Result<Vec<PaperRecord>> {
                 current_tag.clear();
             }
             Ok(Event::Text(e)) if in_entry => {
-                let text = e.unescape().context("unescape arXiv xml text")?.into_owned();
+                let text = e
+                    .unescape()
+                    .context("unescape arXiv xml text")?
+                    .into_owned();
                 match current_tag.as_str() {
                     "title" => entry.title = text,
                     "id" => entry.id = text,
@@ -257,7 +269,9 @@ fn parse_arxiv_feed(xml: &str) -> Result<Vec<PaperRecord>> {
                 title: entry.title.replace('\n', " ").trim().to_string(),
                 authors: entry.authors,
                 year,
-                abstract_text: entry.summary.map(|summary| summary.replace('\n', " ").trim().to_string()),
+                abstract_text: entry
+                    .summary
+                    .map(|summary| summary.replace('\n', " ").trim().to_string()),
                 source_url: Some(entry.id),
                 source_name: "arxiv".to_string(),
             }

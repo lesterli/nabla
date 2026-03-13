@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use nabla_adapters::AgentAdapter;
-use nabla_contracts::{Phase, ProjectBrief, RunManifest, RunStatus, ScreeningDecision, TopicCandidate};
+use nabla_contracts::{
+    Phase, ProjectBrief, RunManifest, RunStatus, ScreeningDecision, TopicCandidate,
+};
 use nabla_sources::PaperCollector;
 use nabla_storage::SqliteStorage;
 use serde::Serialize;
@@ -35,6 +37,10 @@ impl<'a> TopicWorkflow<'a> {
 
     pub fn run(&self, brief: &ProjectBrief) -> Result<WorkflowOutput> {
         let run_id = generate_run_id();
+        self.run_with_id(brief, run_id)
+    }
+
+    pub fn run_with_id(&self, brief: &ProjectBrief, run_id: String) -> Result<WorkflowOutput> {
         let mut manifest = RunManifest {
             run_id: run_id.clone(),
             project_id: brief.id.clone(),
@@ -47,14 +53,16 @@ impl<'a> TopicWorkflow<'a> {
         self.storage.upsert_run_manifest(&manifest)?;
 
         self.run_phase(&mut manifest, Phase::Frame, || {
-            self.storage.write_json_artifact(&run_id, "project_brief.json", brief)?;
+            self.storage
+                .write_json_artifact(&run_id, "project_brief.json", brief)?;
             Ok(())
         })?;
 
         let papers = self.run_phase(&mut manifest, Phase::Collect, || {
             let papers = self.collector.collect(brief).context("collect papers")?;
             self.storage.persist_papers(&brief.id, &papers)?;
-            self.storage.write_json_artifact(&run_id, "paper_set.json", &papers)?;
+            self.storage
+                .write_json_artifact(&run_id, "paper_set.json", &papers)?;
             Ok(papers)
         })?;
 
@@ -64,7 +72,8 @@ impl<'a> TopicWorkflow<'a> {
                 .screen(brief, &papers)
                 .with_context(|| format!("screen papers with adapter {}", self.adapter.name()))?;
             self.storage.persist_screening_decisions(&screening)?;
-            self.storage.write_json_artifact(&run_id, "screening.json", &screening)?;
+            self.storage
+                .write_json_artifact(&run_id, "screening.json", &screening)?;
             Ok(screening)
         })?;
 
@@ -74,7 +83,8 @@ impl<'a> TopicWorkflow<'a> {
                 .propose(brief, &papers, &screening)
                 .with_context(|| format!("propose topics with adapter {}", self.adapter.name()))?;
             self.storage.persist_topic_candidates(&topics)?;
-            self.storage.write_json_artifact(&run_id, "topic_brief.json", &topics)?;
+            self.storage
+                .write_json_artifact(&run_id, "topic_brief.json", &topics)?;
             Ok(topics)
         })?;
 
@@ -113,9 +123,11 @@ impl<'a> TopicWorkflow<'a> {
                     "error.txt",
                     &format!("phase={phase}\nerror={error:#}"),
                 );
-                let _ = self
-                    .storage
-                    .write_json_artifact(&manifest.run_id, "run_manifest.json", manifest);
+                let _ = self.storage.write_json_artifact(
+                    &manifest.run_id,
+                    "run_manifest.json",
+                    manifest,
+                );
                 Err(error)
             }
         }
@@ -187,7 +199,11 @@ mod tests {
                 title: "Test topic".into(),
                 why_now: "Test rationale".into(),
                 scope: "Test scope".into(),
-                representative_paper_ids: papers.iter().take(1).map(|paper| paper.paper_id.clone()).collect(),
+                representative_paper_ids: papers
+                    .iter()
+                    .take(1)
+                    .map(|paper| paper.paper_id.clone())
+                    .collect(),
                 entry_risk: "Test risk".into(),
                 fallback_scope: "Test fallback scope".into(),
             }])
@@ -197,7 +213,9 @@ mod tests {
     #[test]
     fn runs_end_to_end_with_static_collector() {
         let temp = TempDir::new().unwrap();
-        let storage = SqliteStorage::open(temp.path().join("runs.db"), temp.path().join("artifacts")).unwrap();
+        let storage =
+            SqliteStorage::open(temp.path().join("runs.db"), temp.path().join("artifacts"))
+                .unwrap();
         let collector = StaticCollector::new(vec![PaperRecord {
             paper_id: PaperId::DerivedHash("p1".into()),
             title: "Neural operator methods for PDE discovery".into(),

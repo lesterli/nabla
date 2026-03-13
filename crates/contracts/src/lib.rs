@@ -76,6 +76,7 @@ pub struct TopicCandidate {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum Phase {
     Frame,
     Collect,
@@ -103,6 +104,7 @@ impl std::fmt::Display for Phase {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum RunStatus {
     Pending,
     Running,
