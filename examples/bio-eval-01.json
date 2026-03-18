@@ -1,0 +1,18 @@
+{
+  "id": "bio-eval-01-crispr-delivery",
+  "goal": "CRISPR delivery methods for in vivo gene therapy",
+  "keywords": [
+    "CRISPR",
+    "delivery",
+    "in vivo",
+    "gene therapy"
+  ],
+  "constraints": [
+    "Focus on 2020-2026",
+    "Prefer clinical or preclinical studies"
+  ],
+  "date_range": {
+    "start": "2020-01-01",
+    "end": null
+  }
+}

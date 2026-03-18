@@ -100,16 +100,35 @@
 
 ## 数据源与可信度
 
-| 级别 | 来源 | 处理方式 |
-|------|------|---------|
-| L1 | OpenAlex | 结构化元数据完整，直接使用 |
-| L2 | arXiv | 预印本，标注来源 |
+| 级别 | 来源 | 覆盖领域 | 处理方式 |
+|------|------|---------|---------|
+| L1 | OpenAlex | 全领域，240M+ 论文 | 结构化元数据完整，直接使用 |
+| L1 | PubMed | 生物医学，36M+ 论文 | E-utilities API，完整摘要 + MeSH 语义标签 |
+| L2 | arXiv | CS/Physics/Math 预印本 | 标注来源 |
+
+### 数据源选型依据（2026-03 生物学实测）
+
+针对 CRISPR delivery / gut-brain axis / spatial transcriptomics 三个生物学 case 实测：
+
+| 数据源 | CRISPR case 命中 | 摘要覆盖率 | 关键优势 |
+|--------|-----------------|-----------|---------|
+| arXiv | **0 篇** | — | 生物学 q-bio 类目覆盖极小 |
+| OpenAlex | 25 篇 | 52% | 广覆盖但摘要为倒排索引重建，不完整 |
+| **PubMed** | **592 篇** | **完整** | MeSH 语义标签自动解决跨术语问题 |
+| Semantic Scholar | 2117 篇（bulk） | 100% | 跨领域广，引用图 API 强，但相关性排序弱 |
+
+**选择 PubMed 作为生物医学主源的理由**：
+1. MeSH 术语体系天然解决跨术语检索（`gut microbiome` 自动匹配 `gastrointestinal microbiome` / `intestinal flora`），减少对 LLM query 展开的依赖
+2. 完整摘要保障下游 Screen 阶段判断质量
+3. PMC 子集已包含 bioRxiv/medRxiv 预印本
+
+Semantic Scholar 作为后续引用链扩展的备选源（详见 [collect-pipeline.md](./collect-pipeline.md) P2）。
 
 **证据链**：选题建议 → scope 定义 → delta 差异声明 → 代表性论文 → 筛选理由 → 置信度。从结论到原始论文可追溯。
 
 > 可观测性：当前证据链能解释"结论依据哪些论文"，但不能解释"为什么选这几篇"以及"topic 如何从论文集聚类形成"。聚类过程发生在 LLM 的 Propose 调用内部不可见。后续版本可通过让 LLM 输出聚类理由来改善。
 
-**去重**：DOI → arXiv ID → 标题哈希。冲突时 OpenAlex 优先。
+**去重**：DOI > PubMed ID > arXiv ID > OpenAlex ID > 标题哈希。冲突时取摘要最完整的记录。
 
 ## 评估方案
 

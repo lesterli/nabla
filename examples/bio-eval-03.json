@@ -1,0 +1,17 @@
+{
+  "id": "bio-eval-03-spatial-transcriptomics",
+  "goal": "computational methods for spatial transcriptomics data analysis",
+  "keywords": [
+    "spatial transcriptomics",
+    "computational methods",
+    "cell type deconvolution",
+    "gene expression"
+  ],
+  "constraints": [
+    "Focus on methods and benchmarks, not pure applications"
+  ],
+  "date_range": {
+    "start": "2021-01-01",
+    "end": null
+  }
+}

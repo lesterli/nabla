@@ -1,0 +1,18 @@
+{
+  "id": "bio-eval-02-gut-brain",
+  "goal": "gut microbiome influence on neurodegenerative disease progression",
+  "keywords": [
+    "gut microbiome",
+    "neurodegeneration",
+    "Alzheimer",
+    "Parkinson",
+    "gut-brain axis"
+  ],
+  "constraints": [
+    "Include both clinical and mechanistic studies"
+  ],
+  "date_range": {
+    "start": "2018-01-01",
+    "end": null
+  }
+}
