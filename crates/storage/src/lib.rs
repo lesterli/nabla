@@ -518,6 +518,8 @@ fn parse_paper_id_from_key(key: &str) -> Result<PaperId> {
         Ok(PaperId::Arxiv(value.to_string()))
     } else if let Some(value) = key.strip_prefix("openalex:") {
         Ok(PaperId::OpenAlex(value.to_string()))
+    } else if let Some(value) = key.strip_prefix("pubmed:") {
+        Ok(PaperId::PubMed(value.to_string()))
     } else if let Some(value) = key.strip_prefix("derived:") {
         Ok(PaperId::DerivedHash(value.to_string()))
     } else {

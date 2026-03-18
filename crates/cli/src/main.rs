@@ -3,7 +3,7 @@ use clap::Parser;
 use nabla_adapters::{AgentAdapter, LocalCliAdapter};
 use nabla_contracts::ProjectBrief;
 use nabla_service::TopicAgentService;
-use nabla_sources::{ArxivSource, CompositeCollector, OpenAlexSource};
+use nabla_sources::{ArxivSource, CompositeCollector, OpenAlexSource, PubMedSource};
 use nabla_storage::SqliteStorage;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,6 +24,9 @@ struct Args {
     openalex_limit: usize,
 
     #[arg(long, default_value_t = 10)]
+    pubmed_limit: usize,
+
+    #[arg(long, default_value_t = 10)]
     arxiv_limit: usize,
 
     #[arg(long, default_value = "codex")]
@@ -36,6 +39,7 @@ fn main() -> Result<()> {
 
     let storage = SqliteStorage::open(&args.db, &args.artifacts_dir)?;
     let collector = Box::new(CompositeCollector::new(vec![
+        Box::new(PubMedSource::new(args.pubmed_limit)),
         Box::new(OpenAlexSource::new(args.openalex_limit)),
         Box::new(ArxivSource::new(args.arxiv_limit)),
     ]));

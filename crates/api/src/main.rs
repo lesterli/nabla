@@ -9,7 +9,7 @@ use clap::Parser;
 use nabla_adapters::{AgentAdapter, ApiAdapter, LocalCliAdapter};
 use nabla_contracts::{ProjectBrief, ScreeningDecision};
 use nabla_service::TopicAgentService;
-use nabla_sources::{ArxivSource, CompositeCollector, OpenAlexSource};
+use nabla_sources::{ArxivSource, CompositeCollector, OpenAlexSource, PubMedSource};
 use nabla_storage::SqliteStorage;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -25,6 +25,7 @@ struct ServerConfig {
     db: String,
     artifacts_dir: String,
     openalex_limit: usize,
+    pubmed_limit: usize,
     arxiv_limit: usize,
     adapter: String,
     api_key: Option<String>,
@@ -59,24 +60,39 @@ fn build_adapter(config: &ServerConfig) -> Result<Box<dyn AgentAdapter>> {
                 .api_key
                 .clone()
                 .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-                .ok_or_else(|| anyhow::anyhow!("anthropic adapter requires --api-key or ANTHROPIC_API_KEY env"))?;
-            Ok(Box::new(ApiAdapter::anthropic(api_key, config.model.clone(), config.base_url.clone())))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("anthropic adapter requires --api-key or ANTHROPIC_API_KEY env")
+                })?;
+            Ok(Box::new(ApiAdapter::anthropic(
+                api_key,
+                config.model.clone(),
+                config.base_url.clone(),
+            )))
         }
         "openai" => {
             let api_key = config
                 .api_key
                 .clone()
                 .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                .ok_or_else(|| anyhow::anyhow!("openai adapter requires --api-key or OPENAI_API_KEY env"))?;
-            Ok(Box::new(ApiAdapter::openai(api_key, config.model.clone(), config.base_url.clone())))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("openai adapter requires --api-key or OPENAI_API_KEY env")
+                })?;
+            Ok(Box::new(ApiAdapter::openai(
+                api_key,
+                config.model.clone(),
+                config.base_url.clone(),
+            )))
         }
-        other => anyhow::bail!("unsupported adapter: {other} (options: test, codex, claude, anthropic, openai)"),
+        other => anyhow::bail!(
+            "unsupported adapter: {other} (options: test, codex, claude, anthropic, openai)"
+        ),
     }
 }
 
 fn build_service(config: &ServerConfig) -> Result<TopicAgentService> {
     let storage = SqliteStorage::open(&config.db, &config.artifacts_dir)?;
     let collector = Box::new(CompositeCollector::new(vec![
+        Box::new(PubMedSource::new(config.pubmed_limit)),
         Box::new(OpenAlexSource::new(config.openalex_limit)),
         Box::new(ArxivSource::new(config.arxiv_limit)),
     ]));
@@ -98,6 +114,9 @@ struct Args {
 
     #[arg(long, default_value_t = 5)]
     openalex_limit: usize,
+
+    #[arg(long, default_value_t = 5)]
+    pubmed_limit: usize,
 
     #[arg(long, default_value_t = 5)]
     arxiv_limit: usize,
@@ -137,6 +156,7 @@ fn main() -> Result<()> {
         db: args.db,
         artifacts_dir: args.artifacts_dir,
         openalex_limit: args.openalex_limit,
+        pubmed_limit: args.pubmed_limit,
         arxiv_limit: args.arxiv_limit,
         adapter: args.adapter,
         api_key: args.api_key,
@@ -195,7 +215,11 @@ async fn create_run(
         Ok(service) => {
             if let Err(error) = service.execute_submitted_run(&background_brief, &background_run_id)
             {
-                tracing::error!(run_id = background_run_id, error = format!("{error:#}"), "background run failed");
+                tracing::error!(
+                    run_id = background_run_id,
+                    error = format!("{error:#}"),
+                    "background run failed"
+                );
             }
         }
         Err(error) => {

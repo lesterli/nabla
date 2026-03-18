@@ -21,6 +21,7 @@ pub enum PaperId {
     Doi(String),
     Arxiv(String),
     OpenAlex(String),
+    PubMed(String),
     DerivedHash(String),
 }
 
@@ -30,6 +31,7 @@ impl PaperId {
             PaperId::Doi(value) => format!("doi:{value}"),
             PaperId::Arxiv(value) => format!("arxiv:{value}"),
             PaperId::OpenAlex(value) => format!("openalex:{value}"),
+            PaperId::PubMed(value) => format!("pubmed:{value}"),
             PaperId::DerivedHash(value) => format!("derived:{value}"),
         }
     }

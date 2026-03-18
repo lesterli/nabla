@@ -1,11 +1,15 @@
-use anyhow::{anyhow, Context, Result};
+mod arxiv;
+mod openalex;
+mod pubmed;
+
+use anyhow::{anyhow, Result};
 use nabla_contracts::{PaperId, PaperRecord, ProjectBrief};
-use quick_xml::events::Event;
-use quick_xml::Reader;
-use reqwest::blocking::Client;
-use serde::Deserialize;
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
+
+pub use arxiv::ArxivSource;
+pub use openalex::OpenAlexSource;
+pub use pubmed::PubMedSource;
 
 pub trait PaperCollector: Send + Sync {
     fn collect(&self, brief: &ProjectBrief) -> Result<Vec<PaperRecord>>;
@@ -28,115 +32,20 @@ impl CompositeCollector {
 impl PaperCollector for CompositeCollector {
     fn collect(&self, brief: &ProjectBrief) -> Result<Vec<PaperRecord>> {
         let mut papers = Vec::new();
+        let mut errors = Vec::new();
+
         for source in &self.sources {
-            papers.extend(source.fetch(brief)?);
+            match source.fetch(brief) {
+                Ok(source_papers) => papers.extend(source_papers),
+                Err(error) => errors.push(error.to_string()),
+            }
         }
+
+        if papers.is_empty() && !errors.is_empty() {
+            return Err(anyhow!("all paper sources failed: {}", errors.join("; ")));
+        }
+
         Ok(dedup_papers(papers))
-    }
-}
-
-#[derive(Clone)]
-pub struct OpenAlexSource {
-    client: Client,
-    limit: usize,
-}
-
-impl OpenAlexSource {
-    pub fn new(limit: usize) -> Self {
-        Self {
-            client: Client::new(),
-            limit,
-        }
-    }
-}
-
-impl PaperSource for OpenAlexSource {
-    fn fetch(&self, brief: &ProjectBrief) -> Result<Vec<PaperRecord>> {
-        let query = brief.keywords.join(" ");
-        let url = format!(
-            "https://api.openalex.org/works?search={}&per-page={}",
-            urlencoding::encode(&query),
-            self.limit
-        );
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .context("send OpenAlex request")?
-            .error_for_status()
-            .context("OpenAlex returned error status")?;
-        let payload: OpenAlexResponse = response.json().context("parse OpenAlex response")?;
-        Ok(payload
-            .results
-            .into_iter()
-            .map(|work| PaperRecord {
-                paper_id: work
-                    .doi
-                    .as_ref()
-                    .map(|doi| PaperId::Doi(doi.trim_start_matches("https://doi.org/").to_string()))
-                    .or_else(|| {
-                        work.id
-                            .rsplit('/')
-                            .next()
-                            .map(|id| PaperId::OpenAlex(id.to_string()))
-                    })
-                    .unwrap_or_else(|| derived_paper_id(&work.display_name, work.publication_year)),
-                title: work.display_name,
-                authors: work
-                    .authorships
-                    .into_iter()
-                    .filter_map(|auth| auth.author.map(|author| author.display_name))
-                    .collect(),
-                year: work.publication_year.map(|year| year as u16),
-                abstract_text: work
-                    .abstract_inverted_index
-                    .map(|index| rebuild_inverted_index(index)),
-                source_url: work
-                    .primary_location
-                    .and_then(|location| location.landing_page_url),
-                source_name: "openalex".to_string(),
-            })
-            .collect())
-    }
-}
-
-#[derive(Clone)]
-pub struct ArxivSource {
-    client: Client,
-    limit: usize,
-}
-
-impl ArxivSource {
-    pub fn new(limit: usize) -> Self {
-        Self {
-            client: Client::new(),
-            limit,
-        }
-    }
-}
-
-impl PaperSource for ArxivSource {
-    fn fetch(&self, brief: &ProjectBrief) -> Result<Vec<PaperRecord>> {
-        let query = brief
-            .keywords
-            .iter()
-            .map(|keyword| format!("all:\"{}\"", keyword))
-            .collect::<Vec<_>>()
-            .join("+AND+");
-        let url = format!(
-            "https://export.arxiv.org/api/query?search_query={}&start=0&max_results={}",
-            query, self.limit
-        );
-        let body = self
-            .client
-            .get(url)
-            .send()
-            .context("send arXiv request")?
-            .error_for_status()
-            .context("arXiv returned error status")?
-            .text()
-            .context("read arXiv response body")?;
-        parse_arxiv_feed(&body)
     }
 }
 
@@ -157,31 +66,102 @@ impl PaperCollector for StaticCollector {
     }
 }
 
-// TODO: cross-source dedup — the same paper fetched from OpenAlex (with DOI) and arXiv
-// (with arXiv ID) will not be merged here. Implement canonical ID normalization with
-// priority DOI > arXiv > OpenAlex > DerivedHash as described in the MVP spec.
 fn dedup_papers(papers: Vec<PaperRecord>) -> Vec<PaperRecord> {
     let mut deduped: BTreeMap<String, PaperRecord> = BTreeMap::new();
+
     for paper in papers {
-        let key = paper.paper_id.as_key();
+        let key = canonical_paper_key(&paper.paper_id);
         if let Some(existing) = deduped.get_mut(&key) {
-            if existing.abstract_text.is_none() {
-                existing.abstract_text = paper.abstract_text.clone();
-            }
-            if existing.source_url.is_none() {
-                existing.source_url = paper.source_url.clone();
-            }
-            if !existing.source_name.contains(&paper.source_name) {
-                existing.source_name = format!("{},{}", existing.source_name, paper.source_name);
-            }
+            merge_paper_records(existing, &paper);
         } else {
             deduped.insert(key, paper);
         }
     }
+
     deduped.into_values().collect()
 }
 
-fn derived_paper_id(title: &str, year: Option<i64>) -> PaperId {
+fn merge_paper_records(existing: &mut PaperRecord, incoming: &PaperRecord) {
+    if should_replace_text(
+        existing.abstract_text.as_deref(),
+        incoming.abstract_text.as_deref(),
+    ) {
+        existing.abstract_text = incoming.abstract_text.clone();
+    }
+
+    if existing.source_url.is_none() {
+        existing.source_url = incoming.source_url.clone();
+    }
+
+    if existing.authors.is_empty() && !incoming.authors.is_empty() {
+        existing.authors = incoming.authors.clone();
+    }
+
+    if existing.year.is_none() {
+        existing.year = incoming.year;
+    }
+
+    if existing.title.trim().is_empty() && !incoming.title.trim().is_empty() {
+        existing.title = incoming.title.clone();
+    }
+
+    existing.source_name = merge_source_names(&existing.source_name, &incoming.source_name);
+}
+
+fn should_replace_text(existing: Option<&str>, incoming: Option<&str>) -> bool {
+    let existing_len = existing.map(str::trim).map(str::len).unwrap_or(0);
+    let incoming_len = incoming.map(str::trim).map(str::len).unwrap_or(0);
+    incoming_len > existing_len
+}
+
+fn merge_source_names(existing: &str, incoming: &str) -> String {
+    let mut names = Vec::new();
+
+    for value in [existing, incoming] {
+        for name in value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            if !names.iter().any(|seen: &String| seen == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+
+    names.join(",")
+}
+
+pub(crate) fn canonical_paper_key(paper_id: &PaperId) -> String {
+    match paper_id {
+        PaperId::Doi(value) => {
+            let doi = normalize_doi(value).unwrap_or_else(|| value.trim().to_lowercase());
+            format!("doi:{doi}")
+        }
+        PaperId::Arxiv(value) => format!("arxiv:{}", value.trim()),
+        PaperId::OpenAlex(value) => format!("openalex:{}", value.trim()),
+        PaperId::PubMed(value) => format!("pubmed:{}", value.trim()),
+        PaperId::DerivedHash(value) => format!("derived:{}", value.trim()),
+    }
+}
+
+pub(crate) fn normalize_doi(value: &str) -> Option<String> {
+    let normalized = value
+        .trim()
+        .trim_start_matches("https://doi.org/")
+        .trim_start_matches("http://doi.org/")
+        .trim_start_matches("doi:")
+        .trim()
+        .to_lowercase();
+
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+pub(crate) fn derived_paper_id(title: &str, year: Option<u16>) -> PaperId {
     let mut hasher = Sha1::new();
     hasher.update(title.trim().to_lowercase().as_bytes());
     if let Some(year) = year {
@@ -190,7 +170,7 @@ fn derived_paper_id(title: &str, year: Option<i64>) -> PaperId {
     PaperId::DerivedHash(format!("{:x}", hasher.finalize()))
 }
 
-fn rebuild_inverted_index(index: BTreeMap<String, Vec<usize>>) -> String {
+pub(crate) fn rebuild_inverted_index(index: BTreeMap<String, Vec<usize>>) -> String {
     let mut words = vec![String::new(); index.values().flatten().max().map(|v| v + 1).unwrap_or(0)];
     for (token, positions) in index {
         for position in positions {
@@ -202,169 +182,120 @@ fn rebuild_inverted_index(index: BTreeMap<String, Vec<usize>>) -> String {
     words.join(" ").trim().to_string()
 }
 
-fn parse_arxiv_feed(xml: &str) -> Result<Vec<PaperRecord>> {
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-    let mut buffer = Vec::new();
-    let mut in_entry = false;
-    let mut current_tag = String::new();
-    let mut entries = Vec::new();
-    let mut entry = ArxivEntry::default();
-
-    loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(Event::Start(e)) => {
-                current_tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if current_tag == "entry" {
-                    in_entry = true;
-                    entry = ArxivEntry::default();
-                }
-            }
-            Ok(Event::End(e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if tag == "entry" && in_entry {
-                    entries.push(entry.clone());
-                    in_entry = false;
-                }
-                current_tag.clear();
-            }
-            Ok(Event::Text(e)) if in_entry => {
-                let text = e
-                    .unescape()
-                    .context("unescape arXiv xml text")?
-                    .into_owned();
-                match current_tag.as_str() {
-                    "title" => entry.title = text,
-                    "id" => entry.id = text,
-                    "summary" => entry.summary = Some(text),
-                    "published" => entry.published = Some(text),
-                    "name" => entry.authors.push(text),
-                    _ => {}
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(err) => return Err(anyhow!("parse arXiv feed: {err}")),
-            _ => {}
-        }
-        buffer.clear();
+pub(crate) fn search_terms(brief: &ProjectBrief) -> Vec<String> {
+    if brief.keywords.is_empty() {
+        vec![brief.goal.clone()]
+    } else {
+        brief.keywords.clone()
     }
-
-    Ok(entries
-        .into_iter()
-        .filter(|entry| !entry.title.is_empty())
-        .map(|entry| {
-            let arxiv_id = entry
-                .id
-                .rsplit('/')
-                .next()
-                .unwrap_or(entry.id.as_str())
-                .to_string();
-            let year = entry
-                .published
-                .as_ref()
-                .and_then(|published| published.get(0..4))
-                .and_then(|year| year.parse::<u16>().ok());
-            PaperRecord {
-                paper_id: PaperId::Arxiv(arxiv_id),
-                title: entry.title.replace('\n', " ").trim().to_string(),
-                authors: entry.authors,
-                year,
-                abstract_text: entry
-                    .summary
-                    .map(|summary| summary.replace('\n', " ").trim().to_string()),
-                source_url: Some(entry.id),
-                source_name: "arxiv".to_string(),
-            }
-        })
-        .collect())
 }
 
-#[derive(Default, Clone)]
-struct ArxivEntry {
-    id: String,
-    title: String,
-    summary: Option<String>,
-    published: Option<String>,
-    authors: Vec<String>,
+pub(crate) fn search_text(brief: &ProjectBrief) -> String {
+    search_terms(brief).join(" ")
 }
 
-#[derive(Debug, Deserialize)]
-struct OpenAlexResponse {
-    results: Vec<OpenAlexWork>,
+pub(crate) fn start_year(brief: &ProjectBrief) -> Option<u16> {
+    brief
+        .date_range
+        .as_ref()
+        .and_then(|range| range.start.as_deref())
+        .and_then(parse_year)
 }
 
-#[derive(Debug, Deserialize)]
-struct OpenAlexWork {
-    id: String,
-    doi: Option<String>,
-    display_name: String,
-    publication_year: Option<i64>,
-    authorships: Vec<OpenAlexAuthorship>,
-    abstract_inverted_index: Option<BTreeMap<String, Vec<usize>>>,
-    primary_location: Option<OpenAlexLocation>,
+pub(crate) fn parse_year(value: &str) -> Option<u16> {
+    value.trim().get(0..4)?.parse().ok()
 }
 
-#[derive(Debug, Deserialize)]
-struct OpenAlexAuthorship {
-    author: Option<OpenAlexAuthor>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAlexAuthor {
-    display_name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAlexLocation {
-    landing_page_url: Option<String>,
+pub(crate) fn normalize_date(value: &str) -> String {
+    value.trim().replace('-', "/")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{dedup_papers, parse_arxiv_feed};
-    use nabla_contracts::{PaperId, PaperRecord};
+    use super::{
+        canonical_paper_key, dedup_papers, CompositeCollector, PaperCollector, PaperSource,
+    };
+    use anyhow::{anyhow, Result};
+    use nabla_contracts::{PaperId, PaperRecord, ProjectBrief};
+
+    struct FailingSource;
+
+    impl PaperSource for FailingSource {
+        fn fetch(&self, _brief: &ProjectBrief) -> Result<Vec<PaperRecord>> {
+            Err(anyhow!("boom"))
+        }
+    }
+
+    struct StaticSource(Vec<PaperRecord>);
+
+    impl PaperSource for StaticSource {
+        fn fetch(&self, _brief: &ProjectBrief) -> Result<Vec<PaperRecord>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn sample_brief() -> ProjectBrief {
+        ProjectBrief {
+            id: "p1".into(),
+            goal: "find papers".into(),
+            constraints: vec![],
+            keywords: vec!["crispr".into()],
+            date_range: None,
+        }
+    }
 
     #[test]
-    fn dedups_by_paper_id() {
+    fn dedups_by_normalized_doi() {
         let deduped = dedup_papers(vec![
             PaperRecord {
-                paper_id: PaperId::Arxiv("1234".into()),
+                paper_id: PaperId::Doi("https://doi.org/10.1000/ABC".into()),
                 title: "A".into(),
                 authors: vec![],
                 year: Some(2024),
                 abstract_text: None,
                 source_url: None,
-                source_name: "arxiv".into(),
+                source_name: "openalex".into(),
             },
             PaperRecord {
-                paper_id: PaperId::Arxiv("1234".into()),
+                paper_id: PaperId::Doi("doi:10.1000/abc".into()),
                 title: "A".into(),
                 authors: vec![],
                 year: Some(2024),
                 abstract_text: Some("text".into()),
                 source_url: Some("url".into()),
-                source_name: "openalex".into(),
+                source_name: "pubmed".into(),
             },
         ]);
+
         assert_eq!(deduped.len(), 1);
-        assert!(deduped[0].abstract_text.is_some());
+        assert_eq!(deduped[0].source_name, "openalex,pubmed");
+        assert_eq!(deduped[0].abstract_text.as_deref(), Some("text"));
     }
 
     #[test]
-    fn parses_basic_arxiv_feed() {
-        let xml = r#"
-        <feed xmlns="http://www.w3.org/2005/Atom">
-          <entry>
-            <id>http://arxiv.org/abs/1234.5678v1</id>
-            <title>Sample Paper</title>
-            <summary>Sample summary</summary>
-            <published>2024-01-01T00:00:00Z</published>
-            <author><name>Alice</name></author>
-          </entry>
-        </feed>
-        "#;
-        let papers = parse_arxiv_feed(xml).unwrap();
+    fn canonicalizes_pubmed_keys() {
+        assert_eq!(
+            canonical_paper_key(&PaperId::PubMed("12345".into())),
+            "pubmed:12345"
+        );
+    }
+
+    #[test]
+    fn collector_tolerates_single_source_failure() {
+        let collector = CompositeCollector::new(vec![
+            Box::new(FailingSource),
+            Box::new(StaticSource(vec![PaperRecord {
+                paper_id: PaperId::Arxiv("1234.5678".into()),
+                title: "Paper".into(),
+                authors: vec![],
+                year: Some(2024),
+                abstract_text: None,
+                source_url: None,
+                source_name: "arxiv".into(),
+            }])),
+        ]);
+
+        let papers = collector.collect(&sample_brief()).unwrap();
         assert_eq!(papers.len(), 1);
-        assert_eq!(papers[0].title, "Sample Paper");
     }
 }
