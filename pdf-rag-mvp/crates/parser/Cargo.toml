@@ -4,9 +4,15 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 
+[features]
+default = ["native"]
+native = ["pdf-extract"]
+docling = ["serde_json"]
+
 [dependencies]
 anyhow.workspace = true
 nabla-pdf-rag-contracts = { path = "../contracts" }
 nabla-pdf-rag-core = { path = "../core" }
+pdf-extract = { workspace = true, optional = true }
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, optional = true }

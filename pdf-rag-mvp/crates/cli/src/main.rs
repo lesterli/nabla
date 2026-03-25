@@ -7,7 +7,7 @@ use nabla_pdf_rag_core::*;
 use nabla_pdf_rag_embedder::HashEmbedder;
 use nabla_pdf_rag_hierarchy::RaptorLiteBuilder;
 use nabla_pdf_rag_llm::{ApiLlmClient, ApiProvider, LocalCliLlmClient};
-use nabla_pdf_rag_parser::DoclingParser;
+use nabla_pdf_rag_parser::PdfExtractParser;
 use nabla_pdf_rag_storage::{run_migrations, SqliteRepository};
 use rusqlite::Connection;
 use uuid::Uuid;
@@ -18,10 +18,6 @@ struct Args {
     /// Path to SQLite database
     #[arg(long, default_value = "nabla.db")]
     db: String,
-
-    /// Path to parser sidecar script (overrides auto-detection)
-    #[arg(long)]
-    sidecar: Option<PathBuf>,
 
     /// LLM provider
     #[arg(long, default_value = "mock")]
@@ -90,7 +86,7 @@ fn main() -> Result<()> {
         }
         Command::Import { library, paths } => {
             let repo = open_db(&args.db)?;
-            cmd_import(&repo, &library, &paths, args.sidecar.as_deref(), llm.as_ref())
+            cmd_import(&repo, &library, &paths, llm.as_ref())
         }
         Command::Ask { library, prompt } => {
             let repo = open_db(&args.db)?;
@@ -174,7 +170,6 @@ fn cmd_import(
     repo: &SqliteRepository,
     library_name: &str,
     paths: &[PathBuf],
-    sidecar_override: Option<&std::path::Path>,
     llm: &dyn LlmClient,
 ) -> Result<()> {
     if paths.is_empty() {
@@ -191,11 +186,7 @@ fn cmd_import(
     };
     let _ = repo.insert_library(&lib);
 
-    let sidecar_path = match sidecar_override {
-        Some(p) => p.to_path_buf(),
-        None => find_sidecar()?,
-    };
-    let parser = DoclingParser::new(sidecar_path);
+    let parser = PdfExtractParser;
     let builder = RaptorLiteBuilder::default();
     let embedder = HashEmbedder::default();
 
@@ -418,22 +409,6 @@ fn hash_path(path: &PathBuf) -> u64 {
         meta.len().hash(&mut hasher);
     }
     hasher.finish()
-}
-
-fn find_sidecar() -> Result<PathBuf> {
-    let candidates = [
-        PathBuf::from("scripts/docling_sidecar.py"),
-        PathBuf::from("pdf-rag-mvp/scripts/docling_sidecar.py"),
-    ];
-    for p in &candidates {
-        if p.exists() {
-            return Ok(p.clone());
-        }
-    }
-    bail!(
-        "Could not find docling_sidecar.py. Looked in: {:?}",
-        candidates
-    )
 }
 
 fn now() -> String {
