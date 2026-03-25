@@ -12,7 +12,7 @@ interface DocumentInfo {
 interface SidebarProps {
   documents: DocumentInfo[];
   selectedDocIds: string[];
-  onDocSelect: (docId: string) => void;
+  onDocSelect: (docId: string, multiSelect: boolean) => void;
   onSelectAll: () => void;
   onDocDeleted?: () => void;
 }
@@ -99,7 +99,7 @@ export function Sidebar({
           return (
             <button
               key={doc.id}
-              onClick={() => onDocSelect(doc.id)}
+              onClick={(e) => onDocSelect(doc.id, e.metaKey || e.ctrlKey)}
               onContextMenu={(e) => handleContextMenu(e, doc)}
               className={`w-full text-left px-3 py-2 border-b border-gray-100 dark:border-gray-800 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors ${
                 isSelected ? "bg-blue-50 dark:bg-blue-950" : ""

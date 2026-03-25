@@ -52,12 +52,17 @@ function App() {
     fetchSummaries();
   }, [selectedDocIds]);
 
-  const handleDocSelect = (docId: string) => {
-    setSelectedDocIds((prev) =>
-      prev.includes(docId)
-        ? prev.filter((id) => id !== docId)
-        : [...prev, docId]
-    );
+  const handleDocSelect = (docId: string, multiSelect: boolean) => {
+    setSelectedDocIds((prev) => {
+      if (multiSelect) {
+        // Cmd/Ctrl+click: toggle in multi-select
+        return prev.includes(docId)
+          ? prev.filter((id) => id !== docId)
+          : [...prev, docId];
+      }
+      // Single click: select only this one (or deselect if already sole selection)
+      return prev.length === 1 && prev[0] === docId ? [] : [docId];
+    });
   };
 
   const handleSelectAll = () => {
