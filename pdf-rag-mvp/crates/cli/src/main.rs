@@ -197,6 +197,7 @@ fn cmd_import(
             .unwrap_or_else(|| "unknown.pdf".into());
 
         println!("\n--- Importing: {file_name} ---");
+        let t0 = std::time::Instant::now();
 
         let doc_id = DocumentId::new(Uuid::new_v4().to_string());
         let checksum = format!("{:x}", hash_path(path));
@@ -261,7 +262,7 @@ fn cmd_import(
         );
 
         repo.update_document_state(&doc_id, &DocumentState::Ready, None)?;
-        println!("  Done: {file_name} → Ready");
+        println!("  Done: {file_name} → Ready ({:.1}s)", t0.elapsed().as_secs_f64());
     }
 
     Ok(())
