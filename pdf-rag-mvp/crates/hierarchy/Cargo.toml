@@ -1,0 +1,13 @@
+[package]
+name = "nabla-pdf-rag-hierarchy"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+nabla-pdf-rag-contracts = { path = "../contracts" }
+nabla-pdf-rag-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
