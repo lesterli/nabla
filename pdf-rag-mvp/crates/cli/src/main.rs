@@ -8,9 +8,13 @@ use nabla_pdf_rag_embedder::HashEmbedder;
 use nabla_pdf_rag_hierarchy::RaptorLiteBuilder;
 use nabla_pdf_rag_llm::{ApiLlmClient, ApiProvider, LocalCliLlmClient};
 use nabla_pdf_rag_parser::PdfExtractParser;
+use nabla_pdf_rag_retrieval::{ChunkEmbedding, HybridSearcher, LanceStore};
 use nabla_pdf_rag_storage::{run_migrations, SqliteRepository};
 use rusqlite::Connection;
 use uuid::Uuid;
+
+const EMBEDDING_DIM: i32 = 384; // must match HashEmbedder dimensions
+const LANCE_DIR: &str = "nabla.lance";
 
 #[derive(Debug, Parser)]
 #[command(name = "nabla-pdf", about = "PDF RAG MVP")]
@@ -18,6 +22,10 @@ struct Args {
     /// Path to SQLite database
     #[arg(long, default_value = "nabla.db")]
     db: String,
+
+    /// Path to LanceDB directory
+    #[arg(long, default_value = LANCE_DIR)]
+    lance: String,
 
     /// LLM provider
     #[arg(long, default_value = "mock")]
@@ -41,13 +49,9 @@ struct Args {
 
 #[derive(Debug, Clone, ValueEnum)]
 enum LlmProvider {
-    /// No real LLM — placeholder summaries
     Mock,
-    /// OpenAI-compatible API (also Kimi, MiniMax, DashScope)
     Openai,
-    /// Anthropic Claude API
     Anthropic,
-    /// Local `claude` CLI
     Claude,
 }
 
@@ -58,24 +62,21 @@ enum Command {
 
     /// Import PDF files into a library
     Import {
-        /// Library name (created if not exists)
         #[arg(long, default_value = "default")]
         library: String,
-        /// PDF file paths
         paths: Vec<PathBuf>,
     },
 
     /// Ask a question against the library
     Ask {
-        /// Library name
         #[arg(long, default_value = "default")]
         library: String,
-        /// Your question
         prompt: String,
     },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
     let llm = build_llm(&args)?;
 
@@ -86,11 +87,13 @@ fn main() -> Result<()> {
         }
         Command::Import { library, paths } => {
             let repo = open_db(&args.db)?;
-            cmd_import(&repo, &library, &paths, llm.as_ref())
+            let lance = LanceStore::open(&args.lance, EMBEDDING_DIM).await?;
+            cmd_import(&repo, &lance, &library, &paths, llm.as_ref()).await
         }
         Command::Ask { library, prompt } => {
             let repo = open_db(&args.db)?;
-            cmd_ask(&repo, &library, &prompt, llm.as_ref())
+            let lance = LanceStore::open(&args.lance, EMBEDDING_DIM).await?;
+            cmd_ask(&repo, &lance, &library, &prompt, llm.as_ref()).await
         }
     }
 }
@@ -166,8 +169,9 @@ fn print_blueprint() {
 
 // ─── Import ────────────────────────────────────────────────────────────────
 
-fn cmd_import(
+async fn cmd_import(
     repo: &SqliteRepository,
+    lance: &LanceStore,
     library_name: &str,
     paths: &[PathBuf],
     llm: &dyn LlmClient,
@@ -252,26 +256,48 @@ fn cmd_import(
             repo.insert_summary_node(node)?;
         }
 
-        // Embed
+        // Embed + persist to LanceDB
         repo.update_document_state(&doc_id, &DocumentState::Embedding, None)?;
         let embed_result = embedder.embed_chunks(&hierarchy.chunks, &progress)?;
+
+        let items: Vec<ChunkEmbedding> = embed_result
+            .indexed
+            .iter()
+            .zip(hierarchy.chunks.iter())
+            .map(|(r, c)| ChunkEmbedding {
+                record: r,
+                document_id: c.document_id.as_str(),
+                text: &c.text,
+            })
+            .collect();
+
+        lance.upsert_embeddings(&items).await?;
+
         println!(
-            "  Embedded {} chunks ({} failed)",
+            "  Embedded {} chunks → LanceDB ({} failed)",
             embed_result.indexed.len(),
             embed_result.failed.len()
         );
 
         repo.update_document_state(&doc_id, &DocumentState::Ready, None)?;
-        println!("  Done: {file_name} → Ready ({:.1}s)", t0.elapsed().as_secs_f64());
+        println!(
+            "  Done: {file_name} → Ready ({:.1}s)",
+            t0.elapsed().as_secs_f64()
+        );
     }
+
+    // Rebuild FTS index after all imports
+    lance.rebuild_fts_index().await?;
+    println!("\nFTS index rebuilt.");
 
     Ok(())
 }
 
 // ─── Ask ───────────────────────────────────────────────────────────────────
 
-fn cmd_ask(
+async fn cmd_ask(
     repo: &SqliteRepository,
+    lance: &LanceStore,
     library_name: &str,
     prompt: &str,
     llm: &dyn LlmClient,
@@ -284,68 +310,43 @@ fn cmd_ask(
         return Ok(());
     }
 
-    // Gather all chunks
-    let mut all_chunks = Vec::new();
-    for doc in &docs {
-        all_chunks.extend(repo.list_chunks(&doc.id)?);
-    }
+    // Embed the query for vector search
+    let embedder = HashEmbedder::default();
+    let query_embedding = embed_query(&embedder, prompt);
 
-    if all_chunks.is_empty() {
-        println!("No chunks found. Documents may not have been parsed yet.");
-        return Ok(());
-    }
+    // Hybrid search: vector + BM25 + RRF, fallback to FTS-only
+    let searcher = HybridSearcher::new(lance);
+    let hits = match searcher.hybrid_search(prompt, &query_embedding, 5).await {
+        Ok(h) => h,
+        Err(_) => searcher.fts_search(prompt, 5).await?,
+    };
 
-    // Keyword recall
-    let query_words: Vec<&str> = prompt.split_whitespace().collect();
-    let mut scored: Vec<(f32, &ChunkRecord)> = all_chunks
-        .iter()
-        .map(|c| {
-            let text_lower = c.text.to_lowercase();
-            let hits = query_words
-                .iter()
-                .filter(|w| text_lower.contains(&w.to_lowercase()))
-                .count();
-            (hits as f32 / query_words.len().max(1) as f32, c)
-        })
-        .filter(|(score, _)| *score > 0.0)
-        .collect();
-
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    let top_chunks: Vec<&ChunkRecord> = scored.iter().take(5).map(|(_, c)| *c).collect();
-
-    if top_chunks.is_empty() {
+    if hits.is_empty() {
         println!("No relevant chunks found for: \"{prompt}\"");
         return Ok(());
     }
 
     // Show evidence
     println!("Question: {prompt}\n");
-    println!("Evidence ({} chunks):\n", top_chunks.len());
+    println!("Evidence ({} chunks via hybrid search):\n", hits.len());
 
-    for (i, chunk) in top_chunks.iter().enumerate() {
-        let page_info = chunk
-            .page_span
-            .as_ref()
-            .map(|p| format!("pp.{}-{}", p.start, p.end))
-            .unwrap_or_else(|| "?".into());
-        let preview: String = chunk.text.chars().take(150).collect();
-        println!("  {}. [{}] {preview}...", i + 1, page_info);
+    for (i, hit) in hits.iter().enumerate() {
+        let preview: String = hit.text.chars().take(150).collect();
+        println!(
+            "  {}. [score={:.2}] [doc:{}] {preview}...",
+            i + 1,
+            hit.score,
+            &hit.document_id[..8.min(hit.document_id.len())]
+        );
     }
 
     // Generate answer via LLM
     println!("\n--- Answer ---\n");
 
-    let evidence_text: String = top_chunks
+    let evidence_text: String = hits
         .iter()
         .enumerate()
-        .map(|(i, c)| {
-            let pages = c
-                .page_span
-                .as_ref()
-                .map(|p| format!("pages {}-{}", p.start, p.end))
-                .unwrap_or_default();
-            format!("[{}] ({}) {}", i + 1, pages, c.text)
-        })
+        .map(|(i, h)| format!("[{}] {}", i + 1, h.text))
         .collect::<Vec<_>>()
         .join("\n\n");
 
@@ -363,6 +364,25 @@ fn cmd_ask(
     }
 
     Ok(())
+}
+
+/// Embed a query string using the same embedder as import.
+fn embed_query(embedder: &HashEmbedder, text: &str) -> Vec<f32> {
+    let fake_chunk = ChunkRecord {
+        id: ChunkId::new("query"),
+        document_id: DocumentId::new("query"),
+        summary_node_id: None,
+        ordinal: 0,
+        heading_path: vec![],
+        page_span: None,
+        text: text.into(),
+        token_count: 0,
+        embedding_state: EmbeddingState::Pending,
+    };
+    let result = embedder
+        .embed_chunks(&[fake_chunk], &NullProgress)
+        .expect("query embedding failed");
+    result.indexed[0].vector.clone()
 }
 
 // ─── Utilities ─────────────────────────────────────────────────────────────
