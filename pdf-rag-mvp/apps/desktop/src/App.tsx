@@ -77,6 +77,7 @@ function App() {
           selectedDocIds={selectedDocIds}
           onDocSelect={handleDocSelect}
           onSelectAll={handleSelectAll}
+          onDocDeleted={refreshDocuments}
         />
 
         <main className="flex-1 flex flex-col overflow-hidden">

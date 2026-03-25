@@ -73,6 +73,24 @@ impl SqliteRepository {
         Ok(())
     }
 
+    /// Delete a document and all its chunks and summary nodes.
+    pub fn delete_document(&self, doc_id: &DocumentId) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM chunks WHERE document_id = ?1",
+            params![doc_id.as_str()],
+        )?;
+        conn.execute(
+            "DELETE FROM summary_nodes WHERE document_id = ?1",
+            params![doc_id.as_str()],
+        )?;
+        conn.execute(
+            "DELETE FROM documents WHERE id = ?1",
+            params![doc_id.as_str()],
+        )?;
+        Ok(())
+    }
+
     pub fn insert_document(&self, doc: &DocumentRecord) -> Result<()> {
         self.lock().execute(
             "INSERT INTO documents (id, library_id, batch_id, file_name, source_path, checksum_sha256, page_count, title, authors, state, created_at, updated_at, error_message)

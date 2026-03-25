@@ -323,6 +323,14 @@ pub fn get_document_summaries(
     Ok(summaries)
 }
 
+/// Delete a document and all its chunks/summaries from SQLite.
+/// LanceDB data is left as-is (orphaned rows are harmless and cleaned on next rebuild).
+#[tauri::command]
+pub fn delete_document(doc_id: String, state: State<AppState>) -> Result<(), String> {
+    let id = DocumentId::new(doc_id);
+    state.repo.delete_document(&id).map_err(|e| e.to_string())
+}
+
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
 struct MockLlm;

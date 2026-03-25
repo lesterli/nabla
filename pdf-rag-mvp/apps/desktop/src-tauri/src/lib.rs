@@ -23,6 +23,7 @@ pub fn run() {
             commands::import_files,
             commands::ask_question,
             commands::get_document_summaries,
+            commands::delete_document,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
