@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use anyhow::{bail, Context, Result};
 use nabla_pdf_rag_contracts::ChunkRecord;
 use nabla_pdf_rag_core::{
@@ -9,10 +7,9 @@ use serde::Deserialize;
 
 /// OpenAI-compatible embedding API client.
 ///
-/// Works with any provider that implements the `/embeddings` endpoint:
-/// OpenAI, Azure OpenAI, Jina, Voyage, local vLLM, etc.
+/// Uses `ureq` (pure sync HTTP) to avoid tokio runtime conflicts.
+/// Works with any provider: OpenAI, GLM/ZhipuAI, Jina, Voyage, vLLM, etc.
 pub struct ApiEmbedder {
-    client: reqwest::blocking::Client,
     api_key: String,
     base_url: String,
     model: String,
@@ -28,15 +25,11 @@ impl ApiEmbedder {
         dimensions: Option<usize>,
     ) -> Self {
         Self {
-            client: reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(120))
-                .build()
-                .expect("failed to build HTTP client"),
             api_key: api_key.into(),
             base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
             model: model.unwrap_or_else(|| "text-embedding-3-small".into()),
             dimensions: dimensions.unwrap_or(1536),
-            batch_size: 64, // OpenAI allows up to 2048 inputs, but 64 is safe for most providers
+            batch_size: 64,
         }
     }
 
@@ -52,44 +45,35 @@ impl ApiEmbedder {
             "input": texts,
         });
 
-        // Only include dimensions if model supports it (OpenAI text-embedding-3-*)
-        if self.model.contains("text-embedding-3") {
-            body["dimensions"] = serde_json::json!(self.dimensions);
-        }
+        // Include dimensions for models that support it
+        body["dimensions"] = serde_json::json!(self.dimensions);
 
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+        let resp: serde_json::Value = ureq::post(&url)
+            .header("Authorization", &format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .context("Embedding API request failed")?;
+            .send_json(&body)
+            .context("Embedding API request failed")?
+            .body_mut()
+            .read_json()
+            .context("Failed to parse embedding response")?;
 
-        let status = resp.status();
-        let resp_body: serde_json::Value = resp.json().context("Failed to parse embedding response")?;
-
-        if !status.is_success() {
-            let msg = resp_body["error"]["message"]
-                .as_str()
-                .unwrap_or("unknown error");
-            bail!("Embedding API {status}: {msg}");
+        if let Some(err) = resp.get("error") {
+            let msg = err["message"].as_str().unwrap_or("unknown error");
+            bail!("Embedding API error: {msg}");
         }
 
-        let data = resp_body["data"]
+        let data = resp["data"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("No 'data' array in embedding response"))?;
 
-        let mut vectors: Vec<EmbeddingItem> = data
+        let mut items: Vec<EmbeddingItem> = data
             .iter()
             .map(|item| serde_json::from_value(item.clone()))
             .collect::<std::result::Result<Vec<_>, _>>()
             .context("Failed to parse embedding items")?;
 
-        // Sort by index to match input order
-        vectors.sort_by_key(|v| v.index);
-
-        Ok(vectors.into_iter().map(|v| v.embedding).collect())
+        items.sort_by_key(|v| v.index);
+        Ok(items.into_iter().map(|v| v.embedding).collect())
     }
 }
 
