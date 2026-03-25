@@ -331,6 +331,9 @@ async fn cmd_import(
             embed_result.indexed.len(),
             embed_result.failed.len()
         );
+        for (chunk_id, reason) in &embed_result.failed {
+            eprintln!("    FAIL {chunk_id}: {reason}");
+        }
 
         repo.update_document_state(&doc_id, &DocumentState::Ready, None)?;
         println!(
