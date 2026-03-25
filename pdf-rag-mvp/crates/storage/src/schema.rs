@@ -5,10 +5,11 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS libraries (
-            id          TEXT PRIMARY KEY,
-            name        TEXT NOT NULL,
-            root_dir    TEXT NOT NULL,
-            created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            id               TEXT PRIMARY KEY,
+            name             TEXT NOT NULL,
+            root_dir         TEXT NOT NULL,
+            created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            prompt_template  TEXT  -- path to prompt template file for this library's scenario
         );
 
         CREATE TABLE IF NOT EXISTS import_batches (

@@ -141,6 +141,8 @@ pub struct LibraryRecord {
     pub name: String,
     pub root_dir: String,
     pub created_at: String,
+    /// Path to a prompt template file for this library's scenario (e.g., "prompts/hr.md").
+    pub prompt_template: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

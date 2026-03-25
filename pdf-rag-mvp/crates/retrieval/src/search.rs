@@ -17,13 +17,27 @@ pub struct SearchHit {
 }
 
 /// Performs hybrid search (vector + BM25 + RRF) over the LanceDB chunks table.
+/// Optionally filters by document IDs.
 pub struct HybridSearcher<'a> {
     store: &'a LanceStore,
+    doc_filter: Option<String>,
 }
 
 impl<'a> HybridSearcher<'a> {
     pub fn new(store: &'a LanceStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            doc_filter: None,
+        }
+    }
+
+    /// Restrict search to specific document IDs.
+    pub fn with_doc_ids(mut self, doc_ids: &[&str]) -> Self {
+        if !doc_ids.is_empty() {
+            let quoted: Vec<String> = doc_ids.iter().map(|id| format!("'{id}'")).collect();
+            self.doc_filter = Some(format!("document_id IN ({})", quoted.join(", ")));
+        }
+        self
     }
 
     /// Vector-only search (ANN).
@@ -33,10 +47,16 @@ impl<'a> HybridSearcher<'a> {
         top_k: usize,
     ) -> Result<Vec<SearchHit>> {
         let table = self.store.open_table().await?;
-        let batches = table
+        let mut query = table
             .vector_search(query_embedding)?
             .distance_type(DistanceType::Cosine)
-            .limit(top_k)
+            .limit(top_k);
+
+        if let Some(filter) = &self.doc_filter {
+            query = query.only_if(filter.clone());
+        }
+
+        let batches = query
             .execute()
             .await?
             .try_collect::<Vec<_>>()
@@ -53,10 +73,16 @@ impl<'a> HybridSearcher<'a> {
         top_k: usize,
     ) -> Result<Vec<SearchHit>> {
         let table = self.store.open_table().await?;
-        let batches = table
+        let mut query = table
             .query()
             .full_text_search(FullTextSearchQuery::new(query_text.to_owned()))
-            .limit(top_k)
+            .limit(top_k);
+
+        if let Some(filter) = &self.doc_filter {
+            query = query.only_if(filter.clone());
+        }
+
+        let batches = query
             .execute()
             .await?
             .try_collect::<Vec<_>>()
@@ -74,11 +100,17 @@ impl<'a> HybridSearcher<'a> {
         top_k: usize,
     ) -> Result<Vec<SearchHit>> {
         let table = self.store.open_table().await?;
-        let batches = table
+        let mut query = table
             .query()
             .full_text_search(FullTextSearchQuery::new(query_text.to_owned()))
             .nearest_to(query_embedding)?
-            .limit(top_k)
+            .limit(top_k);
+
+        if let Some(filter) = &self.doc_filter {
+            query = query.only_if(filter.clone());
+        }
+
+        let batches = query
             .execute_hybrid(QueryExecutionOptions::default())
             .await?
             .try_collect::<Vec<_>>()
@@ -102,8 +134,6 @@ fn extract_hits(batches: &[arrow_array::RecordBatch]) -> Vec<SearchHit> {
             .column_by_name("text")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
-        // Try to extract actual relevance score from LanceDB
-        // hybrid → _relevance_score, vector → _distance, FTS → ordering
         let scores = batch
             .column_by_name("_relevance_score")
             .or_else(|| batch.column_by_name("_distance"))
@@ -137,23 +167,23 @@ mod tests {
     async fn setup_store(dir: &std::path::Path) -> LanceStore {
         let store = LanceStore::open(dir.to_str().unwrap(), 8).await.unwrap();
 
-        let test_data: Vec<(&str, &str)> = vec![
-            ("c-0", "RAPTOR builds hierarchical summaries for document retrieval"),
-            ("c-1", "BM25 is a probabilistic ranking function for full-text search"),
-            ("c-2", "Reciprocal Rank Fusion combines multiple retrieval channels"),
-            ("c-3", "PDF parsing extracts text and reading order from pages"),
-            ("c-4", "Vector embeddings capture semantic similarity between passages"),
-            ("c-5", "LanceDB is an embedded vector database with hybrid search"),
-            ("c-6", "Scientific papers often use two-column layouts"),
-            ("c-7", "Support-oppose framing affects attitude sharing behavior"),
-            ("c-8", "Machine learning models require large training datasets"),
-            ("c-9", "Bitcoin vaults enable trustless collateral management"),
+        let test_data: Vec<(&str, &str, &str)> = vec![
+            ("c-0", "doc-1", "RAPTOR builds hierarchical summaries for document retrieval"),
+            ("c-1", "doc-1", "BM25 is a probabilistic ranking function for full-text search"),
+            ("c-2", "doc-2", "Reciprocal Rank Fusion combines multiple retrieval channels"),
+            ("c-3", "doc-2", "PDF parsing extracts text and reading order from pages"),
+            ("c-4", "doc-1", "Vector embeddings capture semantic similarity between passages"),
+            ("c-5", "doc-3", "LanceDB is an embedded vector database with hybrid search"),
+            ("c-6", "doc-3", "Scientific papers often use two-column layouts"),
+            ("c-7", "doc-2", "Support-oppose framing affects attitude sharing behavior"),
+            ("c-8", "doc-1", "Machine learning models require large training datasets"),
+            ("c-9", "doc-3", "Bitcoin vaults enable trustless collateral management"),
         ];
 
         let records: Vec<EmbeddingRecord> = test_data
             .iter()
             .enumerate()
-            .map(|(i, (id, _))| {
+            .map(|(i, (id, _, _))| {
                 let mut v = vec![0.1f32; 8];
                 v[i % 8] += 0.5;
                 let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -168,9 +198,9 @@ mod tests {
         let items: Vec<ChunkEmbedding> = records
             .iter()
             .zip(test_data.iter())
-            .map(|(r, (_, text))| ChunkEmbedding {
+            .map(|(r, (_, doc_id, text))| ChunkEmbedding {
                 record: r,
-                document_id: "doc-1",
+                document_id: doc_id,
                 text,
             })
             .collect();
@@ -189,7 +219,6 @@ mod tests {
 
         let results = searcher.fts_search("vector database hybrid", 3).await.unwrap();
         assert!(!results.is_empty());
-        // Should find the LanceDB chunk
         assert!(results.iter().any(|h| h.text.contains("LanceDB")));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -232,6 +261,22 @@ mod tests {
             .await
             .unwrap();
         assert!(!results.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn doc_filter_restricts_results() {
+        let dir = std::env::temp_dir().join("nabla-lance-search-filter");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = setup_store(&dir).await;
+        let searcher = HybridSearcher::new(&store).with_doc_ids(&["doc-1"]);
+
+        let results = searcher.fts_search("search retrieval", 10).await.unwrap();
+        for hit in &results {
+            assert_eq!(hit.document_id, "doc-1", "Hit from wrong doc: {:?}", hit);
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

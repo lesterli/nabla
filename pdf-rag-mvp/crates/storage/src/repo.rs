@@ -35,8 +35,40 @@ impl SqliteRepository {
 
     pub fn insert_library(&self, lib: &LibraryRecord) -> Result<()> {
         self.lock().execute(
-            "INSERT INTO libraries (id, name, root_dir, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![lib.id.as_str(), lib.name, lib.root_dir, lib.created_at],
+            "INSERT INTO libraries (id, name, root_dir, created_at, prompt_template) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![lib.id.as_str(), lib.name, lib.root_dir, lib.created_at, lib.prompt_template],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_library(&self, library_id: &LibraryId) -> Result<Option<LibraryRecord>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, root_dir, created_at, prompt_template FROM libraries WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![library_id.as_str()], |row| {
+            Ok(LibraryRecord {
+                id: LibraryId::new(row.get::<_, String>(0)?),
+                name: row.get(1)?,
+                root_dir: row.get(2)?,
+                created_at: row.get(3)?,
+                prompt_template: row.get(4)?,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn update_library_prompt_template(
+        &self,
+        library_id: &LibraryId,
+        prompt_template: Option<&str>,
+    ) -> Result<()> {
+        self.lock().execute(
+            "UPDATE libraries SET prompt_template = ?1 WHERE id = ?2",
+            params![prompt_template, library_id.as_str()],
         )?;
         Ok(())
     }
@@ -239,6 +271,7 @@ mod tests {
             name: "Test Library".into(),
             root_dir: "/tmp/test".into(),
             created_at: "2025-01-01T00:00:00Z".into(),
+            prompt_template: None,
         }
     }
 

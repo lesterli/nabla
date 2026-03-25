@@ -86,6 +86,16 @@ enum Command {
     Ask {
         #[arg(long, default_value = "default")]
         library: String,
+
+        /// Filter by document name (substring match)
+        #[arg(long)]
+        doc: Option<String>,
+
+        /// Path to a prompt template file (system instruction for the LLM)
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+
+        /// Your question
         prompt: String,
     },
 }
@@ -106,10 +116,15 @@ async fn main() -> Result<()> {
             let lance = LanceStore::open(&args.lance, embed_dim as i32).await?;
             cmd_import(&repo, &lance, &library, &paths, llm.as_ref(), embedder.as_ref()).await
         }
-        Command::Ask { library, prompt } => {
+        Command::Ask {
+            library,
+            doc,
+            prompt_file,
+            prompt,
+        } => {
             let repo = open_db(&args.db)?;
             let lance = LanceStore::open(&args.lance, embed_dim as i32).await?;
-            cmd_ask(&repo, &lance, &library, &prompt, llm.as_ref(), embedder.as_ref()).await
+            cmd_ask(&repo, &lance, &library, &prompt, doc.as_deref(), prompt_file.as_deref(), llm.as_ref(), embedder.as_ref()).await
         }
     }
 }
@@ -241,6 +256,7 @@ async fn cmd_import(
         name: library_name.into(),
         root_dir: ".".into(),
         created_at: now(),
+        prompt_template: None,
     };
     let _ = repo.insert_library(&lib);
 
@@ -356,6 +372,8 @@ async fn cmd_ask(
     lance: &LanceStore,
     library_name: &str,
     prompt: &str,
+    doc_filter: Option<&str>,
+    prompt_file: Option<&std::path::Path>,
     llm: &dyn LlmClient,
     embedder: &dyn Embedder,
 ) -> Result<()> {
@@ -367,11 +385,37 @@ async fn cmd_ask(
         return Ok(());
     }
 
+    // Filter documents by name if --doc is provided
+    let filtered_docs: Vec<&DocumentRecord> = if let Some(filter) = doc_filter {
+        let filter_lower = filter.to_lowercase();
+        let matched: Vec<_> = docs
+            .iter()
+            .filter(|d| d.file_name.to_lowercase().contains(&filter_lower))
+            .collect();
+        if matched.is_empty() {
+            println!("No documents matching '{filter}' in library '{library_name}'.");
+            return Ok(());
+        }
+        println!("Filtered to {} document(s) matching '{filter}':\n", matched.len());
+        for d in &matched {
+            println!("  - {}", d.file_name);
+        }
+        println!();
+        matched
+    } else {
+        docs.iter().collect()
+    };
+
     // Embed the query for vector search
     let query_embedding = embed_query(embedder, prompt);
 
-    // Hybrid search: vector + BM25 + RRF, fallback to FTS-only
-    let searcher = HybridSearcher::new(lance);
+    // Two-stage doc filter: SQLite matches by file name → LanceDB filters by document ID
+    let mut searcher = HybridSearcher::new(lance);
+    if doc_filter.is_some() {
+        let doc_ids: Vec<&str> = filtered_docs.iter().map(|d| d.id.as_str()).collect();
+        searcher = searcher.with_doc_ids(&doc_ids);
+    }
+
     let hits = match searcher.hybrid_search(prompt, &query_embedding, 5).await {
         Ok(h) => h,
         Err(_) => searcher.fts_search(prompt, 5).await?,
@@ -439,10 +483,19 @@ async fn cmd_ask(
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    let answer_prompt = format!(
+    // Load custom system prompt from file, or use default
+    let system_instruction = if let Some(path) = prompt_file {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read prompt file: {}", path.display()))?
+    } else {
         "Based on the following document summaries and evidence chunks, answer the user's question. \
          Cite evidence using [N] notation. Use document summaries for context (names, overview). \
-         If the evidence is insufficient, say so.\n\n\
+         If the evidence is insufficient, say so."
+            .to_string()
+    };
+
+    let answer_prompt = format!(
+        "{system_instruction}\n\n\
          {summary_context}\
          Evidence chunks:\n{evidence_text}\n\n\
          Question: {prompt}\n\n\
