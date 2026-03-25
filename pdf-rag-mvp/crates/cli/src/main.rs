@@ -326,8 +326,32 @@ async fn cmd_ask(
         return Ok(());
     }
 
+    // Collect document summaries for each unique doc in the hits
+    let mut seen_docs = std::collections::HashSet::new();
+    let mut doc_summaries = Vec::new();
+    for hit in &hits {
+        if seen_docs.insert(hit.document_id.clone()) {
+            let doc_id = DocumentId::new(&hit.document_id);
+            if let Ok(nodes) = repo.list_summary_nodes(&doc_id) {
+                if let Some(doc_node) = nodes.iter().find(|n| n.kind == SummaryNodeKind::Document) {
+                    doc_summaries.push(format!(
+                        "[Doc: {}] {}",
+                        &hit.document_id[..8.min(hit.document_id.len())],
+                        doc_node.summary
+                    ));
+                }
+            }
+        }
+    }
+
     // Show evidence
     println!("Question: {prompt}\n");
+    if !doc_summaries.is_empty() {
+        println!("Document summaries ({}):\n", doc_summaries.len());
+        for s in &doc_summaries {
+            println!("  {s}\n");
+        }
+    }
     println!("Evidence ({} chunks via hybrid search):\n", hits.len());
 
     for (i, hit) in hits.iter().enumerate() {
@@ -340,8 +364,17 @@ async fn cmd_ask(
         );
     }
 
-    // Generate answer via LLM
+    // Generate answer via LLM — include document summaries for global context
     println!("\n--- Answer ---\n");
+
+    let summary_context = if doc_summaries.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Document summaries (global context):\n{}\n\n",
+            doc_summaries.join("\n")
+        )
+    };
 
     let evidence_text: String = hits
         .iter()
@@ -351,9 +384,11 @@ async fn cmd_ask(
         .join("\n\n");
 
     let answer_prompt = format!(
-        "Based on the following evidence chunks from research documents, answer the user's question. \
-         Cite evidence using [N] notation. If the evidence is insufficient, say so.\n\n\
-         Evidence:\n{evidence_text}\n\n\
+        "Based on the following document summaries and evidence chunks, answer the user's question. \
+         Cite evidence using [N] notation. Use document summaries for context (names, overview). \
+         If the evidence is insufficient, say so.\n\n\
+         {summary_context}\
+         Evidence chunks:\n{evidence_text}\n\n\
          Question: {prompt}\n\n\
          Answer:"
     );
