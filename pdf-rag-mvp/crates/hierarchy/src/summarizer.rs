@@ -5,6 +5,18 @@ use uuid::Uuid;
 
 use crate::chunker;
 
+/// Truncate a string to at most `max_bytes`, respecting UTF-8 char boundaries.
+fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// RAPTOR-lite hierarchy builder.
 ///
 /// 1. Split extracted document into chunks (rule-based, by token budget)
@@ -75,7 +87,7 @@ impl HierarchyBuilder for RaptorLiteBuilder {
 
             let prompt = format!(
                 "Summarize the following text in 2-3 sentences. Be concise and factual.\n\n{}",
-                &combined_text[..combined_text.len().min(4000)]
+                truncate_str(&combined_text, 4000)
             );
 
             let summary = llm.complete(&prompt, 200)?;
@@ -124,7 +136,7 @@ impl HierarchyBuilder for RaptorLiteBuilder {
 
         let doc_summary_prompt = format!(
             "Synthesize the following section summaries into a single cohesive document summary (3-5 sentences).\n\n{}",
-            &sections_text[..sections_text.len().min(4000)]
+            truncate_str(&sections_text, 4000)
         );
 
         let doc_summary = llm.complete(&doc_summary_prompt, 300)?;
