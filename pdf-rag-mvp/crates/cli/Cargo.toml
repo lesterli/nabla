@@ -10,6 +10,7 @@ clap.workspace = true
 nabla-pdf-rag-contracts = { path = "../contracts" }
 nabla-pdf-rag-core = { path = "../core" }
 nabla-pdf-rag-embedder = { path = "../embedder" }
+nabla-pdf-rag-llm = { path = "../llm" }
 nabla-pdf-rag-hierarchy = { path = "../hierarchy" }
 nabla-pdf-rag-parser = { path = "../parser" }
 nabla-pdf-rag-storage = { path = "../storage" }

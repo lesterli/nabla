@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use nabla_pdf_rag_contracts::*;
 use nabla_pdf_rag_core::*;
 use nabla_pdf_rag_embedder::HashEmbedder;
 use nabla_pdf_rag_hierarchy::RaptorLiteBuilder;
+use nabla_pdf_rag_llm::{ApiLlmClient, ApiProvider, LocalCliLlmClient};
 use nabla_pdf_rag_parser::DoclingParser;
 use nabla_pdf_rag_storage::{run_migrations, SqliteRepository};
 use rusqlite::Connection;
@@ -14,16 +15,44 @@ use uuid::Uuid;
 #[derive(Debug, Parser)]
 #[command(name = "nabla-pdf", about = "PDF RAG MVP")]
 struct Args {
-    /// Path to SQLite database (default: ./nabla.db)
+    /// Path to SQLite database
     #[arg(long, default_value = "nabla.db")]
     db: String,
 
-    /// Path to sidecar Python script (overrides auto-detection)
+    /// Path to parser sidecar script (overrides auto-detection)
     #[arg(long)]
     sidecar: Option<PathBuf>,
 
+    /// LLM provider
+    #[arg(long, default_value = "mock")]
+    llm: LlmProvider,
+
+    /// API key (or set NABLA_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY env var)
+    #[arg(long)]
+    api_key: Option<String>,
+
+    /// API base URL (overrides provider default)
+    #[arg(long)]
+    base_url: Option<String>,
+
+    /// Model name (overrides provider default)
+    #[arg(long)]
+    model: Option<String>,
+
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum LlmProvider {
+    /// No real LLM — placeholder summaries
+    Mock,
+    /// OpenAI-compatible API (also Kimi, MiniMax, DashScope)
+    Openai,
+    /// Anthropic Claude API
+    Anthropic,
+    /// Local `claude` CLI
+    Claude,
 }
 
 #[derive(Debug, Subcommand)]
@@ -52,6 +81,7 @@ enum Command {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let llm = build_llm(&args)?;
 
     match args.command {
         Command::Blueprint => {
@@ -60,13 +90,60 @@ fn main() -> Result<()> {
         }
         Command::Import { library, paths } => {
             let repo = open_db(&args.db)?;
-            cmd_import(&repo, &library, &paths, args.sidecar.as_deref())
+            cmd_import(&repo, &library, &paths, args.sidecar.as_deref(), llm.as_ref())
         }
         Command::Ask { library, prompt } => {
             let repo = open_db(&args.db)?;
-            cmd_ask(&repo, &library, &prompt)
+            cmd_ask(&repo, &library, &prompt, llm.as_ref())
         }
     }
+}
+
+fn build_llm(args: &Args) -> Result<Box<dyn LlmClient>> {
+    match args.llm {
+        LlmProvider::Mock => Ok(Box::new(MockLlm)),
+        LlmProvider::Openai => {
+            let key = resolve_api_key(args, &["NABLA_API_KEY", "OPENAI_API_KEY"])?;
+            Ok(Box::new(ApiLlmClient::new(
+                ApiProvider::OpenAi,
+                key,
+                args.model.clone(),
+                args.base_url.clone(),
+                None,
+            )))
+        }
+        LlmProvider::Anthropic => {
+            let key = resolve_api_key(args, &["NABLA_API_KEY", "ANTHROPIC_API_KEY"])?;
+            Ok(Box::new(ApiLlmClient::new(
+                ApiProvider::Anthropic,
+                key,
+                args.model.clone(),
+                args.base_url.clone(),
+                None,
+            )))
+        }
+        LlmProvider::Claude => Ok(Box::new(LocalCliLlmClient::new(
+            nabla_pdf_rag_llm::local_cli::LocalCliTool::Claude,
+            None,
+        ))),
+    }
+}
+
+fn resolve_api_key(args: &Args, env_vars: &[&str]) -> Result<String> {
+    if let Some(key) = &args.api_key {
+        return Ok(key.clone());
+    }
+    for var in env_vars {
+        if let Ok(key) = std::env::var(var) {
+            if !key.is_empty() {
+                return Ok(key);
+            }
+        }
+    }
+    bail!(
+        "No API key provided. Use --api-key or set one of: {}",
+        env_vars.join(", ")
+    )
 }
 
 fn open_db(path: &str) -> Result<SqliteRepository> {
@@ -83,7 +160,6 @@ fn print_blueprint() {
         println!("  later: {}", decision.later_choice);
         println!("  reason: {}", decision.reason);
     }
-
     println!();
     println!("Pipeline");
     for step in DEFAULT_PIPELINE {
@@ -99,14 +175,13 @@ fn cmd_import(
     library_name: &str,
     paths: &[PathBuf],
     sidecar_override: Option<&std::path::Path>,
+    llm: &dyn LlmClient,
 ) -> Result<()> {
     if paths.is_empty() {
         bail!("No PDF paths provided");
     }
 
     let progress = StderrProgress;
-
-    // Ensure library exists
     let library_id = LibraryId::new(format!("lib-{library_name}"));
     let lib = LibraryRecord {
         id: library_id.clone(),
@@ -114,7 +189,6 @@ fn cmd_import(
         root_dir: ".".into(),
         created_at: now(),
     };
-    // Ignore error if library already exists
     let _ = repo.insert_library(&lib);
 
     let sidecar_path = match sidecar_override {
@@ -124,7 +198,6 @@ fn cmd_import(
     let parser = DoclingParser::new(sidecar_path);
     let builder = RaptorLiteBuilder::default();
     let embedder = HashEmbedder::default();
-    let llm = CliMockLlm;
 
     for path in paths {
         let file_name = path
@@ -135,7 +208,7 @@ fn cmd_import(
         println!("\n--- Importing: {file_name} ---");
 
         let doc_id = DocumentId::new(Uuid::new_v4().to_string());
-        let checksum = format!("{:x}", md5_path(path));
+        let checksum = format!("{:x}", hash_path(path));
 
         let doc = DocumentRecord {
             id: doc_id.clone(),
@@ -173,14 +246,13 @@ fn cmd_import(
 
         // Build hierarchy
         repo.update_document_state(&doc_id, &DocumentState::Chunking, None)?;
-        let hierarchy = builder.build(&extracted, &llm, &progress)?;
+        let hierarchy = builder.build(&extracted, llm, &progress)?;
         println!(
             "  {} chunks, {} summary nodes",
             hierarchy.chunks.len(),
             hierarchy.summary_nodes.len()
         );
 
-        // Persist chunks and summary nodes
         for chunk in &hierarchy.chunks {
             repo.insert_chunk(chunk)?;
         }
@@ -197,8 +269,6 @@ fn cmd_import(
             embed_result.failed.len()
         );
 
-        // TODO: Persist embeddings to LanceDB (P0-6b)
-
         repo.update_document_state(&doc_id, &DocumentState::Ready, None)?;
         println!("  Done: {file_name} → Ready");
     }
@@ -208,7 +278,12 @@ fn cmd_import(
 
 // ─── Ask ───────────────────────────────────────────────────────────────────
 
-fn cmd_ask(repo: &SqliteRepository, library_name: &str, prompt: &str) -> Result<()> {
+fn cmd_ask(
+    repo: &SqliteRepository,
+    library_name: &str,
+    prompt: &str,
+    llm: &dyn LlmClient,
+) -> Result<()> {
     let library_id = LibraryId::new(format!("lib-{library_name}"));
     let docs = repo.list_documents(&library_id)?;
 
@@ -217,11 +292,10 @@ fn cmd_ask(repo: &SqliteRepository, library_name: &str, prompt: &str) -> Result<
         return Ok(());
     }
 
-    // Gather all chunks across all documents
+    // Gather all chunks
     let mut all_chunks = Vec::new();
     for doc in &docs {
-        let chunks = repo.list_chunks(&doc.id)?;
-        all_chunks.extend(chunks);
+        all_chunks.extend(repo.list_chunks(&doc.id)?);
     }
 
     if all_chunks.is_empty() {
@@ -229,7 +303,7 @@ fn cmd_ask(repo: &SqliteRepository, library_name: &str, prompt: &str) -> Result<
         return Ok(());
     }
 
-    // Simple keyword matching for MVP (vector search requires LanceDB integration)
+    // Keyword recall
     let query_words: Vec<&str> = prompt.split_whitespace().collect();
     let mut scored: Vec<(f32, &ChunkRecord)> = all_chunks
         .iter()
@@ -245,36 +319,56 @@ fn cmd_ask(repo: &SqliteRepository, library_name: &str, prompt: &str) -> Result<
         .collect();
 
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    let top_k = scored.iter().take(5).collect::<Vec<_>>();
+    let top_chunks: Vec<&ChunkRecord> = scored.iter().take(5).map(|(_, c)| *c).collect();
 
-    if top_k.is_empty() {
+    if top_chunks.is_empty() {
         println!("No relevant chunks found for: \"{prompt}\"");
         return Ok(());
     }
 
+    // Show evidence
     println!("Question: {prompt}\n");
-    println!("Top {} evidence chunks:\n", top_k.len());
+    println!("Evidence ({} chunks):\n", top_chunks.len());
 
-    for (i, (score, chunk)) in top_k.iter().enumerate() {
+    for (i, chunk) in top_chunks.iter().enumerate() {
         let page_info = chunk
             .page_span
             .as_ref()
             .map(|p| format!("pp.{}-{}", p.start, p.end))
             .unwrap_or_else(|| "?".into());
-
-        let preview: String = chunk.text.chars().take(200).collect();
-        println!(
-            "  {}. [score={:.2}] [{}] [doc:{}]",
-            i + 1,
-            score,
-            page_info,
-            chunk.document_id
-        );
-        println!("     {preview}...\n");
+        let preview: String = chunk.text.chars().take(150).collect();
+        println!("  {}. [{}] {preview}...", i + 1, page_info);
     }
 
-    // TODO: Pass to AnswerEngine with LLM for full answer generation
-    println!("(Full LLM-powered answer generation will be available with AnswerEngine integration)");
+    // Generate answer via LLM
+    println!("\n--- Answer ---\n");
+
+    let evidence_text: String = top_chunks
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let pages = c
+                .page_span
+                .as_ref()
+                .map(|p| format!("pages {}-{}", p.start, p.end))
+                .unwrap_or_default();
+            format!("[{}] ({}) {}", i + 1, pages, c.text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let answer_prompt = format!(
+        "Based on the following evidence chunks from research documents, answer the user's question. \
+         Cite evidence using [N] notation. If the evidence is insufficient, say so.\n\n\
+         Evidence:\n{evidence_text}\n\n\
+         Question: {prompt}\n\n\
+         Answer:"
+    );
+
+    match llm.complete(&answer_prompt, 500) {
+        Ok(answer) => println!("{answer}"),
+        Err(e) => println!("(LLM error: {e})"),
+    }
 
     Ok(())
 }
@@ -299,12 +393,11 @@ impl ProgressSink for StderrProgress {
     }
 }
 
-/// Mock LLM for CLI testing — returns placeholder summaries.
-struct CliMockLlm;
+struct MockLlm;
 
-impl LlmClient for CliMockLlm {
+impl LlmClient for MockLlm {
     fn complete(&self, _prompt: &str, _max_tokens: u32) -> Result<String> {
-        Ok("(Summary placeholder — connect a real LLM for production use)".into())
+        Ok("(Mock LLM — use --llm openai/anthropic/claude for real answers)".into())
     }
 
     fn complete_json(&self, _prompt: &str, _max_tokens: u32) -> Result<serde_json::Value> {
@@ -316,13 +409,11 @@ impl LlmClient for CliMockLlm {
     }
 }
 
-/// Simple hash of file path for deduplication (not cryptographic).
-fn md5_path(path: &PathBuf) -> u64 {
+fn hash_path(path: &PathBuf) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);
-    // Also hash file size if available
     if let Ok(meta) = std::fs::metadata(path) {
         meta.len().hash(&mut hasher);
     }
@@ -330,7 +421,6 @@ fn md5_path(path: &PathBuf) -> u64 {
 }
 
 fn find_sidecar() -> Result<PathBuf> {
-    // Look relative to the binary, then in common locations
     let candidates = [
         PathBuf::from("scripts/docling_sidecar.py"),
         PathBuf::from("pdf-rag-mvp/scripts/docling_sidecar.py"),
@@ -343,11 +433,10 @@ fn find_sidecar() -> Result<PathBuf> {
     bail!(
         "Could not find docling_sidecar.py. Looked in: {:?}",
         candidates
-    );
+    )
 }
 
 fn now() -> String {
-    // Simple UTC timestamp — no chrono dependency needed for MVP
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
