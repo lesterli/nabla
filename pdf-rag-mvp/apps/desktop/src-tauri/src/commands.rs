@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use nabla_pdf_rag_contracts::*;
 use nabla_pdf_rag_core::*;
-use nabla_pdf_rag_embedder::HashEmbedder;
 use nabla_pdf_rag_hierarchy::RaptorLiteBuilder;
 use nabla_pdf_rag_parser::PdfExtractParser;
 use nabla_pdf_rag_retrieval::{ChunkEmbedding, HybridSearcher};
@@ -82,8 +81,8 @@ pub async fn import_files(
 
     let parser = PdfExtractParser;
     let builder = RaptorLiteBuilder::default();
-    let embedder = HashEmbedder { dimensions: crate::state::DEFAULT_DIM as usize };
-    let llm = MockLlm;
+    let embedder = state.build_embedder();
+    let llm = state.build_llm();
 
     let mut imported = 0;
     let mut failed = 0;
@@ -151,7 +150,7 @@ pub async fn import_files(
         // Build hierarchy
         let _ = state.repo.update_document_state(&doc_id, &DocumentState::Chunking, None);
         emit_progress("chunk", "Building hierarchy");
-        let hierarchy = match builder.build(&extracted, &llm, &NullProgress) {
+        let hierarchy = match builder.build(&extracted, llm.as_ref(), &NullProgress) {
             Ok(h) => h,
             Err(e) => {
                 let msg = format!("Hierarchy failed: {e}");
@@ -230,8 +229,8 @@ pub async fn ask_question(
     }
 
     // Embed query for vector search
-    let embedder = HashEmbedder { dimensions: crate::state::DEFAULT_DIM as usize };
-    let query_vec = embed_query_text(&embedder, &prompt);
+    let embedder = state.build_embedder();
+    let query_vec = embed_query_text(embedder.as_ref(), &prompt);
 
     // Hybrid search with FTS fallback
     let hits = match searcher
@@ -294,7 +293,7 @@ pub async fn ask_question(
          Question: {prompt}\n\nAnswer:"
     );
 
-    let llm = MockLlm;
+    let llm = state.build_llm();
     let answer = llm
         .complete(&answer_prompt, 500)
         .unwrap_or_else(|e| format!("LLM error: {e}"));
@@ -331,23 +330,33 @@ pub fn delete_document(doc_id: String, state: State<AppState>) -> Result<(), Str
     state.repo.delete_document(&id).map_err(|e| e.to_string())
 }
 
-// ─── Helpers ───────────────────────────────────────────────────────────────
-
-struct MockLlm;
-
-impl LlmClient for MockLlm {
-    fn complete(&self, _prompt: &str, _max_tokens: u32) -> anyhow::Result<String> {
-        Ok("(Configure LLM in settings for real answers)".into())
-    }
-    fn complete_json(&self, _prompt: &str, _max_tokens: u32) -> anyhow::Result<serde_json::Value> {
-        Ok(serde_json::json!({}))
-    }
-    fn max_context_tokens(&self) -> u32 {
-        4096
-    }
+/// Get current app configuration.
+#[tauri::command]
+pub fn get_config(state: State<AppState>) -> Result<crate::config::AppConfig, String> {
+    let config = state.config.read().map_err(|e| e.to_string())?;
+    Ok(config.clone())
 }
 
-fn embed_query_text(embedder: &HashEmbedder, text: &str) -> Vec<f32> {
+/// Save app configuration.
+#[tauri::command]
+pub fn save_config(
+    config: crate::config::AppConfig,
+    state: State<AppState>,
+) -> Result<(), String> {
+    crate::config::save_config(&config).map_err(|e| e.to_string())?;
+    let mut current = state.config.write().map_err(|e| e.to_string())?;
+    *current = config;
+    // Reset LanceDB connection so it picks up new embedding dimensions
+    let lance = state.lance.try_lock();
+    if let Ok(mut guard) = lance {
+        *guard = None;
+    }
+    Ok(())
+}
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
+
+fn embed_query_text(embedder: &dyn Embedder, text: &str) -> Vec<f32> {
     let chunk = ChunkRecord {
         id: ChunkId::new("query"),
         document_id: DocumentId::new("query"),

@@ -4,6 +4,7 @@ import { Sidebar } from "./components/Sidebar";
 import { AskPanel } from "./components/AskPanel";
 import { DocPreview } from "./components/DocPreview";
 import { TopBar } from "./components/TopBar";
+import { SettingsDialog } from "./components/SettingsDialog";
 
 export interface DocumentInfo {
   id: string;
@@ -17,6 +18,7 @@ function App() {
   const [documents, setDocuments] = useState<DocumentInfo[]>([]);
   const [selectedDocIds, setSelectedDocIds] = useState<string[]>([]);
   const [docSummaries, setDocSummaries] = useState<Record<string, string>>({});
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const refreshDocuments = async () => {
     try {
@@ -74,7 +76,14 @@ function App() {
 
   return (
     <div className="flex flex-col h-screen bg-white dark:bg-gray-950">
-      <TopBar onImportDone={refreshDocuments} />
+      <TopBar
+        onImportDone={refreshDocuments}
+        onSettingsClick={() => setSettingsOpen(true)}
+      />
+      <SettingsDialog
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+      />
 
       <div className="flex flex-1 overflow-hidden">
         <Sidebar

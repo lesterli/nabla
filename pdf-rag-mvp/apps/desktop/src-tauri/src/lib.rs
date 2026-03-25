@@ -1,4 +1,5 @@
 mod commands;
+mod config;
 mod state;
 
 use state::AppState;
@@ -24,6 +25,8 @@ pub fn run() {
             commands::ask_question,
             commands::get_document_summaries,
             commands::delete_document,
+            commands::get_config,
+            commands::save_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

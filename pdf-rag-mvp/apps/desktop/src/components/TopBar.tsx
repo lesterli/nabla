@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 
 interface TopBarProps {
   onImportDone: () => void;
+  onSettingsClick: () => void;
 }
 
 interface ImportProgress {
@@ -13,7 +14,7 @@ interface ImportProgress {
   message: string;
 }
 
-export function TopBar({ onImportDone }: TopBarProps) {
+export function TopBar({ onImportDone, onSettingsClick }: TopBarProps) {
   const [importing, setImporting] = useState(false);
   const [progress, setProgress] = useState<string | null>(null);
 
@@ -69,13 +70,22 @@ export function TopBar({ onImportDone }: TopBarProps) {
         )}
       </div>
 
-      <button
-        onClick={handleImport}
-        disabled={importing}
-        className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 transition-colors"
-      >
-        {importing ? "Importing..." : "+ Import"}
-      </button>
+      <div className="flex items-center gap-2">
+        <button
+          onClick={handleImport}
+          disabled={importing}
+          className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 transition-colors"
+        >
+          {importing ? "Importing..." : "+ Import"}
+        </button>
+        <button
+          onClick={onSettingsClick}
+          className="px-2 py-1.5 text-sm text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-gray-200 dark:hover:bg-gray-800 rounded-md transition-colors"
+          title="Settings"
+        >
+          Settings
+        </button>
+      </div>
     </header>
   );
 }
