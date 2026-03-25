@@ -1,0 +1,12 @@
+[package]
+name = "nabla-pdf-rag-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+nabla-pdf-rag-contracts = { path = "../contracts" }
+nabla-pdf-rag-core = { path = "../core" }
+serde_json.workspace = true
