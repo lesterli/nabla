@@ -82,7 +82,7 @@ pub async fn import_files(
 
     let parser = PdfExtractParser;
     let builder = RaptorLiteBuilder::default();
-    let embedder = HashEmbedder { dimensions: 384 };
+    let embedder = HashEmbedder { dimensions: crate::state::DEFAULT_DIM as usize };
     let llm = MockLlm;
 
     let mut imported = 0;
@@ -230,7 +230,7 @@ pub async fn ask_question(
     }
 
     // Embed query for vector search
-    let embedder = HashEmbedder { dimensions: 384 };
+    let embedder = HashEmbedder { dimensions: crate::state::DEFAULT_DIM as usize };
     let query_vec = embed_query_text(&embedder, &prompt);
 
     // Hybrid search with FTS fallback

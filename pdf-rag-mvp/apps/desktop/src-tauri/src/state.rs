@@ -7,9 +7,9 @@ use tokio::sync::Mutex;
 const DB_PATH: &str = "nabla.db";
 const LANCE_PATH: &str = "nabla.lance";
 
-/// Default embedding dimensions (matches GLM embedding-3 @ 1024 or hash @ 384).
-/// This is read from config or inferred from the first import.
-pub const DEFAULT_DIM: i32 = 1024;
+/// Embedding dimensions — must match the embedder in use.
+/// HashEmbedder = 384, GLM embedding-3 = 1024, OpenAI = 1536.
+pub const DEFAULT_DIM: i32 = 384;
 
 pub const DEFAULT_LIBRARY_ID: &str = "lib-default";
 
