@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use nabla_pdf_rag_contracts::*;
 use nabla_pdf_rag_core::*;
-use nabla_pdf_rag_embedder::HashEmbedder;
+use nabla_pdf_rag_embedder::{ApiEmbedder, HashEmbedder};
 use nabla_pdf_rag_hierarchy::RaptorLiteBuilder;
 use nabla_pdf_rag_llm::{ApiLlmClient, ApiProvider, LocalCliLlmClient};
 use nabla_pdf_rag_parser::PdfExtractParser;
@@ -13,7 +13,6 @@ use nabla_pdf_rag_storage::{run_migrations, SqliteRepository};
 use rusqlite::Connection;
 use uuid::Uuid;
 
-const EMBEDDING_DIM: i32 = 384; // must match HashEmbedder dimensions
 const LANCE_DIR: &str = "nabla.lance";
 
 #[derive(Debug, Parser)]
@@ -42,6 +41,22 @@ struct Args {
     /// Model name (overrides provider default)
     #[arg(long)]
     model: Option<String>,
+
+    /// Embedding model (default: text-embedding-3-small for API, hash for mock)
+    #[arg(long)]
+    embed_model: Option<String>,
+
+    /// Embedding API base URL (defaults to same as --base-url or OpenAI)
+    #[arg(long)]
+    embed_base_url: Option<String>,
+
+    /// Embedding API key (defaults to same as --api-key)
+    #[arg(long)]
+    embed_api_key: Option<String>,
+
+    /// Embedding dimensions (default: 1536 for API, 384 for hash)
+    #[arg(long)]
+    embed_dim: Option<usize>,
 
     #[command(subcommand)]
     command: Command,
@@ -79,6 +94,7 @@ enum Command {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let llm = build_llm(&args)?;
+    let (embedder, embed_dim) = build_embedder(&args)?;
 
     match args.command {
         Command::Blueprint => {
@@ -87,13 +103,13 @@ async fn main() -> Result<()> {
         }
         Command::Import { library, paths } => {
             let repo = open_db(&args.db)?;
-            let lance = LanceStore::open(&args.lance, EMBEDDING_DIM).await?;
-            cmd_import(&repo, &lance, &library, &paths, llm.as_ref()).await
+            let lance = LanceStore::open(&args.lance, embed_dim as i32).await?;
+            cmd_import(&repo, &lance, &library, &paths, llm.as_ref(), embedder.as_ref()).await
         }
         Command::Ask { library, prompt } => {
             let repo = open_db(&args.db)?;
-            let lance = LanceStore::open(&args.lance, EMBEDDING_DIM).await?;
-            cmd_ask(&repo, &lance, &library, &prompt, llm.as_ref()).await
+            let lance = LanceStore::open(&args.lance, embed_dim as i32).await?;
+            cmd_ask(&repo, &lance, &library, &prompt, llm.as_ref(), embedder.as_ref()).await
         }
     }
 }
@@ -125,6 +141,43 @@ fn build_llm(args: &Args) -> Result<Box<dyn LlmClient>> {
             nabla_pdf_rag_llm::local_cli::LocalCliTool::Claude,
             None,
         ))),
+    }
+}
+
+/// Build the embedder. Returns (embedder, dimensions).
+/// - Mock mode: HashEmbedder (384-dim, no API needed)
+/// - API mode: ApiEmbedder using OpenAI-compatible /embeddings
+fn build_embedder(args: &Args) -> Result<(Box<dyn Embedder>, usize)> {
+    match args.llm {
+        LlmProvider::Mock => {
+            let dim = args.embed_dim.unwrap_or(384);
+            Ok((
+                Box::new(HashEmbedder { dimensions: dim }),
+                dim,
+            ))
+        }
+        _ => {
+            // For API/Claude modes, use ApiEmbedder
+            // Reuse LLM's API key if no separate embed key is set
+            let key = args
+                .embed_api_key
+                .clone()
+                .or_else(|| args.api_key.clone())
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                .or_else(|| std::env::var("NABLA_API_KEY").ok())
+                .ok_or_else(|| anyhow::anyhow!(
+                    "No embedding API key. Use --embed-api-key, --api-key, or set OPENAI_API_KEY"
+                ))?;
+
+            let embed = ApiEmbedder::new(
+                key,
+                args.embed_base_url.clone().or_else(|| args.base_url.clone()),
+                args.embed_model.clone(),
+                args.embed_dim,
+            );
+            let dim = embed.dimensions();
+            Ok((Box::new(embed), dim))
+        }
     }
 }
 
@@ -175,6 +228,7 @@ async fn cmd_import(
     library_name: &str,
     paths: &[PathBuf],
     llm: &dyn LlmClient,
+    embedder: &dyn Embedder,
 ) -> Result<()> {
     if paths.is_empty() {
         bail!("No PDF paths provided");
@@ -192,7 +246,6 @@ async fn cmd_import(
 
     let parser = PdfExtractParser;
     let builder = RaptorLiteBuilder::default();
-    let embedder = HashEmbedder::default();
 
     for path in paths {
         let file_name = path
@@ -301,6 +354,7 @@ async fn cmd_ask(
     library_name: &str,
     prompt: &str,
     llm: &dyn LlmClient,
+    embedder: &dyn Embedder,
 ) -> Result<()> {
     let library_id = LibraryId::new(format!("lib-{library_name}"));
     let docs = repo.list_documents(&library_id)?;
@@ -311,8 +365,7 @@ async fn cmd_ask(
     }
 
     // Embed the query for vector search
-    let embedder = HashEmbedder::default();
-    let query_embedding = embed_query(&embedder, prompt);
+    let query_embedding = embed_query(embedder, prompt);
 
     // Hybrid search: vector + BM25 + RRF, fallback to FTS-only
     let searcher = HybridSearcher::new(lance);
@@ -402,7 +455,7 @@ async fn cmd_ask(
 }
 
 /// Embed a query string using the same embedder as import.
-fn embed_query(embedder: &HashEmbedder, text: &str) -> Vec<f32> {
+fn embed_query(embedder: &dyn Embedder, text: &str) -> Vec<f32> {
     let fake_chunk = ChunkRecord {
         id: ChunkId::new("query"),
         document_id: DocumentId::new("query"),

@@ -8,3 +8,6 @@ version.workspace = true
 anyhow.workspace = true
 nabla-pdf-rag-contracts = { path = "../contracts" }
 nabla-pdf-rag-core = { path = "../core" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
