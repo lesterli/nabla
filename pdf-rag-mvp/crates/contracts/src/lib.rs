@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
 
 // ─── Newtype IDs ───────────────────────────────────────────────────────────
 
@@ -45,6 +46,31 @@ define_id!(DocumentId, "Unique identifier for a PDF document.");
 define_id!(ChunkId, "Unique identifier for a retrieval chunk.");
 define_id!(SummaryNodeId, "Unique identifier for a summary tree node.");
 
+// ─── Enum Display/FromStr ──────────────────────────────────────────────────
+
+macro_rules! string_enum {
+    ($name:ident { $($variant:ident),+ $(,)? }) => {
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    $(Self::$variant => write!(f, stringify!($variant)),)+
+                }
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = String;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s {
+                    $(stringify!($variant) => Ok(Self::$variant),)+
+                    other => Err(format!("unknown {} variant: {}", stringify!($name), other)),
+                }
+            }
+        }
+    };
+}
+
 // ─── Enums ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -54,6 +80,7 @@ pub enum JobStatus {
     Completed,
     Failed,
 }
+string_enum!(JobStatus { Pending, Running, Completed, Failed });
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DocumentState {
@@ -65,6 +92,7 @@ pub enum DocumentState {
     Ready,
     Failed,
 }
+string_enum!(DocumentState { Queued, Extracting, Chunking, Summarizing, Embedding, Ready, Failed });
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SummaryNodeKind {
@@ -72,6 +100,7 @@ pub enum SummaryNodeKind {
     Cluster,
     Document,
 }
+string_enum!(SummaryNodeKind { Section, Cluster, Document });
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EmbeddingState {
@@ -79,6 +108,7 @@ pub enum EmbeddingState {
     Indexed,
     Failed,
 }
+string_enum!(EmbeddingState { Pending, Indexed, Failed });
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RetrievalMode {
