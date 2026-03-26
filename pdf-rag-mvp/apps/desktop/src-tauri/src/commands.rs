@@ -41,8 +41,8 @@ pub struct AskResponse {
 pub struct ImportProgress {
     pub file_name: String,
     pub stage: String,
-    pub current: u64,
-    pub total: u64,
+    pub file_index: usize,
+    pub file_total: usize,
     pub message: String,
 }
 
@@ -86,8 +86,9 @@ pub async fn import_files(
 
     let mut imported = 0;
     let mut failed = 0;
+    let file_total = paths.len();
 
-    for path_str in &paths {
+    for (file_idx, path_str) in paths.iter().enumerate() {
         let path = PathBuf::from(path_str);
         let file_name = path
             .file_name()
@@ -100,8 +101,8 @@ pub async fn import_files(
                 ImportProgress {
                     file_name: file_name.clone(),
                     stage: stage.into(),
-                    current: 0,
-                    total: 1,
+                    file_index: file_idx + 1,
+                    file_total,
                     message: msg.into(),
                 },
             );
