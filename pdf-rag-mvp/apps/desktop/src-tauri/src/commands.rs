@@ -76,6 +76,12 @@ pub async fn import_files(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    // Expand directories into PDF files
+    let expanded_paths = expand_paths(&paths);
+    if expanded_paths.is_empty() {
+        return Ok("No PDF files found".into());
+    }
+
     let lance = state.lance().await.map_err(|e| e.to_string())?;
     let library_id = LibraryId::new(DEFAULT_LIBRARY_ID);
 
@@ -86,9 +92,9 @@ pub async fn import_files(
 
     let mut imported = 0;
     let mut failed = 0;
-    let file_total = paths.len();
+    let file_total = expanded_paths.len();
 
-    for (file_idx, path_str) in paths.iter().enumerate() {
+    for (file_idx, path_str) in expanded_paths.iter().enumerate() {
         let path = PathBuf::from(path_str);
         let file_name = path
             .file_name()
@@ -373,6 +379,36 @@ fn embed_query_text(embedder: &dyn Embedder, text: &str) -> Vec<f32> {
         .embed_chunks(&[chunk], &NullProgress)
         .expect("query embedding failed");
     result.indexed[0].vector.clone()
+}
+
+/// Expand a list of paths: files pass through, directories are recursively scanned for .pdf files.
+fn expand_paths(paths: &[String]) -> Vec<String> {
+    let mut result = Vec::new();
+    for p in paths {
+        let path = std::path::Path::new(p);
+        if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if entry_path.is_file() {
+                        if let Some(ext) = entry_path.extension() {
+                            if ext.eq_ignore_ascii_case("pdf") {
+                                result.push(entry_path.to_string_lossy().to_string());
+                            }
+                        }
+                    } else if entry_path.is_dir() {
+                        // Recurse into subdirectories
+                        let sub = expand_paths(&[entry_path.to_string_lossy().to_string()]);
+                        result.extend(sub);
+                    }
+                }
+            }
+        } else if path.is_file() {
+            result.push(p.clone());
+        }
+    }
+    result.sort();
+    result
 }
 
 fn hash_path(path: &PathBuf) -> u64 {

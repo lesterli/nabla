@@ -57,16 +57,30 @@ export function TopBar({ onImportDone, onSettingsClick }: TopBarProps) {
     };
   }, [onImportDone]);
 
-  const handleImport = async () => {
-    const files = await open({
-      multiple: true,
-      filters: [{ name: "PDF", extensions: ["pdf"] }],
-    });
-    if (files && files.length > 0) {
-      const paths =
-        typeof files[0] === "string"
-          ? files
-          : files.map((f: any) => f.path);
+  const handleImport = async (folder = false) => {
+    let paths: string[] = [];
+
+    if (folder) {
+      // Select a folder — backend will recursively find PDFs
+      const dir = await open({ directory: true });
+      if (dir) {
+        paths = [typeof dir === "string" ? dir : (dir as any).path];
+      }
+    } else {
+      // Select individual PDF files
+      const files = await open({
+        multiple: true,
+        filters: [{ name: "PDF", extensions: ["pdf"] }],
+      });
+      if (files && files.length > 0) {
+        paths =
+          typeof files[0] === "string"
+            ? (files as string[])
+            : files.map((f: any) => f.path);
+      }
+    }
+
+    if (paths.length > 0) {
       setImporting(true);
       setProgress(null);
       setErrors([]);
@@ -107,13 +121,23 @@ export function TopBar({ onImportDone, onSettingsClick }: TopBarProps) {
         </div>
 
         <div className="flex items-center gap-2">
-          <button
-            onClick={handleImport}
-            disabled={importing}
-            className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 transition-colors"
-          >
-            {importing ? "Importing..." : "+ Import"}
-          </button>
+          <div className="flex items-center">
+            <button
+              onClick={() => handleImport(false)}
+              disabled={importing}
+              className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-l-md hover:bg-blue-700 disabled:opacity-50 transition-colors"
+            >
+              {importing ? "Importing..." : "+ Files"}
+            </button>
+            <button
+              onClick={() => handleImport(true)}
+              disabled={importing}
+              className="px-2 py-1.5 text-sm bg-blue-700 text-white rounded-r-md hover:bg-blue-800 disabled:opacity-50 transition-colors border-l border-blue-500"
+              title="Import all PDFs from a folder"
+            >
+              Folder
+            </button>
+          </div>
           <button
             onClick={onSettingsClick}
             className="px-2 py-1.5 text-sm text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-gray-200 dark:hover:bg-gray-800 rounded-md transition-colors"
