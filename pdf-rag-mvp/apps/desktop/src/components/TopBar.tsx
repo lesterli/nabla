@@ -16,24 +16,39 @@ interface ImportProgress {
   message: string;
 }
 
+// Each stage gets a weight within a single file's progress
+const stageWeight: Record<string, number> = {
+  parse: 0.15,
+  chunk: 0.50,
+  embed: 0.80,
+  done: 1.0,
+  error: 1.0,
+  skip: 1.0,
+};
+
 const stageLabels: Record<string, string> = {
   parse: "Parsing",
-  chunk: "Chunking",
+  chunk: "Summarizing",
   embed: "Embedding",
-  done: "Done",
-  error: "Error",
+  done: "Ready",
+  error: "Failed",
   skip: "Skipped",
 };
 
 export function TopBar({ onImportDone, onSettingsClick }: TopBarProps) {
   const [importing, setImporting] = useState(false);
   const [progress, setProgress] = useState<ImportProgress | null>(null);
+  const [errors, setErrors] = useState<string[]>([]);
   const [resultMsg, setResultMsg] = useState<string | null>(null);
 
   useEffect(() => {
     const unlisten = listen<ImportProgress>("import-progress", (event) => {
-      setProgress(event.payload);
-      if (event.payload.stage === "done" || event.payload.stage === "error") {
+      const p = event.payload;
+      setProgress(p);
+      if (p.stage === "error") {
+        setErrors((prev) => [...prev, `${p.file_name}: ${p.message}`]);
+      }
+      if (p.stage === "done" || p.stage === "error") {
         onImportDone();
       }
     });
@@ -54,25 +69,32 @@ export function TopBar({ onImportDone, onSettingsClick }: TopBarProps) {
           : files.map((f: any) => f.path);
       setImporting(true);
       setProgress(null);
+      setErrors([]);
       setResultMsg(null);
       try {
         const result = await invoke<string>("import_files", { paths });
         setResultMsg(result);
         onImportDone();
       } catch (e) {
-        setResultMsg(`Error: ${e}`);
+        setErrors((prev) => [...prev, `Import error: ${e}`]);
       } finally {
         setImporting(false);
         setProgress(null);
-        setTimeout(() => setResultMsg(null), 5000);
       }
     }
   };
 
-  const pct =
-    progress && progress.file_total > 0
-      ? Math.round((progress.file_index / progress.file_total) * 100)
-      : 0;
+  // Calculate overall progress: completed files + current file's stage progress
+  const calcPercent = () => {
+    if (!progress || progress.file_total === 0) return 0;
+    const completedFiles = progress.file_index - 1;
+    const currentStageWeight = stageWeight[progress.stage] ?? 0.5;
+    return Math.round(
+      ((completedFiles + currentStageWeight) / progress.file_total) * 100
+    );
+  };
+
+  const pct = calcPercent();
 
   return (
     <header className="border-b border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-900">
@@ -102,7 +124,7 @@ export function TopBar({ onImportDone, onSettingsClick }: TopBarProps) {
         </div>
       </div>
 
-      {/* Progress bar */}
+      {/* Progress bar during import */}
       {importing && progress && (
         <div className="px-4 pb-2">
           <div className="flex items-center justify-between text-xs text-gray-500 mb-1">
@@ -110,7 +132,7 @@ export function TopBar({ onImportDone, onSettingsClick }: TopBarProps) {
               {progress.file_index}/{progress.file_total}{" "}
               <span className="text-gray-400">—</span>{" "}
               {stageLabels[progress.stage] || progress.stage}:{" "}
-              <span className="text-gray-700 dark:text-gray-300">
+              <span className="text-gray-700 dark:text-gray-300 truncate">
                 {progress.file_name}
               </span>
             </span>
@@ -118,20 +140,35 @@ export function TopBar({ onImportDone, onSettingsClick }: TopBarProps) {
           </div>
           <div className="w-full h-1.5 bg-gray-200 dark:bg-gray-800 rounded-full overflow-hidden">
             <div
-              className="h-full bg-blue-500 rounded-full transition-all duration-300"
+              className="h-full bg-blue-500 rounded-full transition-all duration-500 ease-out"
               style={{ width: `${pct}%` }}
             />
           </div>
-          <p className="text-xs text-gray-400 mt-1">{progress.message}</p>
         </div>
       )}
 
-      {/* Result message */}
-      {resultMsg && !importing && (
-        <div className="px-4 pb-2">
-          <p className="text-xs text-green-600 dark:text-green-400">
-            {resultMsg}
-          </p>
+      {/* Result + errors after import */}
+      {!importing && (resultMsg || errors.length > 0) && (
+        <div className="px-4 pb-2 space-y-1">
+          {resultMsg && (
+            <p className="text-xs text-green-600 dark:text-green-400">
+              {resultMsg}
+            </p>
+          )}
+          {errors.map((err, i) => (
+            <p key={i} className="text-xs text-red-500">
+              {err}
+            </p>
+          ))}
+          <button
+            onClick={() => {
+              setResultMsg(null);
+              setErrors([]);
+            }}
+            className="text-xs text-gray-400 hover:text-gray-600"
+          >
+            dismiss
+          </button>
         </div>
       )}
     </header>
