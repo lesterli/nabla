@@ -121,21 +121,22 @@ export function TopBar({ onImportDone, onSettingsClick }: TopBarProps) {
         </div>
 
         <div className="flex items-center gap-2">
-          <div className="flex items-center">
+          <div className="flex items-center text-sm">
             <button
               onClick={() => handleImport(false)}
               disabled={importing}
-              className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-l-md hover:bg-blue-700 disabled:opacity-50 transition-colors"
+              className="px-3 py-1.5 bg-blue-600 text-white rounded-l-md hover:bg-blue-700 disabled:opacity-50 transition-colors"
             >
-              {importing ? "Importing..." : "+ Files"}
+              {importing ? "Importing..." : "+ Import"}
             </button>
+            <span className="w-px h-7 bg-blue-400/50" />
             <button
               onClick={() => handleImport(true)}
               disabled={importing}
-              className="px-2 py-1.5 text-sm bg-blue-700 text-white rounded-r-md hover:bg-blue-800 disabled:opacity-50 transition-colors border-l border-blue-500"
+              className="px-2.5 py-1.5 bg-blue-600 text-white rounded-r-md hover:bg-blue-700 disabled:opacity-50 transition-colors"
               title="Import all PDFs from a folder"
             >
-              Folder
+              📁
             </button>
           </div>
           <button
