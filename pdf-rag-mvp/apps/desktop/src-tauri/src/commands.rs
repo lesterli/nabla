@@ -154,13 +154,23 @@ pub async fn import_files(
                 return;
             }
 
-            // Parse
+            // Parse (catch_unwind because pdf-extract can panic on malformed fonts)
             let _ = state_ref.repo.update_document_state(&doc_id, &DocumentState::Extracting, None);
             let parser = PdfExtractParser;
-            let extracted = match parser.extract_text(&doc, &NullProgress) {
-                Ok(e) => e,
-                Err(e) => {
+            let parse_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                parser.extract_text(&doc, &NullProgress)
+            }));
+            let extracted = match parse_result {
+                Ok(Ok(e)) => e,
+                Ok(Err(e)) => {
                     let msg = format!("Parse failed: {e}");
+                    emit("error", &msg);
+                    let _ = state_ref.repo.update_document_state(&doc_id, &DocumentState::Failed, Some(&msg));
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Err(_) => {
+                    let msg = "Parse crashed: PDF has unsupported font encoding".to_string();
                     emit("error", &msg);
                     let _ = state_ref.repo.update_document_state(&doc_id, &DocumentState::Failed, Some(&msg));
                     failed.fetch_add(1, Ordering::Relaxed);
