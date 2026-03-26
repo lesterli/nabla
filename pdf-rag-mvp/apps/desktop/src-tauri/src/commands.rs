@@ -154,22 +154,24 @@ pub async fn import_files(
                 return;
             }
 
-            // Parse (catch_unwind because pdf-extract can panic on malformed fonts)
+            // Parse in a separate blocking thread to isolate pdf-extract panics
             let _ = state_ref.repo.update_document_state(&doc_id, &DocumentState::Extracting, None);
-            let parser = PdfExtractParser;
-            let parse_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                parser.extract_text(&doc, &NullProgress)
-            }));
-            let extracted = match parse_result {
-                Ok(Ok(e)) => e,
-                Ok(Err(e)) => {
+            let doc_for_parse = doc.clone();
+            let parse_handle = tokio::task::spawn_blocking(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    PdfExtractParser.extract_text(&doc_for_parse, &NullProgress)
+                }))
+            });
+            let extracted = match parse_handle.await {
+                Ok(Ok(Ok(e))) => e,
+                Ok(Ok(Err(e))) => {
                     let msg = format!("Parse failed: {e}");
                     emit("error", &msg);
                     let _ = state_ref.repo.update_document_state(&doc_id, &DocumentState::Failed, Some(&msg));
                     failed.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
-                Err(_) => {
+                Ok(Err(_)) | Err(_) => {
                     let msg = "Parse crashed: PDF has unsupported font encoding".to_string();
                     emit("error", &msg);
                     let _ = state_ref.repo.update_document_state(&doc_id, &DocumentState::Failed, Some(&msg));
