@@ -39,11 +39,11 @@ impl Default for AppConfig {
                 model: None,
             },
             embedding: EmbeddingConfig {
-                provider: "hash".into(),
-                api_key: None,
-                base_url: None,
-                model: None,
-                dimensions: None,
+                provider: "api".into(),
+                api_key: std::env::var("NABLA_EMBED_API_KEY").ok(),
+                base_url: Some("https://open.bigmodel.cn/api/paas/v4".into()),
+                model: Some("embedding-3".into()),
+                dimensions: Some(1024),
             },
         }
     }
