@@ -30,6 +30,7 @@ interface AskPanelProps {
 
 export function AskPanel({ selectedDocIds, documents }: AskPanelProps) {
   const [query, setQuery] = useState("");
+  const [askedQuery, setAskedQuery] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<AskResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -37,13 +38,16 @@ export function AskPanel({ selectedDocIds, documents }: AskPanelProps) {
   const handleAsk = async () => {
     if (!query.trim()) return;
 
+    const q = query.trim();
+    setAskedQuery(q);
+    setQuery(""); // Clear input immediately
     setLoading(true);
     setError(null);
     setResult(null);
 
     try {
       const response = await invoke<AskResponse>("ask_question", {
-        prompt: query,
+        prompt: q,
         docIds: selectedDocIds.length > 0 ? selectedDocIds : null,
       });
       setResult(response);
@@ -80,9 +84,19 @@ export function AskPanel({ selectedDocIds, documents }: AskPanelProps) {
           </div>
         )}
 
+        {/* Show the asked question */}
+        {askedQuery && (
+          <div className="mb-4 px-4 py-3 bg-blue-50 dark:bg-blue-950 rounded-lg">
+            <p className="text-sm font-medium text-blue-800 dark:text-blue-200">
+              {askedQuery}
+            </p>
+          </div>
+        )}
+
         {loading && (
-          <div className="flex items-center justify-center h-full">
-            <div className="text-gray-400 animate-pulse">Searching...</div>
+          <div className="flex items-center gap-2 text-gray-400">
+            <div className="animate-spin w-4 h-4 border-2 border-gray-300 border-t-blue-500 rounded-full" />
+            <span>Searching and generating answer...</span>
           </div>
         )}
 
