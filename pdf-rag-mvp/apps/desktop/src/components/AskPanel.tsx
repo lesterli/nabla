@@ -65,7 +65,7 @@ export function AskPanel({ selectedDocIds, documents }: AskPanelProps) {
       : `${selectedDocIds.length} selected`;
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col flex-1 min-h-0">
       {/* Results area */}
       <div className="flex-1 overflow-y-auto p-6">
         {!result && !loading && !error && (
@@ -153,8 +153,8 @@ export function AskPanel({ selectedDocIds, documents }: AskPanelProps) {
         )}
       </div>
 
-      {/* Input bar */}
-      <div className="border-t border-gray-200 dark:border-gray-800 p-4 bg-white dark:bg-gray-950">
+      {/* Input bar — always visible at bottom */}
+      <div className="shrink-0 border-t border-gray-200 dark:border-gray-800 p-4 bg-white dark:bg-gray-950">
         <div className="flex gap-2">
           <input
             type="text"
