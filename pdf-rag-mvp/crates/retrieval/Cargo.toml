@@ -1,0 +1,18 @@
+[package]
+name = "nabla-pdf-rag-retrieval"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+futures.workspace = true
+lance-index.workspace = true
+lancedb.workspace = true
+nabla-pdf-rag-contracts = { path = "../contracts" }
+nabla-pdf-rag-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

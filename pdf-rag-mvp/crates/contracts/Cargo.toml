@@ -1,0 +1,9 @@
+[package]
+name = "nabla-pdf-rag-contracts"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

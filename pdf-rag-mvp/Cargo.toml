@@ -1,0 +1,26 @@
+[workspace]
+members = ["crates/*"]
+exclude = ["apps/desktop/src-tauri"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+arrow-array = "57"
+arrow-schema = "57"
+clap = { version = "4.5", features = ["derive"] }
+futures = "0.3"
+lance-index = "3.0"
+lancedb = "0.27"
+pdf-extract = "0.10"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+rusqlite = { version = "0.33", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+ureq = { version = "3", features = ["json"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+uuid = { version = "1.0", features = ["v4"] }
