@@ -1,7 +1,9 @@
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
+use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 const HERMES_BASE: &str = "http://127.0.0.1:8642";
@@ -9,6 +11,7 @@ const HERMES_BASE: &str = "http://127.0.0.1:8642";
 struct AppState {
     client: Client,
     session_id: Mutex<Option<String>>,
+    hermes_process: Mutex<Option<Child>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,21 +30,46 @@ struct DoneEvent {
     session_id: String,
 }
 
+async fn start_hermes(state: &AppState) -> Result<(), String> {
+    // Check if already running
+    let resp = state.client.get(format!("{HERMES_BASE}/health")).send().await;
+    if resp.is_ok_and(|r| r.status().is_success()) {
+        return Ok(());
+    }
+
+    let child = Command::new("hermes")
+        .arg("gateway")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("Failed to start hermes gateway: {e}"))?;
+
+    *state.hermes_process.lock().await = Some(child);
+
+    // Wait for health check (up to 15s)
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Ok(resp) = state.client.get(format!("{HERMES_BASE}/health")).send().await {
+            if resp.status().is_success() {
+                return Ok(());
+            }
+        }
+    }
+
+    Err("Hermes gateway failed to start within 15s".to_string())
+}
+
 #[tauri::command]
-async fn health_check(state: State<'_, AppState>) -> Result<bool, String> {
-    let resp = state
-        .client
-        .get(format!("{HERMES_BASE}/health"))
-        .send()
-        .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
-    Ok(resp.status().is_success())
+async fn health_check(state: State<'_, Arc<AppState>>) -> Result<bool, String> {
+    start_hermes(&state).await?;
+    Ok(true)
 }
 
 #[tauri::command]
 async fn send_message(
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     message: String,
     history: Vec<ChatMessage>,
 ) -> Result<String, String> {
@@ -88,7 +116,6 @@ async fn send_message(
         let chunk = chunk.map_err(|e| format!("Stream error: {e}"))?;
         raw_buf.extend_from_slice(&chunk);
 
-        // Decode only complete UTF-8 from the byte buffer
         let valid_up_to = match std::str::from_utf8(&raw_buf) {
             Ok(s) => s.len(),
             Err(e) => e.valid_up_to(),
@@ -134,7 +161,6 @@ async fn send_message(
             }
         }
 
-        // Keep only unprocessed bytes
         raw_buf.drain(..search_start);
     }
 
@@ -147,12 +173,15 @@ async fn send_message(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let state = Arc::new(AppState {
+        client: Client::new(),
+        session_id: Mutex::new(None),
+        hermes_process: Mutex::new(None),
+    });
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .manage(AppState {
-            client: Client::new(),
-            session_id: Mutex::new(None),
-        })
+        .manage(state)
         .invoke_handler(tauri::generate_handler![health_check, send_message])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
