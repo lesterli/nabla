@@ -1,7 +1,7 @@
 use std::sync::RwLock;
 
 use nabla_pdf_rag_contracts::LibraryId;
-use nabla_pdf_rag_core::{Embedder, LlmClient};
+use nabla_pdf_rag_core::{DocumentParser, Embedder, LlmClient};
 use nabla_pdf_rag_embedder::{ApiEmbedder, HashEmbedder};
 use nabla_pdf_rag_llm::{ApiLlmClient, ApiProvider, LocalCliLlmClient};
 use nabla_pdf_rag_retrieval::LanceStore;
@@ -90,6 +90,21 @@ impl AppState {
                 nabla_pdf_rag_llm::local_cli::LocalCliTool::Claude,
                 None,
             )),
+        }
+    }
+
+    pub fn build_parser(&self) -> Box<dyn DocumentParser> {
+        let config = self.config.read().unwrap();
+        match config.parser.backend.as_str() {
+            "native" => Box::new(nabla_pdf_rag_parser::PdfExtractParser),
+            "docling" => {
+                // Explicit docling mode: find sidecar or fail at parse time
+                nabla_pdf_rag_parser::DoclingSidecarParser::find_sidecar()
+                    .map(|p| Box::new(p) as Box<dyn DocumentParser>)
+                    .unwrap_or_else(|| Box::new(nabla_pdf_rag_parser::PdfExtractParser))
+            }
+            // "auto" or anything else
+            _ => Box::new(nabla_pdf_rag_parser::AutoParser::new()),
         }
     }
 

@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use nabla_pdf_rag_contracts::DocumentRecord;
 use nabla_pdf_rag_core::{
-    DocumentParser, ExtractedDocument, ExtractedPage, PipelineStage, ProgressSink, ProgressUpdate,
+    DocElement, DocumentParser, ElementKind, PipelineStage, ProgressSink, ProgressUpdate,
+    StructuredDocument,
 };
 
 /// Pure-Rust PDF text extractor using `pdf-extract`.
@@ -12,15 +13,15 @@ use nabla_pdf_rag_core::{
 /// Limitations:
 /// - No OCR (scanned PDFs return empty text)
 /// - Two-column layouts may have interleaved text order
-/// - No structural awareness (headings not distinguished from body)
+/// - No structural awareness (all elements emitted as Paragraph)
 pub struct PdfExtractParser;
 
 impl DocumentParser for PdfExtractParser {
-    fn extract_text(
+    fn parse(
         &self,
         document: &DocumentRecord,
         progress: &dyn ProgressSink,
-    ) -> Result<ExtractedDocument> {
+    ) -> Result<StructuredDocument> {
         progress.on_progress(&ProgressUpdate {
             stage: PipelineStage::Parse,
             current: 0,
@@ -34,37 +35,46 @@ impl DocumentParser for PdfExtractParser {
         let page_texts = pdf_extract::extract_text_from_mem_by_pages(&bytes)
             .with_context(|| format!("Failed to extract text from: {}", document.file_name))?;
 
-        let pages: Vec<ExtractedPage> = page_texts
+        let page_count = page_texts.len() as u32;
+
+        // Convert each page's text into Paragraph elements
+        let elements: Vec<DocElement> = page_texts
             .into_iter()
             .enumerate()
-            .map(|(i, text)| ExtractedPage {
-                page_number: (i + 1) as u32,
-                text,
+            .flat_map(|(i, text)| {
+                let page_number = (i + 1) as u32;
+                // Split page text into non-empty paragraphs
+                text.split("\n\n")
+                    .map(|para| para.trim().to_string())
+                    .filter(|para| !para.is_empty())
+                    .map(move |para| DocElement {
+                        kind: ElementKind::Paragraph,
+                        text: para,
+                        page_number,
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
 
-        // Infer title from first non-empty line of page 1
-        let inferred_title = pages
+        // Infer title from first non-empty element
+        let title = elements
             .first()
-            .and_then(|p| {
-                p.text
-                    .lines()
-                    .find(|line| !line.trim().is_empty())
-                    .map(|line| line.trim().to_string())
-            })
+            .map(|e| e.text.lines().next().unwrap_or("").trim().to_string())
+            .filter(|t| !t.is_empty())
             .map(|t| t.chars().take(200).collect());
 
         progress.on_progress(&ProgressUpdate {
             stage: PipelineStage::Parse,
             current: 1,
             total: 1,
-            message: Some(format!("Extracted {} pages", pages.len())),
+            message: Some(format!("Extracted {} pages, {} elements", page_count, elements.len())),
         });
 
-        Ok(ExtractedDocument {
+        Ok(StructuredDocument {
             document_id: document.id.clone(),
-            inferred_title,
-            pages,
+            title,
+            page_count,
+            elements,
         })
     }
 }
@@ -97,35 +107,35 @@ mod tests {
     fn nonexistent_file_returns_error() {
         let parser = PdfExtractParser;
         let doc = make_doc("/tmp/does-not-exist-12345.pdf");
-        assert!(parser.extract_text(&doc, &NullProgress).is_err());
+        assert!(parser.parse(&doc, &NullProgress).is_err());
     }
 
     #[test]
     fn extracts_from_minimal_pdf() {
-        // Create a minimal valid PDF in memory and write to temp file
         let pdf_bytes = minimal_pdf_bytes();
         let path = std::env::temp_dir().join("nabla-test-minimal.pdf");
         std::fs::write(&path, &pdf_bytes).unwrap();
 
         let parser = PdfExtractParser;
         let doc = make_doc(path.to_str().unwrap());
-        let result = parser.extract_text(&doc, &NullProgress);
+        let result = parser.parse(&doc, &NullProgress);
 
         let _ = std::fs::remove_file(&path);
 
         match result {
-            Ok(extracted) => {
-                assert!(!extracted.pages.is_empty());
-                assert_eq!(extracted.pages[0].page_number, 1);
+            Ok(structured) => {
+                assert!(structured.page_count >= 1);
+                // All elements should be Paragraph kind (degraded path)
+                for elem in &structured.elements {
+                    assert_eq!(elem.kind, ElementKind::Paragraph);
+                }
             }
             Err(e) => {
-                // pdf-extract may fail on our minimal PDF — that's OK for the test
                 eprintln!("Minimal PDF parse failed (expected for some versions): {e}");
             }
         }
     }
 
-    /// Generate a tiny valid PDF with one page containing "Hello World".
     fn minimal_pdf_bytes() -> Vec<u8> {
         let pdf = r#"%PDF-1.0
 1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj

@@ -1,89 +1,177 @@
 #!/usr/bin/env python3
 """
-Docling PDF parser sidecar for nabla-pdf-rag.
+Long-lived Docling sidecar for nabla-pdf-rag.
 
-Protocol: reads one JSON line from stdin, writes one JSON line to stdout.
+Protocol (JSON lines over stdin/stdout):
+  1. On startup, loads Docling models, prints: {"status": "ready"}
+  2. Reads requests:  {"pdf_path": "/path/to.pdf", "document_id": "doc-123"}
+  3. Writes responses: {"document_id": "...", "title": "...", "page_count": N, "elements": [...], "error": null}
+  4. Loops until stdin is closed.
 
-Input:  {"pdf_path": "/path/to/file.pdf", "document_id": "doc-123"}
-Output: {"document_id": "doc-123", "inferred_title": "...", "pages": [...], "error": null}
+Each element: {"kind": "paragraph"|"section_header"|"table"|..., "text": "...", "page_number": N, "level": null|N}
 
 Requires: pip install docling
 """
+
 import json
 import sys
+import traceback
 
 
-def parse_with_docling(pdf_path: str, document_id: str) -> dict:
+def load_converter():
+    """Load Docling DocumentConverter (heavy — models download on first run)."""
+    from docling.document_converter import DocumentConverter
+    converter = DocumentConverter()
+    return converter
+
+
+def convert_document(converter, pdf_path: str, document_id: str) -> dict:
+    """Convert a single PDF and return a StructuredDocument-compatible dict."""
     try:
-        from docling.document_converter import DocumentConverter
-
-        converter = DocumentConverter()
         result = converter.convert(pdf_path)
-
         doc = result.document
-        pages = []
-        # Docling provides text per page via the export
-        md_text = doc.export_to_markdown()
 
-        # Fallback: if page-level text is available, use it;
-        # otherwise treat the whole markdown as page 1.
-        # Docling's internal page segmentation depends on the PDF structure.
-        if hasattr(doc, "pages") and doc.pages:
-            for i, page in enumerate(doc.pages):
-                page_text = ""
-                if hasattr(page, "text"):
-                    page_text = page.text
-                elif hasattr(page, "cells"):
-                    page_text = "\n".join(
-                        c.text for c in page.cells if hasattr(c, "text")
-                    )
-                pages.append({"page_number": i + 1, "text": page_text})
+        elements = []
+        page_count = 0
+
+        # Walk the document body in reading order
+        for item, _level in doc.iterate_items():
+            kind = "paragraph"
+            text = ""
+            page_number = 1
+            level = None
+
+            # Get text
+            if hasattr(item, "text"):
+                text = item.text or ""
+
+            # Get page number from provenance
+            if hasattr(item, "prov") and item.prov:
+                page_number = item.prov[0].page_no
+                page_count = max(page_count, page_number)
+
+            # Determine element kind from label
+            label = getattr(item, "label", None)
+            if label is not None:
+                label_str = label.value if hasattr(label, "value") else str(label)
+                label_lower = label_str.lower()
+
+                if label_lower == "title":
+                    kind = "title"
+                elif label_lower in ("section_header", "section-header"):
+                    kind = "section_header"
+                    # Try to get heading level
+                    level = getattr(item, "level", None)
+                    if level is None:
+                        level = 1
+                elif label_lower in ("paragraph", "text"):
+                    kind = "paragraph"
+                elif label_lower == "table":
+                    kind = "table"
+                    # Export table as markdown if possible
+                    if hasattr(item, "export_to_markdown"):
+                        text = item.export_to_markdown()
+                elif label_lower == "list_item":
+                    kind = "list_item"
+                elif label_lower in ("picture", "figure"):
+                    kind = "figure"
+                    # Try to get caption
+                    if hasattr(item, "captions") and item.captions:
+                        cap_texts = []
+                        for cap in item.captions:
+                            if hasattr(cap, "text") and cap.text:
+                                cap_texts.append(cap.text)
+                        if cap_texts:
+                            text = " ".join(cap_texts)
+                elif label_lower == "code":
+                    kind = "code"
+                elif label_lower in ("formula", "equation"):
+                    kind = "equation"
+                elif label_lower == "page_header":
+                    kind = "page_header"
+                elif label_lower == "page_footer":
+                    kind = "page_footer"
+
+            if text:  # skip empty elements
+                elements.append({
+                    "kind": kind,
+                    "text": text,
+                    "page_number": page_number,
+                    "level": level,
+                })
+
+        # Infer title
+        title = None
+        if hasattr(doc, "name") and doc.name:
+            title = doc.name
         else:
-            pages.append({"page_number": 1, "text": md_text})
-
-        inferred_title = None
-        if hasattr(doc, "title") and doc.title:
-            inferred_title = doc.title
-        elif pages and pages[0]["text"]:
-            # Use first non-empty line as title heuristic
-            for line in pages[0]["text"].split("\n"):
-                stripped = line.strip().lstrip("#").strip()
-                if stripped:
-                    inferred_title = stripped[:200]
+            for elem in elements:
+                if elem["kind"] == "title":
+                    title = elem["text"]
                     break
+
+        # Page count fallback
+        if page_count == 0 and hasattr(doc, "pages"):
+            page_count = len(doc.pages) if doc.pages else 1
 
         return {
             "document_id": document_id,
-            "inferred_title": inferred_title,
-            "pages": pages,
+            "title": title,
+            "page_count": page_count,
+            "elements": elements,
             "error": None,
         }
 
-    except ImportError:
-        return {
-            "document_id": document_id,
-            "inferred_title": None,
-            "pages": [],
-            "error": "docling not installed. Run: pip install docling",
-        }
     except Exception as e:
         return {
             "document_id": document_id,
-            "inferred_title": None,
-            "pages": [],
-            "error": str(e),
+            "title": None,
+            "page_count": 0,
+            "elements": [],
+            "error": f"{type(e).__name__}: {e}",
         }
 
 
 def main():
-    line = sys.stdin.readline().strip()
-    if not line:
-        print(json.dumps({"document_id": "", "inferred_title": None, "pages": [], "error": "empty input"}))
-        return
+    # Redirect Docling's logging to stderr so it doesn't pollute the JSON protocol
+    import logging
+    logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
 
-    req = json.loads(line)
-    result = parse_with_docling(req["pdf_path"], req["document_id"])
-    print(json.dumps(result))
+    try:
+        converter = load_converter()
+    except ImportError:
+        print(json.dumps({"status": "error", "message": "docling not installed. Run: pip install docling"}), flush=True)
+        sys.exit(1)
+    except Exception as e:
+        print(json.dumps({"status": "error", "message": f"Failed to load Docling: {e}"}), flush=True)
+        sys.exit(1)
+
+    # Signal readiness
+    print(json.dumps({"status": "ready"}), flush=True)
+
+    # Process loop
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError as e:
+            print(json.dumps({
+                "document_id": "",
+                "title": None,
+                "page_count": 0,
+                "elements": [],
+                "error": f"Invalid JSON: {e}",
+            }), flush=True)
+            continue
+
+        pdf_path = req.get("pdf_path", "")
+        document_id = req.get("document_id", "")
+
+        result = convert_document(converter, pdf_path, document_id)
+        print(json.dumps(result, ensure_ascii=False), flush=True)
 
 
 if __name__ == "__main__":

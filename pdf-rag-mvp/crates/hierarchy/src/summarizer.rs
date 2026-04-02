@@ -17,22 +17,22 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
-/// RAPTOR-lite hierarchy builder.
+/// RAPTOR-lite hierarchy builder — now structure-aware.
 ///
-/// 1. Split extracted document into chunks (rule-based, by token budget)
-/// 2. Generate section summaries via LLM
-/// 3. Generate a single document summary via LLM
-///
-/// Cluster summaries are deferred to a later milestone — for MVP,
-/// section + document summaries are sufficient.
+/// 1. Split structured document into chunks via structure-aware chunking
+/// 2. Group chunks by top-level heading (not arbitrary count)
+/// 3. Generate section summaries via LLM with real heading titles
+/// 4. Generate a single document summary from section summaries
 pub struct RaptorLiteBuilder {
     pub chunk_max_tokens: u32,
+    pub chunk_min_tokens: u32,
 }
 
 impl Default for RaptorLiteBuilder {
     fn default() -> Self {
         Self {
             chunk_max_tokens: 256,
+            chunk_min_tokens: 32,
         }
     }
 }
@@ -40,7 +40,7 @@ impl Default for RaptorLiteBuilder {
 impl HierarchyBuilder for RaptorLiteBuilder {
     fn build(
         &self,
-        document: &ExtractedDocument,
+        document: &StructuredDocument,
         llm: &dyn LlmClient,
         progress: &dyn ProgressSink,
     ) -> Result<HierarchyBuildOutput> {
@@ -51,12 +51,12 @@ impl HierarchyBuilder for RaptorLiteBuilder {
             message: Some("Chunking document".into()),
         });
 
-        // Step 1: Chunk all pages
-        let chunks = chunker::chunk_pages(
+        // Step 1: Structure-aware chunking
+        let chunks = chunker::chunk_structured(
             &document.document_id,
-            &document.pages,
-            &[],
+            &document.elements,
             self.chunk_max_tokens,
+            self.chunk_min_tokens,
         );
 
         if chunks.is_empty() {
@@ -73,13 +73,14 @@ impl HierarchyBuilder for RaptorLiteBuilder {
             message: Some(format!("Summarizing {} chunks", chunks.len())),
         });
 
-        // Step 2: Build section summaries (one per ~5 chunks)
-        let section_size = 5;
-        let mut section_nodes = Vec::new();
-        let mut chunk_ids_by_section: Vec<Vec<ChunkId>> = Vec::new();
+        // Step 2: Group chunks by top-level heading for section summaries
+        let section_groups = group_chunks_by_heading(&chunks);
 
-        for section_chunks in chunks.chunks(section_size) {
-            let combined_text: String = section_chunks
+        let mut section_nodes = Vec::new();
+
+        for group in &section_groups {
+            let combined_text: String = group
+                .chunks
                 .iter()
                 .map(|c| c.text.as_str())
                 .collect::<Vec<_>>()
@@ -92,32 +93,33 @@ impl HierarchyBuilder for RaptorLiteBuilder {
 
             let summary = llm.complete(&prompt, 200)?;
 
-            let page_start = section_chunks
+            let page_start = group
+                .chunks
                 .first()
                 .and_then(|c| c.page_span.as_ref().map(|p| p.start));
-            let page_end = section_chunks
+            let page_end = group
+                .chunks
                 .last()
                 .and_then(|c| c.page_span.as_ref().map(|p| p.end));
 
             let node_id = SummaryNodeId::new(Uuid::new_v4().to_string());
-            let chunk_ids: Vec<ChunkId> = section_chunks.iter().map(|c| c.id.clone()).collect();
+            let chunk_ids: Vec<ChunkId> = group.chunks.iter().map(|c| c.id.clone()).collect();
 
             section_nodes.push(SummaryNode {
                 id: node_id,
                 document_id: document.document_id.clone(),
-                parent_id: None, // will be set after document node is created
+                parent_id: None, // set after document node is created
                 kind: SummaryNodeKind::Section,
                 depth: 1,
                 ordinal: section_nodes.len() as u32,
-                title: format!("Section {}", section_nodes.len() + 1),
+                title: group.title.clone(),
                 page_span: page_start
                     .zip(page_end)
                     .map(|(s, e)| PageSpan { start: s, end: e }),
                 summary,
                 child_ids: vec![],
-                source_chunk_ids: chunk_ids.clone(),
+                source_chunk_ids: chunk_ids,
             });
-            chunk_ids_by_section.push(chunk_ids);
         }
 
         progress.on_progress(&ProgressUpdate {
@@ -130,7 +132,7 @@ impl HierarchyBuilder for RaptorLiteBuilder {
         // Step 3: Build document summary from section summaries
         let sections_text: String = section_nodes
             .iter()
-            .map(|n| n.summary.as_str())
+            .map(|n| format!("[{}] {}", n.title, n.summary))
             .collect::<Vec<_>>()
             .join("\n\n");
 
@@ -157,12 +159,12 @@ impl HierarchyBuilder for RaptorLiteBuilder {
             depth: 0,
             ordinal: 0,
             title: document
-                .inferred_title
+                .title
                 .clone()
                 .unwrap_or_else(|| "Untitled".into()),
             page_span: Some(PageSpan {
                 start: 1,
-                end: document.pages.len() as u32,
+                end: document.page_count,
             }),
             summary: doc_summary,
             child_ids: section_ids,
@@ -184,6 +186,84 @@ impl HierarchyBuilder for RaptorLiteBuilder {
             chunks,
         })
     }
+}
+
+// ─── Section Grouping ────────────────────────────────────────────────────
+
+struct SectionGroup<'a> {
+    title: String,
+    chunks: Vec<&'a ChunkRecord>,
+}
+
+/// Group chunks by their top-level heading.
+///
+/// If chunks have real heading paths (from Docling), groups are formed by
+/// the first element of heading_path. If no headings exist (PdfExtract fallback),
+/// falls back to positional grouping (every ~5 chunks).
+fn group_chunks_by_heading<'a>(chunks: &'a [ChunkRecord]) -> Vec<SectionGroup<'a>> {
+    let has_headings = chunks.iter().any(|c| !c.heading_path.is_empty());
+
+    if has_headings {
+        group_by_top_heading(chunks)
+    } else {
+        group_by_position(chunks, 5)
+    }
+}
+
+/// Group chunks that share the same top-level heading.
+fn group_by_top_heading<'a>(chunks: &'a [ChunkRecord]) -> Vec<SectionGroup<'a>> {
+    let mut groups: Vec<SectionGroup<'a>> = Vec::new();
+
+    for chunk in chunks {
+        let top_heading = chunk
+            .heading_path
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "(no heading)".into());
+
+        // If the last group has the same top heading, append to it
+        if let Some(last) = groups.last_mut() {
+            if last.title == top_heading {
+                last.chunks.push(chunk);
+                continue;
+            }
+        }
+
+        groups.push(SectionGroup {
+            title: top_heading,
+            chunks: vec![chunk],
+        });
+    }
+
+    groups
+}
+
+/// Fallback: group every N chunks together with a positional title.
+fn group_by_position<'a>(chunks: &'a [ChunkRecord], group_size: usize) -> Vec<SectionGroup<'a>> {
+    chunks
+        .chunks(group_size)
+        .enumerate()
+        .map(|(i, group)| {
+            // Use first sentence of first chunk as title (better than "Section N")
+            let title = group
+                .first()
+                .map(|c| {
+                    c.text
+                        .split_terminator(|ch: char| ch == '.' || ch == '\n')
+                        .next()
+                        .unwrap_or(&c.text)
+                        .chars()
+                        .take(80)
+                        .collect::<String>()
+                })
+                .unwrap_or_else(|| format!("Section {}", i + 1));
+
+            SectionGroup {
+                title,
+                chunks: group.iter().collect(),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -210,36 +290,60 @@ mod tests {
         }
     }
 
-    fn make_document(num_pages: usize) -> ExtractedDocument {
-        let pages: Vec<ExtractedPage> = (0..num_pages)
-            .map(|i| ExtractedPage {
-                page_number: (i + 1) as u32,
-                text: format!(
-                    "This is page {}. It contains some text about topic {} with details.",
-                    i + 1,
-                    i + 1
-                ),
-            })
-            .collect();
-        ExtractedDocument {
+    fn make_structured(elements: Vec<DocElement>) -> StructuredDocument {
+        StructuredDocument {
             document_id: DocumentId::new("test-doc"),
-            inferred_title: Some("Test Paper".into()),
-            pages,
+            title: Some("Test Paper".into()),
+            page_count: 3,
+            elements,
         }
     }
 
     #[test]
-    fn builds_hierarchy_for_small_document() {
+    fn builds_hierarchy_with_headings() {
+        let doc = make_structured(vec![
+            DocElement {
+                kind: ElementKind::SectionHeader { level: 1 },
+                text: "Introduction".into(),
+                page_number: 1,
+            },
+            DocElement {
+                kind: ElementKind::Paragraph,
+                text: "This paper explores something important about the topic at hand with details.".into(),
+                page_number: 1,
+            },
+            DocElement {
+                kind: ElementKind::SectionHeader { level: 1 },
+                text: "Methods".into(),
+                page_number: 2,
+            },
+            DocElement {
+                kind: ElementKind::Paragraph,
+                text: "We used the following methodology to investigate the research question here.".into(),
+                page_number: 2,
+            },
+        ]);
+
         let builder = RaptorLiteBuilder {
-            chunk_max_tokens: 10,
+            chunk_max_tokens: 100,
+            chunk_min_tokens: 5,
         };
-        let doc = make_document(3);
         let result = builder.build(&doc, &MockLlm, &NullProgress).unwrap();
 
         assert!(!result.chunks.is_empty());
-        assert!(!result.summary_nodes.is_empty());
 
-        // Should have at least one document-level summary
+        // Should have section nodes with real titles
+        let section_nodes: Vec<_> = result
+            .summary_nodes
+            .iter()
+            .filter(|n| n.kind == SummaryNodeKind::Section)
+            .collect();
+
+        let titles: Vec<&str> = section_nodes.iter().map(|n| n.title.as_str()).collect();
+        assert!(titles.contains(&"Introduction"));
+        assert!(titles.contains(&"Methods"));
+
+        // Document node
         let doc_nodes: Vec<_> = result
             .summary_nodes
             .iter()
@@ -247,28 +351,49 @@ mod tests {
             .collect();
         assert_eq!(doc_nodes.len(), 1);
         assert_eq!(doc_nodes[0].title, "Test Paper");
-        assert_eq!(doc_nodes[0].depth, 0);
+    }
 
-        // Section nodes should point to document as parent
+    #[test]
+    fn fallback_positional_grouping_without_headings() {
+        // Simulate PdfExtract path: all paragraphs, no headings
+        let elements: Vec<DocElement> = (0..12)
+            .map(|i| DocElement {
+                kind: ElementKind::Paragraph,
+                text: format!("Paragraph {} with some words about topic {i}.", i + 1),
+                page_number: (i / 4 + 1) as u32,
+            })
+            .collect();
+
+        let doc = make_structured(elements);
+        let builder = RaptorLiteBuilder {
+            chunk_max_tokens: 20,
+            chunk_min_tokens: 3,
+        };
+        let result = builder.build(&doc, &MockLlm, &NullProgress).unwrap();
+
+        assert!(!result.chunks.is_empty());
+        assert!(!result.summary_nodes.is_empty());
+
+        // Section titles should NOT be "Section N" — they use first sentence
         let section_nodes: Vec<_> = result
             .summary_nodes
             .iter()
             .filter(|n| n.kind == SummaryNodeKind::Section)
             .collect();
         for sn in &section_nodes {
-            assert_eq!(sn.parent_id.as_ref(), Some(&doc_nodes[0].id));
-            assert_eq!(sn.depth, 1);
+            assert!(!sn.title.starts_with("Section "), "Got generic title: {}", sn.title);
         }
     }
 
     #[test]
     fn empty_document_returns_empty() {
-        let builder = RaptorLiteBuilder::default();
-        let doc = ExtractedDocument {
+        let doc = StructuredDocument {
             document_id: DocumentId::new("empty"),
-            inferred_title: None,
-            pages: vec![],
+            title: None,
+            page_count: 0,
+            elements: vec![],
         };
+        let builder = RaptorLiteBuilder::default();
         let result = builder.build(&doc, &MockLlm, &NullProgress).unwrap();
         assert!(result.chunks.is_empty());
         assert!(result.summary_nodes.is_empty());

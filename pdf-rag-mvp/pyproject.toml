@@ -1,0 +1,11 @@
+[project]
+name = "nabla-pdf-rag-sidecar"
+version = "0.1.0"
+description = "Python sidecar dependencies for nabla-pdf-rag (Docling)"
+requires-python = ">=3.10"
+dependencies = [
+    "docling>=2.14",
+]
+
+[tool.uv]
+dev-dependencies = []

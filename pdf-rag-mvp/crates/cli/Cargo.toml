@@ -12,7 +12,7 @@ nabla-pdf-rag-core = { path = "../core" }
 nabla-pdf-rag-embedder = { path = "../embedder" }
 nabla-pdf-rag-llm = { path = "../llm" }
 nabla-pdf-rag-hierarchy = { path = "../hierarchy" }
-nabla-pdf-rag-parser = { path = "../parser" }
+nabla-pdf-rag-parser = { path = "../parser", features = ["native", "docling"] }
 nabla-pdf-rag-retrieval = { path = "../retrieval" }
 nabla-pdf-rag-storage = { path = "../storage" }
 tokio.workspace = true

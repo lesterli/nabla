@@ -8,6 +8,22 @@ use serde::{Deserialize, Serialize};
 pub struct AppConfig {
     pub llm: LlmConfig,
     pub embedding: EmbeddingConfig,
+    #[serde(default)]
+    pub parser: ParserConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParserConfig {
+    /// "auto" (try docling sidecar, fallback native) | "docling" | "native"
+    pub backend: String,
+}
+
+impl Default for ParserConfig {
+    fn default() -> Self {
+        Self {
+            backend: "auto".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +61,7 @@ impl Default for AppConfig {
                 model: Some("embedding-3".into()),
                 dimensions: Some(1024),
             },
+            parser: ParserConfig::default(),
         }
     }
 }

@@ -20,7 +20,7 @@ nabla-pdf-rag-core = { path = "../../../crates/core" }
 nabla-pdf-rag-embedder = { path = "../../../crates/embedder" }
 nabla-pdf-rag-hierarchy = { path = "../../../crates/hierarchy" }
 nabla-pdf-rag-llm = { path = "../../../crates/llm" }
-nabla-pdf-rag-parser = { path = "../../../crates/parser" }
+nabla-pdf-rag-parser = { path = "../../../crates/parser", features = ["native", "docling"] }
 nabla-pdf-rag-retrieval = { path = "../../../crates/retrieval" }
 nabla-pdf-rag-storage = { path = "../../../crates/storage" }
 rusqlite = { version = "0.33", features = ["bundled"] }

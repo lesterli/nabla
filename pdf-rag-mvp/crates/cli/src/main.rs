@@ -7,7 +7,7 @@ use nabla_pdf_rag_core::*;
 use nabla_pdf_rag_embedder::{ApiEmbedder, HashEmbedder};
 use nabla_pdf_rag_hierarchy::RaptorLiteBuilder;
 use nabla_pdf_rag_llm::{ApiLlmClient, ApiProvider, LocalCliLlmClient};
-use nabla_pdf_rag_parser::PdfExtractParser;
+use nabla_pdf_rag_parser::{AutoParser, DoclingSidecarParser, PdfExtractParser};
 use nabla_pdf_rag_retrieval::{ChunkEmbedding, HybridSearcher, LanceStore};
 use nabla_pdf_rag_storage::{run_migrations, SqliteRepository};
 use rusqlite::Connection;
@@ -58,8 +58,23 @@ struct Args {
     #[arg(long)]
     embed_dim: Option<usize>,
 
+    /// PDF parser backend: auto (try docling sidecar, fallback native), docling, native
+    #[arg(long, default_value = "auto")]
+    parser: ParserBackend,
+
+    /// Path to docling sidecar script (default: auto-discover scripts/docling_sidecar.py)
+    #[arg(long)]
+    sidecar_path: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum ParserBackend {
+    Auto,
+    Docling,
+    Native,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -111,10 +126,11 @@ async fn main() -> Result<()> {
             print_blueprint();
             Ok(())
         }
-        Command::Import { library, paths } => {
+        Command::Import { ref library, ref paths } => {
             let repo = open_db(&args.db)?;
             let lance = LanceStore::open(&args.lance, embed_dim as i32).await?;
-            cmd_import(&repo, &lance, &library, &paths, llm.as_ref(), embedder.as_ref()).await
+            let parser = build_parser(&args);
+            cmd_import(&repo, &lance, &library, paths, parser.as_ref(), llm.as_ref(), embedder.as_ref()).await
         }
         Command::Ask {
             library,
@@ -213,6 +229,31 @@ fn resolve_api_key(args: &Args, env_vars: &[&str]) -> Result<String> {
     )
 }
 
+fn build_parser(args: &Args) -> Box<dyn DocumentParser> {
+    match args.parser {
+        ParserBackend::Native => Box::new(PdfExtractParser),
+        ParserBackend::Docling => {
+            if let Some(path) = &args.sidecar_path {
+                Box::new(DoclingSidecarParser::new(path))
+            } else {
+                DoclingSidecarParser::find_sidecar()
+                    .map(|p| Box::new(p) as Box<dyn DocumentParser>)
+                    .unwrap_or_else(|| {
+                        eprintln!("Warning: Docling sidecar not found, falling back to native");
+                        Box::new(PdfExtractParser)
+                    })
+            }
+        }
+        ParserBackend::Auto => {
+            if let Some(path) = &args.sidecar_path {
+                Box::new(AutoParser::with_sidecar_path(path))
+            } else {
+                Box::new(AutoParser::new())
+            }
+        }
+    }
+}
+
 fn open_db(path: &str) -> Result<SqliteRepository> {
     let conn = Connection::open(path).context("Failed to open database")?;
     run_migrations(&conn)?;
@@ -242,6 +283,7 @@ async fn cmd_import(
     lance: &LanceStore,
     library_name: &str,
     paths: &[PathBuf],
+    parser: &dyn DocumentParser,
     llm: &dyn LlmClient,
     embedder: &dyn Embedder,
 ) -> Result<()> {
@@ -260,7 +302,6 @@ async fn cmd_import(
     };
     let _ = repo.insert_library(&lib);
 
-    let parser = PdfExtractParser;
     let builder = RaptorLiteBuilder::default();
 
     for path in paths {
@@ -299,10 +340,10 @@ async fn cmd_import(
         // Parse (catch_unwind because pdf-extract can panic on malformed fonts)
         repo.update_document_state(&doc_id, &DocumentState::Extracting, None)?;
         let parse_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            parser.extract_text(&doc, &progress)
+            parser.parse(&doc, &progress)
         }));
-        let extracted = match parse_result {
-            Ok(Ok(e)) => e,
+        let structured = match parse_result {
+            Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 let msg = format!("Parse failed: {e}");
                 eprintln!("  {msg}");
@@ -316,11 +357,11 @@ async fn cmd_import(
                 continue;
             }
         };
-        println!("  Parsed {} pages", extracted.pages.len());
+        println!("  Parsed {} elements from {} pages", structured.elements.len(), structured.page_count);
 
         // Build hierarchy
         repo.update_document_state(&doc_id, &DocumentState::Chunking, None)?;
-        let hierarchy = builder.build(&extracted, llm, &progress)?;
+        let hierarchy = builder.build(&structured, llm, &progress)?;
         println!(
             "  {} chunks, {} summary nodes",
             hierarchy.chunks.len(),

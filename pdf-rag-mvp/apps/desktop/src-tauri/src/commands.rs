@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use nabla_pdf_rag_contracts::*;
 use nabla_pdf_rag_core::*;
 use nabla_pdf_rag_hierarchy::RaptorLiteBuilder;
-use nabla_pdf_rag_parser::PdfExtractParser;
 use nabla_pdf_rag_retrieval::{ChunkEmbedding, HybridSearcher};
 use serde::Serialize;
 use tauri::{Emitter, Manager, State};
@@ -157,13 +156,14 @@ pub async fn import_files(
             // Parse in a separate blocking thread to isolate pdf-extract panics
             let _ = state_ref.repo.update_document_state(&doc_id, &DocumentState::Extracting, None);
             let doc_for_parse = doc.clone();
+            let parser = state_ref.build_parser();
             let parse_handle = tokio::task::spawn_blocking(move || {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    PdfExtractParser.extract_text(&doc_for_parse, &NullProgress)
+                    parser.parse(&doc_for_parse, &NullProgress)
                 }))
             });
-            let extracted = match parse_handle.await {
-                Ok(Ok(Ok(e))) => e,
+            let structured = match parse_handle.await {
+                Ok(Ok(Ok(s))) => s,
                 Ok(Ok(Err(e))) => {
                     let msg = format!("Parse failed: {e}");
                     emit("error", &msg);
@@ -179,14 +179,14 @@ pub async fn import_files(
                     return;
                 }
             };
-            emit("parse", &format!("Parsed {} pages", extracted.pages.len()));
+            emit("parse", &format!("Parsed {} elements from {} pages", structured.elements.len(), structured.page_count));
 
             // Build hierarchy (sync LLM calls)
             let _ = state_ref.repo.update_document_state(&doc_id, &DocumentState::Chunking, None);
             emit("chunk", "Building hierarchy");
             let llm = state_ref.build_llm();
             let builder = RaptorLiteBuilder::default();
-            let hierarchy = match builder.build(&extracted, llm.as_ref(), &NullProgress) {
+            let hierarchy = match builder.build(&structured, llm.as_ref(), &NullProgress) {
                 Ok(h) => h,
                 Err(e) => {
                     let msg = format!("Hierarchy failed: {e}");

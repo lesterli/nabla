@@ -5,6 +5,9 @@ use nabla_pdf_rag_contracts::{
 };
 use serde::{Deserialize, Serialize};
 
+mod structured;
+pub use structured::*;
+
 // ─── LLM Abstraction ──────────────────────────────────────────────────────
 
 /// Minimal LLM abstraction — vendor-agnostic, testable, shared across pipeline stages.
@@ -66,12 +69,15 @@ pub trait DocumentRepository: Send + Sync {
 
 // ─── Parser ────────────────────────────────────────────────────────────────
 
+/// Legacy page-level extraction — used internally by PdfExtractParser before
+/// conversion to StructuredDocument. Kept for backward compatibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedPage {
     pub page_number: u32,
     pub text: String,
 }
 
+/// Legacy flat document — superseded by StructuredDocument.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedDocument {
     pub document_id: DocumentId,
@@ -79,13 +85,16 @@ pub struct ExtractedDocument {
     pub pages: Vec<ExtractedPage>,
 }
 
-/// PDF text extraction — potentially slow (OCR), so accepts a progress sink.
+/// PDF parsing — returns a structure-aware document representation.
+///
+/// Structure-aware parsers (Docling) populate full element types with headings,
+/// tables, and figures. Fallback parsers (pdf-extract) emit all-Paragraph elements.
 pub trait DocumentParser: Send + Sync {
-    fn extract_text(
+    fn parse(
         &self,
         document: &DocumentRecord,
         progress: &dyn ProgressSink,
-    ) -> Result<ExtractedDocument>;
+    ) -> Result<StructuredDocument>;
 }
 
 // ─── Hierarchy Builder ─────────────────────────────────────────────────────
@@ -96,12 +105,12 @@ pub struct HierarchyBuildOutput {
     pub chunks: Vec<ChunkRecord>,
 }
 
-/// Splits an extracted document into chunks and builds the hierarchical summary tree.
+/// Splits a structured document into chunks and builds the hierarchical summary tree.
 /// LLM is used internally for generating section/cluster/document summaries.
 pub trait HierarchyBuilder: Send + Sync {
     fn build(
         &self,
-        document: &ExtractedDocument,
+        document: &StructuredDocument,
         llm: &dyn LlmClient,
         progress: &dyn ProgressSink,
     ) -> Result<HierarchyBuildOutput>;
@@ -227,8 +236,8 @@ pub const DEFAULT_PIPELINE: &[PipelineStep] = &[
     },
     PipelineStep {
         name: "parse",
-        goal: "extract page-level text and recover headings",
-        output: "ExtractedDocument",
+        goal: "extract structured elements (headings, paragraphs, tables) from PDF",
+        output: "StructuredDocument",
     },
     PipelineStep {
         name: "structure",
