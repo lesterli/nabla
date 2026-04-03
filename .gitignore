@@ -25,3 +25,6 @@ target
 
 # project
 .nabla
+
+# node
+node_modules

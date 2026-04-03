@@ -965,6 +965,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nabla-auth"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "nabla-cli"
 version = "0.1.0"
 dependencies = [
